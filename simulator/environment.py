@@ -1,4 +1,5 @@
 from collections.abc import Coroutine
+from simulator.wakeup_queue import WakeUpQueue
 import asyncio
 import logging
 
@@ -20,7 +21,7 @@ class SimulationEnvironment:
     __timer_lock: asyncio.Lock
     __timer_locks: int
 
-    __wakeup_events: dict[int, list[asyncio.Event]]
+    __wakeup_events: WakeUpQueue
     __tasks: list
 
     __TICK_SIZE: float
@@ -29,7 +30,7 @@ class SimulationEnvironment:
 
     def __init__(self, tick_size: float = 0.0001):
         self.__current_tick = 0
-        self.__wakeup_events = {}
+        self.__wakeup_events = WakeUpQueue()
         self.__timer_lock = asyncio.Lock()
         self.__timer_locks = 0
         self.__tasks = []
@@ -69,22 +70,22 @@ class SimulationEnvironment:
         while self.__current_tick < ticks:
             await self.__wait_for_timer_unlock()
 
-            # Nothing changes in the simulation time until at least one event is processed so we
-            # can keep incrementing the time without reacquiring the timer lock.
-            found_events = False
-            while (not found_events) and (self.__current_tick < ticks):
+            next_tick = await self.__wakeup_events.peek_tick()
+            
+            if next_tick is None:
+                # No tasks to wake up, we're done.
+                self.__current_tick += ticks
 
+            else:
                 # Wake up any tasks that are scheduled to wake up at the current time
-                if self.__current_tick in self.__wakeup_events:
-                    for event in self.__wakeup_events[self.__current_tick]:
-                        event.set()
-                        # Prevent the simulation timer from advancing while the task is running
-                        self.__timer_locks += 1
-                    del self.__wakeup_events[self.__current_tick]
-                    found_events = True
+                tick, events = await self.__wakeup_events.next_tick()
 
-                # Advance the simulation time by one tick
-                self.__current_tick += 1
+                self.__current_tick = tick 
+
+                for event in events:
+                    event.set()
+                    # Prevent the simulation timer from advancing while the task is running
+                    self.__timer_locks += 1
 
             self.__timer_lock.release()
 
@@ -170,10 +171,8 @@ class SimulationEnvironment:
         wakeup_time = self.__current_tick + round(duration / self.__TICK_SIZE)
         
         # Register an event to be set when the timer hits the wakeup time
-        if wakeup_time not in self.__wakeup_events:
-            self.__wakeup_events[wakeup_time] = []
         event = asyncio.Event()
-        self.__wakeup_events[wakeup_time].append(event)
+        await self.__wakeup_events.add(wakeup_time, event)
 
         # Reduce the timer lock counter so the simulation timer can advance
         await self.__dec_timer_lock()
