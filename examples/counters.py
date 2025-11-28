@@ -39,5 +39,5 @@ if __name__ == "__main__":
     # sim.create_task(network_task())
     
     # Run the simulation for a sufficient length of time to allow all counters to complete
-    sim.run(simulation_length=15)
+    sim.run(simulation_length=150)
 

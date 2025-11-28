@@ -1,17 +1,13 @@
-
-import asyncio
 from collections.abc import Coroutine
+import asyncio
 import logging
-from venv import logger
-
-SIMULATION_TICK = 0.001  # 1 ms
 
 class SimulationEnvironment:
     """ 
         Simulation environment that manages the simulation time and coordinates the nodes. 
 
         The simulation environment advances the simulation time in discrete ticks (defined by
-        SIMULATION_TICK) and allows nodes to sleep and wait for a specific simulation time.
+        self.__TICK_SIZE) and allows nodes to sleep and wait for a specific simulation time.
         
         Note that as long as any task is not within a `sleep`, `wait`, or `wait_until` call the
         simulation time does not advance. This means you can perform any amount of computation
@@ -19,7 +15,7 @@ class SimulationEnvironment:
         affecting the simulation time.
     """
 
-    __current_time: int
+    __current_tick: int
     
     __timer_lock: asyncio.Lock
     __timer_locks: int
@@ -27,14 +23,17 @@ class SimulationEnvironment:
     __wakeup_events: dict[int, list[asyncio.Event]]
     __tasks: list
 
+    __TICK_SIZE: float
+
     logger = logging.getLogger('simulator')
 
-    def __init__(self):
-        self.__current_time = 0
+    def __init__(self, tick_size: float = 0.0001):
+        self.__current_tick = 0
         self.__wakeup_events = {}
         self.__timer_lock = asyncio.Lock()
         self.__timer_locks = 0
         self.__tasks = []
+        self.__TICK_SIZE = tick_size
         self.logger.setLevel(logging.WARN)
 
 
@@ -66,17 +65,19 @@ class SimulationEnvironment:
 
 
     async def __run_simulation(self, simulation_length: float):
-        while self.current_time() < simulation_length:
+        ticks = round(simulation_length / self.__TICK_SIZE)
+        while self.__current_tick < ticks:
+        # while self.current_time() < simulation_length:
             await self.__wait_for_timer_unlock()
             # Wake up any tasks that are scheduled to wake up at the current time
-            if self.__current_time in self.__wakeup_events:
-                for event in self.__wakeup_events[self.__current_time]:
+            if self.__current_tick in self.__wakeup_events:
+                for event in self.__wakeup_events[self.__current_tick]:
                     event.set()
                     # Prevent the simulation timer from advancing while the task is running
                     self.__timer_locks += 1
-                del self.__wakeup_events[self.__current_time]
+                del self.__wakeup_events[self.__current_tick]
             # Advance the simulation time by one tick
-            self.__current_time += 1
+            self.__current_tick += 1
             self.__timer_lock.release()
 
 
@@ -92,6 +93,7 @@ class SimulationEnvironment:
         """
             Runs the simulation for the given length in seconds. 
         """
+        assert self.__current_tick == 0, "Simulation can only be run once."
         if not loop:
             loop = asyncio.get_event_loop()
         loop.run_until_complete(asyncio.wait([
@@ -110,7 +112,7 @@ class SimulationEnvironment:
             simulation time from advancing until the task itself calls `sleep`, `wait`, or 
             `wait_within`.
         """
-        if self.__current_time > 0:
+        if self.__current_tick > 0:
             raise RuntimeError("Cannot add tasks after the simulation has started.")
         
         # We can increment the timer lock here without acquiring the lock because this method can
@@ -129,7 +131,7 @@ class SimulationEnvironment:
 
     def current_time(self) -> int:
         """ Returns the current simulation time in seconds. """
-        return self.__current_time * SIMULATION_TICK
+        return self.__current_tick * self.__TICK_SIZE
 
 
     async def wait_for_sim_start(self):
@@ -146,8 +148,8 @@ class SimulationEnvironment:
         """
         # Sleeping for 1 tick at the start of the simulation essentially just detects the moment
         # the simulation time starts advancing.
-        if self.__current_time == 0:
-            await self.sleep(SIMULATION_TICK)
+        if self.__current_tick == 0:
+            await self.sleep(self.__TICK_SIZE)
 
 
     async def sleep(self, duration: float):
@@ -157,7 +159,7 @@ class SimulationEnvironment:
         self.logger.debug(f'{self.current_time():.2f} sleep({duration})')
         
         # Compute timestamp at which we need to wake up the task.
-        wakeup_time = self.__current_time + round(duration / SIMULATION_TICK)
+        wakeup_time = self.__current_tick + round(duration / self.__TICK_SIZE)
         
         # Register an event to be set when the timer hits the wakeup time
         if wakeup_time not in self.__wakeup_events:
