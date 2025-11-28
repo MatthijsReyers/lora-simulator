@@ -67,17 +67,25 @@ class SimulationEnvironment:
     async def __run_simulation(self, simulation_length: float):
         ticks = round(simulation_length / self.__TICK_SIZE)
         while self.__current_tick < ticks:
-        # while self.current_time() < simulation_length:
             await self.__wait_for_timer_unlock()
-            # Wake up any tasks that are scheduled to wake up at the current time
-            if self.__current_tick in self.__wakeup_events:
-                for event in self.__wakeup_events[self.__current_tick]:
-                    event.set()
-                    # Prevent the simulation timer from advancing while the task is running
-                    self.__timer_locks += 1
-                del self.__wakeup_events[self.__current_tick]
-            # Advance the simulation time by one tick
-            self.__current_tick += 1
+
+            # Nothing changes in the simulation time until at least one event is processed so we
+            # can keep incrementing the time without reacquiring the timer lock.
+            found_events = False
+            while (not found_events) and (self.__current_tick < ticks):
+
+                # Wake up any tasks that are scheduled to wake up at the current time
+                if self.__current_tick in self.__wakeup_events:
+                    for event in self.__wakeup_events[self.__current_tick]:
+                        event.set()
+                        # Prevent the simulation timer from advancing while the task is running
+                        self.__timer_locks += 1
+                    del self.__wakeup_events[self.__current_tick]
+                    found_events = True
+
+                # Advance the simulation time by one tick
+                self.__current_tick += 1
+
             self.__timer_lock.release()
 
 
