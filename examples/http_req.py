@@ -10,9 +10,8 @@ logger.setLevel(logging.DEBUG)
 async def make_http_request():
     # Note we use asyncio.sleep here instead of sim.sleep to simulate real a real blocking network
     # call that takes time outside of the simulation environment.
-    print(f"Starting HTTP request")
     delay = random.uniform(0.5, 2.0)
-    print(f'Simulated network delay: {delay:.2f} seconds')
+    print(f"Starting HTTP request with simulated network delay: {delay:.2f} seconds")
     await asyncio.sleep(delay)
     print(f"HTTP request finished")
 
