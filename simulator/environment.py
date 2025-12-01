@@ -134,8 +134,13 @@ class SimulationEnvironment:
             # Increment the timer lock since there is now one more active task which might block
             # the simulation time from advancing.
             await self.wait_for_sim_start()
-            t = asyncio.create_task(task)
-            await t
+            try:
+                await asyncio.create_task(task)
+            except Exception as e:
+                self.logger.error(f"Task raised an exception: {e}")
+                import traceback, sys
+                traceback.print_exc()
+                sys.exit(1)
             await self.__task_finished()
 
         self.__tasks.append(wrapped_task)
@@ -182,12 +187,6 @@ class SimulationEnvironment:
 
         # Wait for the timer to hit the wakeup time
         await event.wait()
-
-        # # Re-acquire the timer lock to prevent the simulation timer from advancing while the task
-        # # is running...
-        # await self.__inc_timer_lock()
-
-        return event
     
 
     async def wait(self, future):
@@ -201,6 +200,11 @@ class SimulationEnvironment:
             complete. You should almost always use `wait_real` instead to model the future taking
             some amount of time within the simulation.
         """
+        if not asyncio.isfuture(future) and not asyncio.iscoroutine(future):
+            raise TypeError(
+                "'future' must be a Future or Coroutine, did you accidentally already await the " \
+                "future and ended up passing the result to wait instead?"
+            )
 
         # Reduce the timer lock counter so the simulation timer can advance
         await self.__dec_timer_lock()
@@ -216,7 +220,7 @@ class SimulationEnvironment:
     async def wait_real(self, future, duration: int):
         """ 
             Waits for the given future to complete while allowing the simulation time to advance
-            only for the given duration (in seconds). 
+            only for the given duration (in seconds). Returns the result of the future.
             
             Note that this function does not throw a timeout error! The future can take any 
             arbitrary amount of real time to complete, but the simulation time will only be allowed
@@ -226,9 +230,18 @@ class SimulationEnvironment:
             taking some amount of time within the simulation.
         """
         self.logger.debug(f'{self.current_time():.2f} wait_real({duration})')
-        # Run both the sleep and the future wait concurrently
-        await self.sleep(duration)
-        await future
+
+        if not asyncio.isfuture(future) and not asyncio.iscoroutine(future):
+            raise TypeError(
+                "'future' must be a Future or Coroutine, did you accidentally already await the " \
+                "future and ended up passing the result to wait_real instead?"
+            )
+
+        result = await asyncio.gather(
+            self.sleep(duration),
+            future
+        )
+        return result[1]
 
 simulation_env = SimulationEnvironment()
 
