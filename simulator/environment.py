@@ -10,7 +10,7 @@ class SimulationEnvironment:
         The simulation environment advances the simulation time in discrete ticks (defined by
         self.__TICK_SIZE) and allows nodes to sleep and wait for a specific simulation time.
         
-        Note that as long as any task is not within a `sleep`, `wait`, or `wait_until` call the
+        Note that as long as any task is not within a `sleep`, `wait`, or `wait_real` call the
         simulation time does not advance. This means you can perform any amount of computation
         within a simulation tick, even real network calls of unknown time duration, without 
         affecting the simulation time.
@@ -54,7 +54,7 @@ class SimulationEnvironment:
 
 
     async def __wait_for_timer_unlock(self):
-        self.logger.debug(f'{self.current_time():.2f} __wait_for_timer_unlock(), {self.__timer_locks - 1}')
+        self.logger.debug(f'{self.current_time():.2f} __wait_for_timer_unlock(), {self.__timer_locks}')
         while True:
             await self.__timer_lock.acquire()
             if self.__timer_locks == 0:
@@ -74,7 +74,8 @@ class SimulationEnvironment:
             
             if next_tick is None:
                 # No tasks to wake up, we're done.
-                self.__current_tick += ticks
+                self.__current_tick = ticks
+                break
 
             else:
                 # Wake up any tasks that are scheduled to wake up at the current time
@@ -95,6 +96,7 @@ class SimulationEnvironment:
             Notifies the simulation environment that a task has finished executing. This allows
             the simulation timer to advance again if there are no other active tasks.
         """
+        self.logger.debug(f'{self.current_time():.2f} __task_finished()')
         await self.__dec_timer_lock()
 
 
@@ -119,7 +121,7 @@ class SimulationEnvironment:
 
             Note that by calling this method you create a task that automatically blocks the
             simulation time from advancing until the task itself calls `sleep`, `wait`, or 
-            `wait_within`.
+            `wait_real`.
         """
         if self.__current_tick > 0:
             raise RuntimeError("Cannot add tasks after the simulation has started.")
@@ -132,7 +134,8 @@ class SimulationEnvironment:
             # Increment the timer lock since there is now one more active task which might block
             # the simulation time from advancing.
             await self.wait_for_sim_start()
-            await asyncio.create_task(task)
+            t = asyncio.create_task(task)
+            await t
             await self.__task_finished()
 
         self.__tasks.append(wrapped_task)
@@ -191,12 +194,12 @@ class SimulationEnvironment:
         """ 
             Waits for the given future to complete while allowing the simulation timer to advance
             in the mean time. Note that if you only want to allow the simulation to advance for a
-            limited amount of ticks you should use `wait_within` instead.
+            limited amount of ticks you should use `wait_real` instead.
 
             IMPORTANT: There is almost NEVER a reason to use this method, technically it would
             allow you to run the entire simulation while waiting for a single real network call to
-            complete. You should almost always use `wait_within` instead to model a network call 
-            taking some amount of time within the simulation.
+            complete. You should almost always use `wait_real` instead to model the future taking
+            some amount of time within the simulation.
         """
 
         # Reduce the timer lock counter so the simulation timer can advance
@@ -210,21 +213,21 @@ class SimulationEnvironment:
         await self.__inc_timer_lock()
 
 
-    async def wait_within(self, future, time_limit: int):
+    async def wait_real(self, future, duration: int):
         """ 
             Waits for the given future to complete while allowing the simulation time to advance
-            only for the given time limit (in seconds). 
+            only for the given duration (in seconds). 
             
             Note that this function does not throw a timeout error! The future can take any 
             arbitrary amount of real time to complete, but the simulation time will only be allowed
-            to advance for the given time limit.
-
+            to advance for the given duration.
+            
             This method can be used to simulate real network calls or other blocking operations
             taking some amount of time within the simulation.
         """
-        self.logger.debug(f'{self.current_time():.2f} wait_within({time_limit})')
+        self.logger.debug(f'{self.current_time():.2f} wait_real({duration})')
         # Run both the sleep and the future wait concurrently
-        await self.sleep(time_limit),
+        await self.sleep(duration)
         await future
 
 simulation_env = SimulationEnvironment()
