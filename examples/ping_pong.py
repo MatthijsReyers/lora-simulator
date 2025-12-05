@@ -35,8 +35,8 @@ class Node:
         self.radio.set_tx_config(power=10, spreading_factor=7, bandwidth=125)
         await sim.sleep(random.random() * 15)
         for _ in range(2):
-            print(f'{sim.current_time():.4f} Node {id(self) % 1000} Sending ping')
             await sim.sleep(15)
+            print(f'{sim.current_time():.4f} Node {id(self) % 1000} Sending ping')
             await self.radio.transmit_data_blocking(b"Ping")
             self.radio.receive(continuous=True)
 
