@@ -19,9 +19,9 @@ if __name__ == "__main__":
             await queue.put(i)
 
     async def getter():
-        while sim.current_time() < 130:
+        while sim.is_running():
             try:
-                item = await queue.get_timeout(3)
+                item = await queue.get_timeout(9)
                 # item = await queue.get_timeout(0.5)
                 # item = await queue.get()
                 print(f"{sim.current_time():.2f} - Task 2 got queue -> {item}")
@@ -46,5 +46,5 @@ if __name__ == "__main__":
     sim.create_task(getter(), name="Getter Task")
     
     # Run the simulation for a sufficient length of time to allow all counters to complete
-    sim.run(simulation_length=150000)
+    sim.run(simulation_length=40)
 

@@ -1,4 +1,3 @@
-from typing import Optional
 from simulator.environment import simulation_env as sim
 import asyncio, logging
 
@@ -67,8 +66,13 @@ class Queue():
         if len(self.__data) > 0 and len(self.__get_events) == 0:
             return self.__data.pop(0)
         
+        sim_end = sim.last_tick()
         if timeout_at is None:
-            timeout_at = sim.last_tick() - 1
+            timeout_at = sim_end
+
+        if timeout_at > sim_end:
+            self.logger.warning(f"truncating timeout at {timeout_at}s to within simulation end")
+            timeout_at = sim_end
 
         event = asyncio.Event()
 

@@ -163,6 +163,11 @@ class SimulationEnvironment:
         self.__tasks.append(t)
 
 
+    def is_running(self) -> bool:
+        """ Returns whether the simulation is currently running. """
+        return self.__current_tick > 0 and self.__current_tick < self.__simulation_length - 1
+
+
     def current_time(self) -> float:
         """ Returns the current simulation time in seconds. """
         return self.__current_tick * self.__TICK_SIZE
@@ -175,7 +180,7 @@ class SimulationEnvironment:
 
     def last_tick(self) -> float:
         """ Returns the simulation time at which the simulation will end in seconds. """
-        return self.__simulation_length - 1
+        return (self.__simulation_length - 1) * self.__TICK_SIZE
 
 
     async def wait_for_sim_start(self):
