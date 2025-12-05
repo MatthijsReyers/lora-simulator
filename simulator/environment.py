@@ -1,7 +1,23 @@
 from collections.abc import Coroutine
+from functools import wraps
+from simulator.exceptions import SimulatorException
 from simulator.wakeup_queue import WakeUpQueue
 import asyncio
 import logging
+
+
+def requires_running_simulation(method):
+    """
+    Decorator that enforces the method is only called when the simulation is running.
+    Raises SimulatorException if called after the simulation has finished.
+    """
+    @wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        if not self.is_running() and self._SimulationEnvironment__current_tick > 0:
+            raise SimulatorException(f"Cannot call {method.__name__}, simulation is not running.")
+        return await method(self, *args, **kwargs)
+    return wrapper
+
 
 class SimulationEnvironment:
     """ 
@@ -32,6 +48,7 @@ class SimulationEnvironment:
     __TICK_SIZE: float
 
     logger = logging.getLogger('simulator')
+
 
     def __init__(self, tick_size: float = 0.0001):
         self.__current_tick = 0
@@ -139,7 +156,7 @@ class SimulationEnvironment:
             `wait_real`.
         """
         if self.__current_tick > 0:
-            raise RuntimeError("Cannot add tasks after the simulation has started.")
+            raise SimulatorException("Cannot add tasks after the simulation has started.")
         
         # We can increment the timer lock here without acquiring the lock because this method can
         # only be called before the async runtime is setup and the simulation has started.
@@ -165,7 +182,15 @@ class SimulationEnvironment:
 
     def is_running(self) -> bool:
         """ Returns whether the simulation is currently running. """
-        return self.__current_tick > 0 and self.__current_tick < self.__simulation_length - 1
+        return self.__current_tick > 0 and self.__simulation_length and \
+            self.__current_tick < self.__simulation_length - 1
+
+
+    def is_finished(self) -> bool:
+        """ Returns whether the simulation has finished. """
+        if not self.__simulation_length:
+            return False
+        return self.__current_tick >= self.__simulation_length - 1
 
 
     def current_time(self) -> float:
@@ -174,12 +199,12 @@ class SimulationEnvironment:
 
 
     def next_tick(self) -> float:
-        """ Returns the simulation time of the next tick in seconds. """
+        """ Returns the simulation timestamp of the next tick in seconds. """
         return (self.__current_tick + 1) * self.__TICK_SIZE
 
 
     def last_tick(self) -> float:
-        """ Returns the simulation time at which the simulation will end in seconds. """
+        """ Returns the simulation timestamp at which the simulation will end in seconds. """
         return (self.__simulation_length - 1) * self.__TICK_SIZE
 
 
@@ -201,12 +226,13 @@ class SimulationEnvironment:
             await self.sleep(self.__TICK_SIZE)
 
 
+    @requires_running_simulation
     async def sleep(self, duration: float):
         """ 
             Wait for the simulation time to advance for the given duration.
         """
         self.logger.debug(f'{self.current_time():.2f} sleep({duration})')
-        
+
         # Compute timestamp at which we need to wake up the task.
         wakeup_time = self.__current_tick + round(duration / self.__TICK_SIZE)
         
@@ -240,11 +266,12 @@ class SimulationEnvironment:
             raise e
     
 
+    @requires_running_simulation
     async def schedule_event_no_await(self, event: asyncio.Event, timestamp: float):
         """
-            Schedule an event to be set at the given simulation timestamp, without 
+            Schedule an event to be set at the given simulation timestamp, without awaiting the
+            given event.
         """
-
         self.logger.debug(f'{self.current_time():.2f} schedule_event_no_await({id(event) % 1000}, {timestamp})')
 
         wakeup_time = round(timestamp / self.__TICK_SIZE)
@@ -253,11 +280,13 @@ class SimulationEnvironment:
         if wakeup_time == self.__current_tick:
             wakeup_time += 1
 
-        assert wakeup_time > self.__current_tick, "Cannot schedule event in the past"
+        if wakeup_time <= self.__current_tick:
+            raise SimulatorException("Cannot schedule event in the past")
 
         await self.__wakeup_events.add(wakeup_time, event)
 
 
+    @requires_running_simulation
     async def schedule_event_wait(self, event: asyncio.Event, timestamp: float):
         """
             Schedule an event to be set at the given simulation timestamp and also immediately
@@ -271,6 +300,7 @@ class SimulationEnvironment:
         return await self.wait_for_scheduled_event(event)
     
 
+    @requires_running_simulation
     async def wait_for_scheduled_event(self, event: asyncio.Event):
         """
             Waits for a previously scheduled event to be set, please note that calling this method
@@ -288,11 +318,13 @@ class SimulationEnvironment:
         return result
 
 
+    @requires_running_simulation
     async def advance_tick(self):
         """ Advances the simulation by a single tick. """
         await self.sleep(self.__TICK_SIZE)
 
 
+    @requires_running_simulation
     async def wait_with_duration(self, future, duration: int):
         """ 
             Waits for the given future to complete while allowing the simulation time to advance

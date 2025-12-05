@@ -21,26 +21,29 @@ class Node:
 
     async def recv(self):
         self.radio.set_rx_config(spreading_factor=7, bandwidth=125)
-        while True:
+        while sim.is_running():
             try:
-                packet = await self.radio.receive_data_within(100)
-                print('Received packet:', packet.payload)
+                packet = await self.radio.receive_data_wait()
+                print(f'{sim.current_time():.4f} Node {id(self) % 1000} Received packet:', packet.payload)
                 if packet.payload == b"Ping":
                     await self.radio.transmit_data_blocking(b"Pong")
+                    self.radio.receive(continuous=True)
             except asyncio.TimeoutError:
-                print("Receive timed out")
+                print(f'{sim.current_time():.4f} Node {id(self) % 1000} Receive timed out')
 
     async def send(self):
+        self.radio.set_tx_config(power=10, spreading_factor=7, bandwidth=125)
         await sim.sleep(random.random() * 15)
         for _ in range(2):
+            print(f'{sim.current_time():.4f} Node {id(self) % 1000} Sending ping')
             await sim.sleep(15)
-            self.radio.set_tx_config(power=10, spreading_factor=7, bandwidth=125)
             await self.radio.transmit_data_blocking(b"Ping")
             self.radio.receive(continuous=True)
 
+
 if __name__ == "__main__":
 
-    level = logging.DEBUG
+    level = logging.INFO
     
     ch = logging.StreamHandler()
     ch.setLevel(level)
@@ -49,7 +52,7 @@ if __name__ == "__main__":
 
     logger.addHandler(ch)
 
-    sim.logger.setLevel(logging.DEBUG)
+    sim.logger.setLevel(logging.INFO)
     sim.logger.addHandler(ch)
 
     phy_layer = LoraPhyLayer()
@@ -62,8 +65,8 @@ if __name__ == "__main__":
     node1.radio.logger.setLevel(level)
     node1.radio.logger.addHandler(ch)
     
-    node2.radio.logger.setLevel(logging.DEBUG)
+    node2.radio.logger.setLevel(level)
     node2.radio.logger.addHandler(ch)
 
-    sim.run(simulation_length=150000)
+    sim.run(simulation_length=120)
 

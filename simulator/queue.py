@@ -47,7 +47,7 @@ class Queue():
             the queue to have an item available.
         """
         self.logger.debug(f"{sim.current_time():.2f} - get()")
-        return await self.__get(sim.last_tick() - 1)
+        return await self.__get(sim.last_tick())
 
 
     async def get_timeout(self, timeout: float):

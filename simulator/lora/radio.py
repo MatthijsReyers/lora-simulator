@@ -8,6 +8,7 @@ from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.radio_state import RadioState
 from simulator.lora.packet import LoraPacket
 from simulator.environment import simulation_env as sim
+from simulator.queue import Queue
 
 
 class LoraRadio(ABC):
@@ -45,7 +46,7 @@ class LoraRadio(ABC):
 
     __radio_state: RadioState = RadioState.OFF
     __packets_in_transit: dict[int, PacketMetadata] = {}
-    __rx_queue: asyncio.Queue[LoraPacket] = asyncio.Queue()
+    __rx_queue = Queue()
     
     __rx_bandwidth: Bandwidth = Bandwidth.KHz125
     __rx_spreading_factor: SpreadingFactor = SpreadingFactor.SF7
@@ -100,7 +101,7 @@ class LoraRadio(ABC):
         self.__rx_continuous = continuous
 
 
-    async def receive_data(self) -> Optional[LoraPacket]:
+    async def receive_data_nowait(self) -> Optional[LoraPacket]:
         """
             Tries to receive data from the modem if it is available, immediately returns None if no
             data is available in the receive queue.
@@ -110,7 +111,7 @@ class LoraRadio(ABC):
             self.logger.debug(f"radio={id(self) % 1000} state = RX")
             self.__radio_state = RadioState.RX
         try:
-            packet = self.__rx_queue.get_nowait()
+            packet = await self.__rx_queue.get_timeout(0)
             self.logger.debug(f"receive_data() got packet: {packet}")
             return packet
         except asyncio.QueueEmpty:
@@ -127,7 +128,8 @@ class LoraRadio(ABC):
         if self.__radio_state == RadioState.OFF:
             self.logger.debug(f"radio={id(self) % 1000} state = RX")
             self.__radio_state = RadioState.RX
-        packet = await sim.wait(self.__rx_queue.get())
+        
+        packet = await self.__rx_queue.get()
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
         return packet
 
@@ -144,8 +146,7 @@ class LoraRadio(ABC):
             self.__radio_state = RadioState.RX
 
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
-        packet = await sim.wait_until(self.__rx_queue.get(), timeout=timeout)
-        return packet
+        return await self.__rx_queue.get_timeout(timeout)
 
 
     async def transmit_data(self, data: bytes) -> None:
