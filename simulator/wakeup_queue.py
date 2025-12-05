@@ -1,6 +1,8 @@
 
 import asyncio
+import logging
 
+logger = logging.getLogger(__name__)
 
 class WakeUpQueue():
     __data_lock: asyncio.Lock
@@ -31,6 +33,11 @@ class WakeUpQueue():
             # Insert a new entry
             self.__data.insert(pos, (wakeup_tick, [event]))
 
+        # print([
+        #     f"{tick}: {[id(e) % 1000 for e in events]}"
+        #     for tick, events in self.__data
+        # ])
+
         # Release the data lock
         self.__data_lock.release()
 
@@ -39,6 +46,7 @@ class WakeUpQueue():
         """ 
             Removes all instances a of wakeup event from the queue.
         """
+        logger.debug(f"Removing event {id(event) % 1000} from WakeUpQueue")
         await self.__data_lock.acquire()
 
         found = 0
@@ -48,6 +56,13 @@ class WakeUpQueue():
                 found += 1
 
         self.__data_lock.release()
+        
+        logger.debug(f"Removed {found} instances of event {id(event) % 1000} from WakeUpQueue")
+
+        # print([
+        #     f"{tick}: {[id(e) % 1000 for e in events]}"
+        #     for tick, events in self.__data
+        # ])
 
         return found
 

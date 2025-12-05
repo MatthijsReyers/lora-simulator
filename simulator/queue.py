@@ -1,3 +1,4 @@
+from typing import Optional
 from simulator.environment import simulation_env as sim
 import asyncio, logging
 
@@ -16,11 +17,15 @@ class Queue():
         self.__get_events = []
 
 
+    def __len__(self):
+        return len(self.__data)
+
+
     async def put(self, item):
         """
             Put an item into the queue, note that this will advance the simulation by one tick.
         """
-        self.logger.debug(f"{sim.current_time():.2f} - Queue.put({item})")
+        self.logger.debug(f"{sim.current_time():.2f} - put({item})")
         self.__data.append(item)
         
         if len(self.__get_events) == 0:
@@ -28,6 +33,8 @@ class Queue():
         
         # Schedule the first waiting task for an item to be woken up in the next tick
         event = self.__get_events.pop(0)
+        self.logger.debug(f"{sim.current_time():.2f} - put({item}) waking event {id(event) % 1000}")
+
         timestamp = sim.next_tick()
         await sim.schedule_event_no_await(event, timestamp)
 
@@ -40,7 +47,7 @@ class Queue():
             Get an item from the queue, allowing the simulator to advance time while we wait for
             the queue to have an item available.
         """
-        self.logger.debug(f"{sim.current_time():.2f} - Queue.get()")
+        self.logger.debug(f"{sim.current_time():.2f} - get()")
         return await self.__get(sim.last_tick() - 1)
 
 
@@ -51,7 +58,7 @@ class Queue():
 
             Raises asyncio.TimeoutError if no item is available within the specified timeout.
         """
-        self.logger.debug(f"{sim.current_time():.2f} - Queue.get_timeout({timeout})")
+        self.logger.debug(f"{sim.current_time():.2f} - get_timeout({timeout})")
         return await self.__get(sim.current_time() + timeout)
 
 
@@ -65,15 +72,18 @@ class Queue():
 
         event = asyncio.Event()
 
+        self.logger.debug(f"{sim.current_time():.2f} - waiting for event {id(event) % 1000}")
+
         # Add our event to the list of waiting getters, if data is put before the timeout someone
         # will schedule this event to be set and we will wake up normally. 
         self.__get_events.append(event)
 
         # Schedule a timeout event to wake us up if the timeout expires first
-        await sim.schedule_event(event, timeout_at)
+        await sim.schedule_event_wait(event, timeout_at)
 
         # Did the await finish because data was put, or because we timed out?
         if len(self.__data) == 0:
+            self.__get_events.remove(event)
             raise asyncio.TimeoutError()
 
         return self.__data.pop(0)

@@ -21,16 +21,15 @@ if __name__ == "__main__":
     async def getter():
         while sim.current_time() < 130:
             try:
+                item = await queue.get_timeout(3)
                 # item = await queue.get_timeout(0.5)
-                item = await queue.get()
+                # item = await queue.get()
                 print(f"{sim.current_time():.2f} - Task 2 got queue -> {item}")
             except asyncio.TimeoutError:
                 print(f"{sim.current_time():.2f} - Task 2 timed out waiting for item")
-                pass
-
 
     ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
+    ch.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter("%(asctime)s;%(name)s;%(levelname)s;%(message)s")
 

@@ -207,6 +207,9 @@ class SimulationEnvironment:
         
         # Register an event to be set when the timer hits the wakeup time
         event = asyncio.Event()
+
+        self.logger.debug(f'{self.current_time():.2f} sleep event {id(event) % 1000} scheduled for tick {wakeup_time}')
+
         await self.__wakeup_events.add(wakeup_time, event)
 
         # Reduce the timer lock counter so the simulation timer can advance
@@ -237,7 +240,7 @@ class SimulationEnvironment:
             Schedule an event to be set at the given simulation timestamp, without 
         """
 
-        self.logger.debug(f'{self.current_time():.2f} schedule_event_no_await({timestamp})')
+        self.logger.debug(f'{self.current_time():.2f} schedule_event_no_await({id(event) % 1000}, {timestamp})')
 
         wakeup_time = round(timestamp / self.__TICK_SIZE)
 
@@ -250,11 +253,15 @@ class SimulationEnvironment:
         await self.__wakeup_events.add(wakeup_time, event)
 
 
-    async def schedule_event(self, event: asyncio.Event, timestamp: float):
+    async def schedule_event_wait(self, event: asyncio.Event, timestamp: float):
         """
-            Schedule an event to be set at the given simulation timestamp.
+            Schedule an event to be set at the given simulation timestamp and also immediately
+            wait for the event to be set.
+
+            (This is equivalent to calling `schedule_event_no_await` followed by 
+            `wait_for_scheduled_event`.)
         """
-        self.logger.debug(f'{self.current_time():.2f} schedule_event({timestamp})')
+        self.logger.debug(f'{self.current_time():.2f} schedule_event_wait({timestamp})')
         await self.schedule_event_no_await(event, timestamp)
         return await self.wait_for_scheduled_event(event)
     
