@@ -16,14 +16,19 @@ class SimulationEnvironment:
         affecting the simulation time.
     """
 
+    # Current simulation tick
     __current_tick: int
-    
+
+    # Total length of the simulation in ticks
+    __simulation_length: int
+
     __timer_lock: asyncio.Lock
     __timer_locks: int
 
     __wakeup_events: WakeUpQueue
     __tasks: list
 
+    # Length of a single simulation tick in seconds
     __TICK_SIZE: float
 
     logger = logging.getLogger('simulator')
@@ -65,16 +70,15 @@ class SimulationEnvironment:
             await asyncio.sleep(0)
 
 
-    async def __run_simulation(self, simulation_length: float):
-        ticks = round(simulation_length / self.__TICK_SIZE)
-        while self.__current_tick < ticks:
+    async def __run_simulation(self):
+        while self.__current_tick < self.__simulation_length:
             await self.__wait_for_timer_unlock()
 
             next_tick = await self.__wakeup_events.peek_tick()
             
             if next_tick is None:
                 # No tasks to wake up, we're done.
-                self.__current_tick = ticks
+                self.__current_tick = self.__simulation_length
                 break
 
             else:
@@ -86,9 +90,18 @@ class SimulationEnvironment:
                 for event in events:
                     event.set()
                     # Prevent the simulation timer from advancing while the task is running
+                    self.logger.debug(f'{self.current_time():.2f} __run_simulation: <event {id(event) % 1000}>.set(), {self.__timer_locks} + 1')
+                    
                     self.__timer_locks += 1
 
             self.__timer_lock.release()
+
+        self.logger.info(f"Simulation reached the specified length of {self.__simulation_length * self.__TICK_SIZE}s")
+        await asyncio.sleep(0.1)
+        for task in self.__tasks:
+            if not task.done():
+                self.logger.warning(f"Cancelling unfinished task {task}")
+                task.cancel()
 
 
     async def __task_finished(self):
@@ -100,21 +113,23 @@ class SimulationEnvironment:
         await self.__dec_timer_lock()
 
 
-    def run(self, simulation_length: int, loop: asyncio.AbstractEventLoop = None):
+    def run(self, simulation_length: int):
         """
             Runs the simulation for the given length in seconds. 
         """
         assert self.__current_tick == 0, "Simulation can only be run once."
-        if not loop:
-            loop = asyncio.get_event_loop()
+
+        self.__simulation_length = round(simulation_length / self.__TICK_SIZE)
+
+        loop = asyncio.get_event_loop()
         loop.run_until_complete(asyncio.wait([
-            *[loop.create_task(task()) for task in self.__tasks],
-            loop.create_task(self.__run_simulation(simulation_length))
+            *[t for t in self.__tasks],
+            loop.create_task(self.__run_simulation())
         ]))
         loop.close()
 
 
-    def create_task(self, task: 'Coroutine'):
+    def create_task(self, task: 'Coroutine', name: str = None):
         """ 
             Adds a new async task to the simulation environment to run during the simulation. This must be done before the
             simulation starts.
@@ -143,12 +158,24 @@ class SimulationEnvironment:
                 sys.exit(1)
             await self.__task_finished()
 
-        self.__tasks.append(wrapped_task)
+        loop = asyncio.get_event_loop()
+        t = loop.create_task(wrapped_task(), name=name)
+        self.__tasks.append(t)
 
 
-    def current_time(self) -> int:
+    def current_time(self) -> float:
         """ Returns the current simulation time in seconds. """
         return self.__current_tick * self.__TICK_SIZE
+
+
+    def next_tick(self) -> float:
+        """ Returns the simulation time of the next tick in seconds. """
+        return (self.__current_tick + 1) * self.__TICK_SIZE
+
+
+    def last_tick(self) -> float:
+        """ Returns the simulation time at which the simulation will end in seconds. """
+        return self.__simulation_length - 1
 
 
     async def wait_for_sim_start(self):
@@ -185,39 +212,76 @@ class SimulationEnvironment:
         # Reduce the timer lock counter so the simulation timer can advance
         await self.__dec_timer_lock()
 
-        # Wait for the timer to hit the wakeup time
-        await event.wait()
+        try:
+            # Wait for the timer to hit the wakeup time
+            await event.wait()
+        except asyncio.CancelledError as e:
+            # self.logger.warning(f'{self.current_time():.2f} sleep({duration}) cancelled')
+
+            # If the sleep is cancelled we need to remove the wakeup event from the wakeup queue
+            removed_instances = await self.__wakeup_events.remove(event)
+            if removed_instances > 0:
+                await self.__inc_timer_lock()
+            else:
+                # Due to race conditions in the async-scheduler it may be possible that the event
+                # was already processed and removed from the wakeup queue? In that case we do not
+                # need to re-acquire the timer lock since that already happened when the event was
+                # set.
+                self.logger.warning(f'{self.current_time():.2f} BUG: sleep({duration}) cancelled" \
+                                    " but event already processed')
+            raise e
     
 
-    async def wait(self, future):
-        """ 
-            Waits for the given future to complete while allowing the simulation timer to advance
-            in the mean time. Note that if you only want to allow the simulation to advance for a
-            limited amount of ticks you should use `wait_real` instead.
-
-            IMPORTANT: There is almost NEVER a reason to use this method, technically it would
-            allow you to run the entire simulation while waiting for a single real network call to
-            complete. You should almost always use `wait_real` instead to model the future taking
-            some amount of time within the simulation.
+    async def schedule_event_no_await(self, event: asyncio.Event, timestamp: float):
         """
-        if not asyncio.isfuture(future) and not asyncio.iscoroutine(future):
-            raise TypeError(
-                "'future' must be a Future or Coroutine, did you accidentally already await the " \
-                "future and ended up passing the result to wait instead?"
-            )
+            Schedule an event to be set at the given simulation timestamp, without 
+        """
+
+        self.logger.debug(f'{self.current_time():.2f} schedule_event_no_await({timestamp})')
+
+        wakeup_time = round(timestamp / self.__TICK_SIZE)
+
+        # Use the next tick if the event is scheduled for the current tick
+        if wakeup_time == self.__current_tick:
+            wakeup_time += 1
+
+        assert wakeup_time > self.__current_tick, "Cannot schedule event in the past"
+
+        await self.__wakeup_events.add(wakeup_time, event)
+
+
+    async def schedule_event(self, event: asyncio.Event, timestamp: float):
+        """
+            Schedule an event to be set at the given simulation timestamp.
+        """
+        self.logger.debug(f'{self.current_time():.2f} schedule_event({timestamp})')
+        await self.schedule_event_no_await(event, timestamp)
+        return await self.wait_for_scheduled_event(event)
+    
+
+    async def wait_for_scheduled_event(self, event: asyncio.Event):
+        """
+            Waits for a previously scheduled event to be set, please note that calling this method
+            on an event that was not scheduled using `schedule_event` will break everything.
+        """
+        self.logger.debug(f'{self.current_time():.2f} wait_for_scheduled_event()')
 
         # Reduce the timer lock counter so the simulation timer can advance
         await self.__dec_timer_lock()
 
-        # Wait for the future to complete
-        await future
+        result = await event.wait()
 
-        # Re-acquire the timer lock to prevent the simulation timer from advancing while the task
-        # is running...
-        await self.__inc_timer_lock()
+        await self.__wakeup_events.remove(event)
+
+        return result
 
 
-    async def wait_real(self, future, duration: int):
+    async def advance_tick(self):
+        """ Advances the simulation by a single tick. """
+        await self.sleep(self.__TICK_SIZE)
+
+
+    async def wait_with_duration(self, future, duration: int):
         """ 
             Waits for the given future to complete while allowing the simulation time to advance
             only for the given duration (in seconds). Returns the result of the future.
@@ -229,19 +293,19 @@ class SimulationEnvironment:
             This method can be used to simulate real network calls or other blocking operations
             taking some amount of time within the simulation.
         """
-        self.logger.debug(f'{self.current_time():.2f} wait_real({duration})')
+        self.logger.debug(f'{self.current_time():.2f} wait_with_duration({duration})')
 
         if not asyncio.isfuture(future) and not asyncio.iscoroutine(future):
             raise TypeError(
                 "'future' must be a Future or Coroutine, did you accidentally already await the " \
-                "future and ended up passing the result to wait_real instead?"
+                "future and ended up passing the result to wait_with_duration instead?"
             )
-
         result = await asyncio.gather(
             self.sleep(duration),
             future
         )
         return result[1]
+
 
 simulation_env = SimulationEnvironment()
 

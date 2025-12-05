@@ -29,7 +29,7 @@ if __name__ == "__main__":
         # the simulation by a static amount to simulate a consistent waiting time.
         simulated_duration = 3
         print(f"Starting network task at simulation time: {sim.current_time():.2f}")
-        await sim.wait_real(
+        await sim.wait_with_duration(
             make_http_request(), 
             simulated_duration
         )

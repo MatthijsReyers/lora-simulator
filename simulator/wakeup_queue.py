@@ -35,6 +35,23 @@ class WakeUpQueue():
         self.__data_lock.release()
 
 
+    async def remove(self, event: asyncio.Event) -> int:
+        """ 
+            Removes all instances a of wakeup event from the queue.
+        """
+        await self.__data_lock.acquire()
+
+        found = 0
+        for i, (tick, events) in enumerate(self.__data):
+            while event in events:
+                events.remove(event)
+                found += 1
+
+        self.__data_lock.release()
+
+        return found
+
+
     async def peek_tick(self) -> int | None:
         """ 
             Returns the tick of the next wakeup event without removing it.

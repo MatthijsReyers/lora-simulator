@@ -1,7 +1,7 @@
 from enum import IntEnum
 
 class RadioState(IntEnum):
-    READY = 0
+    OFF = 0
 
     RX = 1
     RX_DONE = 2
