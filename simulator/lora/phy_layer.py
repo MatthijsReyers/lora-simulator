@@ -55,7 +55,7 @@ class LoraPhyLayer():
         """
         self.logger.debug(f"transmit_packet_blocking(sender={id(sender) % 1000})")
         
-        airtime = self.__estimate_airtime(packet)
+        airtime = LoraPhyLayer.estimate_airtime(packet)
         self.logger.debug(f"airtime estimated: {airtime:.3f} s")
 
         # Notify radios about the start of the transmission
@@ -77,17 +77,19 @@ class LoraPhyLayer():
 
 
     @classmethod
-    def __estimate_airtime(cls, packet: LoraPacket) -> float:
-        """ 
-            In seconds; estimate the airtime of a LoRa packet based on its parameters.
-        """
-        return 0.05
-
-
-    @classmethod
     def __estimate_rssi(cls, pos_tx: Tuple[float, float], pos_rx: Tuple[float, float]) -> float:
         """ 
             Estimate the Received Signal Strength Indicator (RSSI) at the receiver based on the
             positions of the transmitter and receiver.
         """
         return 0
+    
+
+    @staticmethod
+    def estimate_airtime(packet: LoraPacket) -> float:
+        """ 
+            In seconds; estimate the airtime of a LoRa packet based on its parameters.
+        """
+        return 0.05
+
+
