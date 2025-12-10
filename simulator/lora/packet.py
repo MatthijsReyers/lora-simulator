@@ -13,6 +13,8 @@ class LoraPacket:
             crc_enabled: bool = True,
             preamble_len: int = 8,
             fixed_len: bool = False,
+            iq_inverted: bool = False,
+            symbols: int = 0,
             snr: float = None,
             rssi: float = None,
         ):
@@ -33,6 +35,8 @@ class LoraPacket:
         self.crc_enabled = crc_enabled
         self.preamble_len = preamble_len
         self.fixed_len = fixed_len
+        self.iq_inverted = iq_inverted
+        self.symbols = symbols
         self.snr = snr
         self.rssi = rssi
 

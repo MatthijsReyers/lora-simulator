@@ -13,6 +13,7 @@ from simulator.queue import Queue
 
 class LoraRadio(ABC):
     class PacketMetadata:
+        """ Radio specific metadata about a packet. """
         def __init__(
             self, 
             packet: LoraPacket, 
@@ -41,6 +42,10 @@ class LoraRadio(ABC):
                 status.append("missed_end")
             status_str = ", ".join(status) if status else "successful"
             return f"PacketMetadata(status={status_str})"
+        
+        def received_successfully(self) -> bool:
+            return not (self.collision or self.missed_start or self.missed_end or self.interrupted)
+
 
     __RECEIVE_PROCESS_DELAY = 0.0001
 
@@ -51,8 +56,7 @@ class LoraRadio(ABC):
     __rx_bandwidth: Bandwidth = Bandwidth.KHz125
     __rx_spreading_factor: SpreadingFactor = SpreadingFactor.SF7
     __rx_code_rate: CodeRate = CodeRate.CR4_5
-    __rx_preable_len: int = 8
-    __rx_symbol_timeout: int = 5
+    __rx_preamble_len: int = 8
     __rx_payload_len: int = 64
     __rx_symbols: int = 0
     __rx_fixed_payload_len: bool = False
@@ -75,6 +79,7 @@ class LoraRadio(ABC):
     position: tuple[float, float]
     logger: logging.Logger
     
+    
     def __init__(self, position: tuple[float, float] = (0.0, 0.0)):
         self.position = position
         self.logger = logging.getLogger(f"LoraRadio-{id(self) % 1000}")
@@ -84,8 +89,10 @@ class LoraRadio(ABC):
         phy = LoraPhyLayer()
         phy.subscribe(self)
 
+
     def get_state(self) -> RadioState:
         return self.__radio_state
+
 
     def receive(self, continuous: bool = True) -> None:
         """
@@ -180,24 +187,60 @@ class LoraRadio(ABC):
 
     def set_rx_config(
         self,
-        bandwidth: Bandwidth = Bandwidth.KHz125,
-        spreading_factor: SpreadingFactor = SpreadingFactor.SF7,
-        code_rate: CodeRate = CodeRate.CR4_5,
+        bandwidth: Bandwidth|int = Bandwidth.KHz125,
+        spreading_factor: SpreadingFactor|int = SpreadingFactor.SF7,
+        code_rate: CodeRate|int = CodeRate.CR4_5,
         preamble_len: int = 8,
-        symbol_timeout: int = 5,
-        payload_len: int = 64,
+        max_payload_len: int = 64,
         symbols: int = 0,
         fixed_payload_len: bool = False,
         crc_enabled: bool = True,
         iq_inverted: bool = False,
         rx_continuous: bool = True,
     ):
+        """
+            Sets the radio's receive configuration. This method is designed to mimic the RX config
+            method of the STM32WLX5 HAL library and uses the same default values.
+            
+            :param bandwidth: LoRa bandwidth (e.g., 125 kHz, 250 kHz, 500 kHz)
+            :param spreading_factor: LoRa spreading factor (e.g., SF7, SF8, SF9)
+            :param code_rate: LoRa code rate (e.g., 4/5, 4/6, 4/7, 4/8) used by incoming packets
+                note that this is only relevant when using implicit mode (i.e. when you set 
+                `fixed_payload_len` to true), otherwise the packet header will indicate the used
+                code rate.
+            :param preamble_len: Preamble length in number of symbols
+            :param max_payload_len: Longest payload length the radio should expect to receive
+            :param symbols: Description
+            :param fixed_payload_len: Does the radio expect fixed length payloads? I.e. will the 
+                received packet have a header indicating their length, or is the length known 
+                ahead of time? (Set expected length with `max_payload_len` parameter)
+            :param crc_enabled: Should the radio expect incoming packets to have a CRC?
+            :param iq_inverted: Description
+            :param rx_continuous: Should the radio remain in receive mode until explicitly turned
+                off?
+        """
+        if type(bandwidth) is int:
+            bandwidth = Bandwidth.from_value(bandwidth)
+        if type(spreading_factor) is int:
+            spreading_factor = SpreadingFactor(spreading_factor)
+        if type(code_rate) is int:
+            code_rate = CodeRate.from_denominator(code_rate)
+
+        assert isinstance(bandwidth, Bandwidth), "Invalid bandwidth"
+        assert isinstance(spreading_factor, SpreadingFactor), "Invalid spreading factor"
+        assert isinstance(code_rate, CodeRate), "Invalid code rate"
+        assert preamble_len > 0, "Preamble length must be positive"
+        assert preamble_len <= 0xFFFF, "Preamble length must fit in u16"
+        assert max_payload_len >= 0, "Payload length must be non-negative"
+        assert type(crc_enabled) is bool, "CRC enabled must be a boolean"
+        assert type(iq_inverted) is bool, "IQ inverted must be a boolean"
+        assert type(rx_continuous) is bool, "RX continuous must be a boolean"
+        
         self.__rx_bandwidth = bandwidth
         self.__rx_spreading_factor = spreading_factor
         self.__rx_code_rate = code_rate
         self.__rx_preable_len = preamble_len
-        self.__rx_symbol_timeout = symbol_timeout
-        self.__rx_payload_len = payload_len
+        self.__rx_payload_len = max_payload_len
         self.__rx_symbols = symbols
         self.__rx_fixed_payload_len = fixed_payload_len
         self.__rx_crc_enabled = crc_enabled
@@ -212,9 +255,9 @@ class LoraRadio(ABC):
     def set_tx_config(
         self,
         power: int,
-        bandwidth: Bandwidth = Bandwidth.KHz125,
-        spreading_factor: SpreadingFactor = SpreadingFactor.SF7,
-        code_rate: CodeRate = CodeRate.CR4_5,
+        bandwidth: Bandwidth|int = Bandwidth.KHz125,
+        spreading_factor: SpreadingFactor|int = SpreadingFactor.SF7,
+        code_rate: CodeRate|int = CodeRate.CR4_5,
         preamble_len: int = 8,
         fixed_len: bool = False,
         crc_enable: bool = True,
@@ -223,6 +266,28 @@ class LoraRadio(ABC):
         iq_inverted: bool = False,
         timeout: int = 3_000,
     ):
+        if type(bandwidth) is int:
+            bandwidth = Bandwidth.from_value(bandwidth)
+        if type(spreading_factor) is int:
+            spreading_factor = SpreadingFactor(spreading_factor)
+        if type(code_rate) is int:
+            code_rate = CodeRate.from_denominator(code_rate)
+
+        assert isinstance(bandwidth, Bandwidth), "Invalid bandwidth"
+        assert isinstance(spreading_factor, SpreadingFactor), "Invalid spreading factor"
+        assert isinstance(code_rate, CodeRate), "Invalid code rate"
+        assert preamble_len > 0, "Preamble length must be positive"
+        assert preamble_len <= 0xFFFF, "Preamble length must fit in u16"
+        assert type(fixed_len) is bool, "Fixed length must be a boolean"
+        assert type(crc_enable) is bool, "CRC enable must be a boolean"
+        assert type(freq_hop_enable) is bool, "Frequency hop enable must be a boolean"
+        assert freq_hop_period >= 0, "Frequency hop period must be non-negative"
+        assert type(iq_inverted) is bool, "IQ inverted must be a boolean"
+        assert timeout >= 0, "Timeout must be non-negative"
+
+        if freq_hop_enable:
+            raise NotImplementedError("Frequency hopping is not yet implemented.")
+
         self.__tx_power = power
         self.__tx_bandwidth = bandwidth
         self.__tx_spreading_factor = spreading_factor
@@ -266,7 +331,7 @@ class LoraRadio(ABC):
             snr=snr,
             collision=found_collision,
             missed_start=missed_start
-        )            
+        )
 
 
     async def _receive_end(self, packet: LoraPacket):
@@ -284,7 +349,7 @@ class LoraRadio(ABC):
             metadata.missed_end = True
 
         # Did we successfully receive the whole packet?
-        if not metadata.collision and not metadata.missed_start and not metadata.interrupted:
+        if metadata.received_successfully():
             self.logger.debug(f"putting packet into rx queue: {packet}")
             await self.__rx_queue.put(packet)
 
@@ -305,7 +370,66 @@ class LoraRadio(ABC):
         if self.__radio_state != RadioState.RX: 
             return False
         
-        # TODO: Implement additional checks based on radio configuration (e.g., SF, BW, frequency)
+        if packet.spreading_factor != self.__rx_spreading_factor:
+            self.logger.info(
+                f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to SF \
+                    mismatch: {packet.spreading_factor} != {self.__rx_spreading_factor}"
+            )
+            return False
+        
+        if packet.bandwidth != self.__rx_bandwidth:
+            self.logger.info(
+                f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to BW \
+                    mismatch: {packet.bandwidth} != {self.__rx_bandwidth}"
+            )
+            return False
+
+        if packet.crc_enabled != self.__rx_crc_enabled:
+            self.logger.info(
+                f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to CRC \
+                    enabled mismatch: {packet.crc_enabled} != {self.__rx_crc_enabled}"
+            )
+            return False
+        
+        if packet.fixed_len != self.__rx_fixed_payload_len:
+            self.logger.info(
+                f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to fixed \
+                    length mismatch: {packet.fixed_len} != {self.__rx_fixed_payload_len}"
+            )
+            return False
+        
+        if packet.preamble_len != self.__rx_preable_len:
+            self.logger.info(
+                f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to \
+                    preamble length mismatch: {packet.preamble_len} != {self.__rx_preable_len}"
+            )
+            return False
+        
+        if packet.iq_inverted != self.__rx_iq_inverted:
+            self.logger.info(
+                f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to IQ \
+                    inversion mismatch: {packet.iq_inverted} != {self.__rx_iq_inverted}"
+            )
+            return False
+        
+        # In implicit mode, we need to check more things since the packet does not have a header to
+        # indicate its parameters.
+        if self.__rx_fixed_payload_len:
+            
+            if packet.payload_len != self.__rx_payload_len:
+                self.logger.info(
+                    f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to \
+                        payload length mismatch: {packet.payload_len} != {self.__rx_payload_len}"
+                )
+                return False
+            
+            if packet.code_rate != self.__rx_code_rate:
+                self.logger.info(
+                    f"radio={id(self) % 1000} cannot receive packet {id(packet) % 1000} due to \
+                        code rate mismatch: {packet.code_rate} != {self.__rx_code_rate}"
+                )
+                return False
+        
         return True
     
 
