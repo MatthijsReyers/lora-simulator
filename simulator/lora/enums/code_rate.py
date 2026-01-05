@@ -14,6 +14,17 @@ class CodeRate(IntEnum):
     def __str__(self):
         return self.name
 
+    def to_denominator(self) -> int:
+        match self:
+            case CodeRate.CR4_5:
+                return 5
+            case CodeRate.CR4_6:
+                return 6
+            case CodeRate.CR4_7:
+                return 7
+            case CodeRate.CR4_8:
+                return 8
+
     @staticmethod
     def from_denominator(value: int) -> 'CodeRate':
         match value:

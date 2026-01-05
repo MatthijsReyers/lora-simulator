@@ -50,7 +50,7 @@ class SimulationEnvironment:
     logger = logging.getLogger('simulator')
 
 
-    def __init__(self, tick_size: float = 0.0001):
+    def __init__(self, tick_size: float = 0.000001):
         self.__current_tick = 0
         self.__wakeup_events = WakeUpQueue()
         self.__timer_lock = asyncio.Lock()

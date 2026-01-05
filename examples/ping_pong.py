@@ -16,12 +16,12 @@ logger.setLevel(logging.DEBUG)
 class Node:
     def __init__(self, code_rate):
         self.radio = LoraRadio()
-        self.radio.set_tx_config(power=14, code_rate=code_rate)
+        self.code_rate = code_rate
         sim.create_task(self.recv())
         sim.create_task(self.send())
 
     async def recv(self):
-        self.radio.set_rx_config(spreading_factor=7, bandwidth=125)
+        self.radio.set_rx_config(spreading_factor=7, bandwidth=125, code_rate=self.code_rate)
         while sim.is_running():
             try:
                 packet = await self.radio.receive_data_wait()
@@ -34,7 +34,7 @@ class Node:
                 print(f'{sim.current_time():.4f} Node {id(self) % 1000} Receive timed out')
 
     async def send(self):
-        self.radio.set_tx_config(power=10, spreading_factor=7, bandwidth=125)
+        self.radio.set_tx_config(power=14, spreading_factor=7, bandwidth=125, code_rate=self.code_rate)
         await sim.sleep(random.random() * 15)
         for _ in range(2):
             await sim.sleep(15)
@@ -61,7 +61,7 @@ if __name__ == "__main__":
     phy_layer.logger.setLevel(level)
     phy_layer.logger.addHandler(ch)
 
-    node1 = Node(code_rate=5)
+    node1 = Node(code_rate=7)
     node2 = Node(code_rate=7)
 
     node1.radio.logger.setLevel(level)
