@@ -109,6 +109,7 @@ class LoraRadio(ABC):
     
 
     def _set_state(self, state: RadioState) -> None:
+        self.logger.debug(f"radio={self._radio_id} set_state(state={state})")
         self.__radio_state = state
         self.events.append([
             sim.current_time(), "state_change", self._radio_id, None, state
@@ -201,6 +202,8 @@ class LoraRadio(ABC):
 
         phy_layer = LoraPhyLayer()
         await phy_layer.transmit_packet_blocking(self, packet)
+
+        self._set_state(RadioState.OFF)
 
 
     def set_rx_config(
@@ -343,7 +346,6 @@ class LoraRadio(ABC):
         snr = self.__estimate_snr()
 
         # Add this packet to the list of packets in transit
-        self.logger.debug(f"radio={self._radio_id} self.__packets_in_transit")
         self.__packets_in_transit[packet.id] = LoraRadio.PacketMetadata(   
             packet=packet,
             rssi=rssi,

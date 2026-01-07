@@ -117,7 +117,7 @@ class SimulationEnvironment:
         await asyncio.sleep(0.1)
         for task in self.__tasks:
             if not task.done():
-                self.logger.warning(f"Cancelling unfinished task {task}")
+                # self.logger.warning(f"Cancelling unfinished task {task}")
                 task.cancel()
 
 
