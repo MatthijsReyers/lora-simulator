@@ -234,7 +234,7 @@ class LoraRadio(ABC):
                 off?
         """
         if type(bandwidth) is int:
-            bandwidth = Bandwidth.from_value(bandwidth)
+            bandwidth = Bandwidth.from_khz(bandwidth)
         if type(spreading_factor) is int:
             spreading_factor = SpreadingFactor(spreading_factor)
         if type(code_rate) is int:
@@ -281,7 +281,7 @@ class LoraRadio(ABC):
         timeout: int = 3_000,
     ):
         if type(bandwidth) is int:
-            bandwidth = Bandwidth.from_value(bandwidth)
+            bandwidth = Bandwidth.from_khz(bandwidth)
         if type(spreading_factor) is int:
             spreading_factor = SpreadingFactor(spreading_factor)
         if type(code_rate) is int:

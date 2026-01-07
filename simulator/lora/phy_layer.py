@@ -3,6 +3,7 @@ from typing import Tuple
 from simulator.environment import simulation_env as sim
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
+from simulator.lora.utils import packet_airtime
 
 class LoraPhyLayer():
     """
@@ -55,7 +56,7 @@ class LoraPhyLayer():
         """
         self.logger.debug(f"transmit_packet_blocking(sender={id(sender) % 1000})")
         
-        airtime = LoraPhyLayer.estimate_airtime(packet)
+        airtime = packet_airtime(packet)
         self.logger.debug(f"airtime estimated: {airtime:.3f} s")
 
         # Notify radios about the start of the transmission
@@ -83,13 +84,3 @@ class LoraPhyLayer():
             positions of the transmitter and receiver.
         """
         return 0
-    
-
-    @staticmethod
-    def estimate_airtime(packet: LoraPacket) -> float:
-        """ 
-            In seconds; estimate the airtime of a LoRa packet based on its parameters.
-        """
-        return 0.05
-
-
