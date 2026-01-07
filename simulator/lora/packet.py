@@ -52,8 +52,7 @@ class LoraPacket:
         self.rssi = rssi
 
     def __repr__(self):
-        return (f"LoRaPacket(payload={self.payload}, spreading_factor={self.spreading_factor}," \
-                 f" bandwidth={self.bandwidth}, code_rate={self.code_rate})")
+        return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.spreading_factor}, bandwidth={self.bandwidth}, code_rate={self.code_rate})")
     
     def copy(self) -> 'LoraPacket':
         return LoraPacket(

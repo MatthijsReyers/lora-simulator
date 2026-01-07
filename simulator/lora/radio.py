@@ -51,9 +51,9 @@ class LoraRadio(ABC):
 
     __RECEIVE_PROCESS_DELAY = 0.0001
 
-    __radio_state: RadioState = RadioState.OFF
-    __packets_in_transit: dict[int, PacketMetadata] = {}
-    __rx_queue = Queue()
+    __radio_state: RadioState
+    __packets_in_transit: dict[int, PacketMetadata]
+    __rx_queue: Queue
     
     __rx_bandwidth: Bandwidth = Bandwidth.KHz125
     __rx_spreading_factor: SpreadingFactor = SpreadingFactor.SF7
@@ -87,12 +87,16 @@ class LoraRadio(ABC):
     events: list[list[float, str, int, int|None, str|None]] = []
     
     def __init__(self, position: tuple[float, float] = (0.0, 0.0)):
+        self.__packets_in_transit = {}
+        self.__rx_queue = Queue()
         self.position = position
-        self.logger = logging.getLogger(f"LoraRadio-{id(self) % 1000}")
+        self.__radio_state = RadioState.OFF
 
         global _radio_id_counter
         _radio_id_counter += 1
         self._radio_id = _radio_id_counter
+
+        self.logger = logging.getLogger(f"LoraRadio-{self._radio_id}")
 
         # Prevents circular import
         from simulator.lora.phy_layer import LoraPhyLayer
@@ -117,7 +121,7 @@ class LoraRadio(ABC):
             blocking receive methods already put the radio into receive mode so this method is only
             needed to put the radio into receive mode after transmitting data.
         """
-        self.logger.debug(f"radio={id(self) % 1000} receive(continuous={continuous})")
+        self.logger.debug(f"radio={self._radio_id} receive(continuous={continuous})")
         if not continuous:
             raise NotImplementedError("Non-continuous receive mode is not yet implemented.")
         self._set_state(RadioState.RX)
@@ -163,7 +167,7 @@ class LoraRadio(ABC):
         self.logger.debug(f"receive_data_within(timeout={timeout})")
 
         if self.__radio_state == RadioState.OFF:
-            self.logger.debug(f"radio={id(self) % 1000} state = RX")
+            self.logger.debug(f"radio={self._radio_id} state = RX")
             self._set_state(RadioState.RX)
 
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
@@ -171,7 +175,7 @@ class LoraRadio(ABC):
 
 
     async def transmit_data(self, data: bytes) -> None:
-        raise NotImplementedError("transmit_data is not yet implemented.")
+        raise NotImplementedError("Non-blocking transmit_data is not yet implemented.")
 
 
     async def transmit_data_blocking(self, data: bytes) -> None:
@@ -321,7 +325,7 @@ class LoraRadio(ABC):
             PHY layer to notify the radio of incoming packets, end users should never be calling
             this directly.
         """
-        self.logger.debug(f"radio={id(self) % 1000} _receive_start({packet}, rssi={rssi})")
+        self.logger.debug(f"radio={self._radio_id} _receive_start({packet}, rssi={rssi})")
 
         # Is the radio turned on and able to receive the packets?
         missed_start = not self.__can_receive(packet)
@@ -339,7 +343,8 @@ class LoraRadio(ABC):
         snr = self.__estimate_snr()
 
         # Add this packet to the list of packets in transit
-        self.__packets_in_transit[id(packet)] = LoraRadio.PacketMetadata(   
+        self.logger.debug(f"radio={self._radio_id} self.__packets_in_transit")
+        self.__packets_in_transit[packet.id] = LoraRadio.PacketMetadata(   
             packet=packet,
             rssi=rssi,
             snr=snr,
@@ -352,13 +357,12 @@ class LoraRadio(ABC):
         """
             Called when the radio finishes receiving a packet. The 
         """
-        self.logger.debug(f"radio={id(self) % 1000} _receive_end({packet})")
-
-        assert id(packet) in self.__packets_in_transit, "BUG: Packet not found in transit?"
+        self.logger.debug(f"radio={self._radio_id} _receive_end({packet})")
+        
+        assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
 
         # Remove packet from in transit list
-        metadata = self.__packets_in_transit.pop(id(packet), None)
-
+        metadata = self.__packets_in_transit.pop(packet.id, None)
         if not self.__can_receive(packet):
             metadata.missed_end = True
 
@@ -372,7 +376,7 @@ class LoraRadio(ABC):
                 self._set_state(RadioState.OFF)
 
         else:
-            self.logger.debug(f"radio={id(self) % 1000} packet lost due to {metadata}")
+            self.logger.debug(f"radio={self._radio_id} packet lost due to {metadata}")
 
 
     def __can_receive(self, packet: LoraPacket) -> bool:
@@ -386,49 +390,49 @@ class LoraRadio(ABC):
         
         if packet.code_rate != self.__rx_code_rate:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to code rate \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to code rate \
                     mismatch: {packet.code_rate} != {self.__rx_code_rate}"
             )
             return False
         
         if packet.spreading_factor != self.__rx_spreading_factor:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to SF \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to SF \
                     mismatch: {packet.spreading_factor} != {self.__rx_spreading_factor}"
             )
             return False
         
         if packet.bandwidth != self.__rx_bandwidth:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to BW \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to BW \
                     mismatch: {packet.bandwidth} != {self.__rx_bandwidth}"
             )
             return False
 
         if packet.crc_enabled != self.__rx_crc_enabled:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to CRC \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to CRC \
                     enabled mismatch: {packet.crc_enabled} != {self.__rx_crc_enabled}"
             )
             return False
         
         if packet.fixed_len != self.__rx_fixed_payload_len:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to fixed \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to fixed \
                     length mode mismatch: {packet.fixed_len} != {self.__rx_fixed_payload_len}"
             )
             return False
         
         if packet.preamble_len != self.__rx_preable_len:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to \
                     preamble length mismatch: {packet.preamble_len} != {self.__rx_preable_len}"
             )
             return False
         
         if packet.iq_inverted != self.__rx_iq_inverted:
             self.logger.info(
-                f"radio={id(self) % 1000} cannot receive packet {packet.id} due to IQ \
+                f"radio={self._radio_id} cannot receive packet {packet.id} due to IQ \
                     inversion mismatch: {packet.iq_inverted} != {self.__rx_iq_inverted}"
             )
             return False
@@ -439,14 +443,14 @@ class LoraRadio(ABC):
             
             if packet.payload_len != self.__rx_payload_len:
                 self.logger.info(
-                    f"radio={id(self) % 1000} cannot receive packet {packet.id} due to \
+                    f"radio={self._radio_id} cannot receive packet {packet.id} due to \
                         payload length mismatch: {packet.payload_len} != {self.__rx_payload_len}"
                 )
                 return False
             
             if packet.code_rate != self.__rx_code_rate:
                 self.logger.info(
-                    f"radio={id(self) % 1000} cannot receive packet {packet.id} due to \
+                    f"radio={self._radio_id} cannot receive packet {packet.id} due to \
                         code rate mismatch: {packet.code_rate} != {self.__rx_code_rate}"
                 )
                 return False
