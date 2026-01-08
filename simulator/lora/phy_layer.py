@@ -5,7 +5,7 @@ from pandas import DataFrame
 from simulator.environment import simulation_env as sim
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
-from simulator.lora.utils import packet_airtime
+from simulator.lora.utils import estimate_packet_airtime
 
 class LoraPhyLayer():
     """
@@ -98,7 +98,7 @@ class LoraPhyLayer():
         
         assert sender in self.__subscribers, "Sender radio is not subscribed to the PHY layer"
 
-        airtime = packet_airtime(packet)
+        airtime = estimate_packet_airtime(packet)
         self.logger.debug(f"airtime estimated: {airtime:.3f} s")
 
         # Log packet for later analysis

@@ -65,7 +65,7 @@ def estimate_airtime(
     return t_preamble + t_payload
 
 
-def packet_airtime(packet: LoraPacket) -> float:
+def estimate_packet_airtime(packet: LoraPacket) -> float:
     """
         Calculate the time on air for a LoRa packet (in seconds).
     """
