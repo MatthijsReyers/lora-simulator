@@ -267,6 +267,46 @@ class SimulationEnvironment:
     
 
     @requires_running_simulation
+    async def sleep_until(self, timestamp: float):
+        """ 
+            Wait for the simulation time to advance for the given duration.
+        """
+        self.logger.debug(f'{self.current_time():.2f} sleep_until({timestamp})')
+
+        # Compute timestamp at which we need to wake up the task.
+        wakeup_time = round(timestamp / self.__TICK_SIZE)
+
+        assert wakeup_time > self.__current_tick, "Cannot sleep until a time in the past"
+        
+        # Register an event to be set when the timer hits the wakeup time
+        event = asyncio.Event()
+
+        await self.__wakeup_events.add(wakeup_time, event)
+
+        # Reduce the timer lock counter so the simulation timer can advance
+        await self.__dec_timer_lock()
+
+        try:
+            # Wait for the timer to hit the wakeup time
+            await event.wait()
+        except asyncio.CancelledError as e:
+            # self.logger.warning(f'{self.current_time():.2f} sleep({duration}) cancelled')
+
+            # If the sleep is cancelled we need to remove the wakeup event from the wakeup queue
+            removed_instances = await self.__wakeup_events.remove(event)
+            if removed_instances > 0:
+                await self.__inc_timer_lock()
+            else:
+                # Due to race conditions in the async-scheduler it may be possible that the event
+                # was already processed and removed from the wakeup queue? In that case we do not
+                # need to re-acquire the timer lock since that already happened when the event was
+                # set.
+                self.logger.warning(f'{self.current_time():.2f} BUG: sleep({duration}) cancelled" \
+                                    " but event already processed')
+            raise e
+    
+
+    @requires_running_simulation
     async def schedule_event_no_await(self, event: asyncio.Event, timestamp: float):
         """
             Schedule an event to be set at the given simulation timestamp, without awaiting the
