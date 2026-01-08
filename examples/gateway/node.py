@@ -36,10 +36,11 @@ class Node:
         for retry in range(5):
             await sim.sleep(random.random() * retry) # Randomized backoff to desync colliding nodes
             enroll_req = EnrollmentRequestPacket(hardware_id=self.hardware_id)
+            print(f'{sim.current_time():.4f} Node {self.hardware_id} requesting to enroll')
             await self.radio.transmit_data_blocking(enroll_req.to_bytes())
             try:
-                start = sim.current_time()
                 data = await self.radio.receive_data_within(0.5)
+                await sim.sleep(0.00001) # Simulate processing delay
                 enroll_res = EnrollmentResponsePacket.from_bytes(data.payload)
                 if enroll_res.hardware_id == self.hardware_id:
                     self.node_id = enroll_res.node_id
