@@ -8,47 +8,13 @@ from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.radio_state import RadioState
 from simulator.lora.packet import LoraPacket
 from simulator.environment import simulation_env as sim
+from simulator.lora.packet_metadata import PacketMetadata
 from simulator.queue import Queue
 
 # Global radio counter for unique radio IDs
 _radio_id_counter = 0
 
 class LoraRadio(ABC):
-    class PacketMetadata:
-        """ Radio specific metadata about a packet. """
-        def __init__(
-            self, 
-            packet: LoraPacket, 
-            rssi: float, 
-            snr: float, 
-            collision: bool, 
-            missed_start: bool
-        ):
-            self.packet = packet
-            self.rssi = rssi
-            self.snr = snr
-            self.collision = collision
-            self.missed_start = missed_start
-            self.missed_end = False
-            self.interrupted = False
-
-        def __repr__(self):
-            status = []
-            if self.collision:
-                status.append("collision")
-            if self.missed_start:
-                status.append("missed_start")
-            if self.interrupted:
-                status.append("interrupted")
-            if self.missed_end:
-                status.append("missed_end")
-            status_str = ", ".join(status) if status else "successful"
-            return f"PacketMetadata(status={status_str})"
-        
-        def received_successfully(self) -> bool:
-            return not (self.collision or self.missed_start or self.missed_end or self.interrupted)
-
-
     __RECEIVE_PROCESS_DELAY = 0.0001
 
     __radio_state: RadioState
@@ -83,8 +49,8 @@ class LoraRadio(ABC):
     position: tuple[float, float]
     logger: logging.Logger
 
-    # [time, event_type, radio, packet_id, details]
-    events: list[list[float, str, int, int|None, str|None]] = []
+    __state_log: list
+    __packets_log: dict
     
     def __init__(self, position: tuple[float, float] = (0.0, 0.0)):
         self.__packets_in_transit = {}
@@ -97,6 +63,18 @@ class LoraRadio(ABC):
         self._radio_id = _radio_id_counter
 
         self.logger = logging.getLogger(f"LoraRadio-{self._radio_id}")
+
+        self.__state_log = []
+        self.__packets_log = {
+            "id": [],
+            "time": [],
+            "snr": [],
+            "rssi": [],
+            "collision": [],
+            "missed_start": [],
+            "missed_end": [],
+            "interrupted": [],
+        }
 
         # Prevents circular import
         from simulator.lora.phy_layer import LoraPhyLayer
@@ -111,8 +89,8 @@ class LoraRadio(ABC):
     def _set_state(self, state: RadioState) -> None:
         self.logger.debug(f"radio={self._radio_id} set_state(state={state})")
         self.__radio_state = state
-        self.events.append([
-            sim.current_time(), "state_change", self._radio_id, None, state
+        self.__state_log.append([
+            sim.current_time(), state
         ])
 
 
@@ -340,13 +318,13 @@ class LoraRadio(ABC):
         found_collision = False
         for meta in possible_collisions:
             if self.__packets_collide(meta.packet, packet):
-                meta.packet.collision = True
+                meta.collision = True
                 found_collision = True
 
         snr = self.__estimate_snr()
 
         # Add this packet to the list of packets in transit
-        self.__packets_in_transit[packet.id] = LoraRadio.PacketMetadata(   
+        self.__packets_in_transit[packet.id] = PacketMetadata(   
             packet=packet,
             rssi=rssi,
             snr=snr,
@@ -367,6 +345,9 @@ class LoraRadio(ABC):
         metadata = self.__packets_in_transit.pop(packet.id, None)
         if not self.__can_receive(packet):
             metadata.missed_end = True
+
+        # Log packet metadata for later analysis
+        self.__log_packet_metadata(metadata)
 
         # Did we successfully receive the whole packet?
         if metadata.received_successfully():
@@ -479,6 +460,20 @@ class LoraRadio(ABC):
         if p1.spreading_factor == p2.spreading_factor and p1.bandwidth == p2.bandwidth:
             return True
         return False
+
+
+    def __log_packet_metadata(self, metadata: PacketMetadata):
+        """
+            Logs the metadata of a received packet for later analysis.
+        """
+        self.__packets_log["id"].append(metadata.packet.id)
+        self.__packets_log["time"].append(sim.current_time())
+        self.__packets_log["snr"].append(metadata.snr)
+        self.__packets_log["rssi"].append(metadata.rssi)
+        self.__packets_log["collision"].append(metadata.collision)
+        self.__packets_log["missed_start"].append(metadata.missed_start)
+        self.__packets_log["missed_end"].append(metadata.missed_end)
+        self.__packets_log["interrupted"].append(metadata.interrupted)
 
 
     def __estimate_snr(self) -> float:

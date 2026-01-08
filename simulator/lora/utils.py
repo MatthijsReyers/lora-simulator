@@ -5,7 +5,7 @@ from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.packet import LoraPacket
 import math
 
-def time_on_air(
+def estimate_airtime(
     payload_len: int,
     bandwidth: Bandwidth|int,
     spreading_factor: SpreadingFactor|int,
@@ -69,7 +69,7 @@ def packet_airtime(packet: LoraPacket) -> float:
     """
         Calculate the time on air for a LoRa packet (in seconds).
     """
-    return time_on_air(
+    return estimate_airtime(
         payload_len=len(packet.payload),
         bandwidth=packet.bandwidth,
         spreading_factor=packet.spreading_factor,
