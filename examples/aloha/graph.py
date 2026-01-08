@@ -17,7 +17,7 @@ ax.set_ylabel("Throughput (S)")
 
 ax.set_title("Pure ALOHA throughput")
 
-G = np.linspace(0, max(df["G"].max(), 2), 100)
+G = np.linspace(0, 5, 100)
 S_ideal = G * np.exp(-2 * G)
 ax.plot(G, S_ideal, linestyle='--', linewidth=1, label='Ideal ALOHA (S = G·e⁻²ᴳ)', zorder=1)
 
