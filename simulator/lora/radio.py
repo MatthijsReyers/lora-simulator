@@ -170,9 +170,9 @@ class LoraRadio(ABC):
             tx_power=self.__tx_power,
             spreading_factor=self.__tx_spreading_factor,
             bandwidth=self.__tx_bandwidth,
-            crc_enabled=True,
-            preamble_len=8,
-            fixed_len=False,
+            crc_enabled=self.__tx_crc_enable,
+            preamble_len=self.__tx_preamble_len,
+            fixed_len=self.__tx_fixed_len,
         )
 
         # Prevents circular import
