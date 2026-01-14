@@ -226,6 +226,15 @@ class SimulationEnvironment:
             await self.sleep(self.__TICK_SIZE)
 
 
+    async def wait_for_sim_end(self):
+        """ 
+            Waits until the simulation is over, some classes use this to perform cleanup or final 
+            processing at the end of the simulation.
+        """
+        duration_ticks = self.last_tick() - self.__current_tick
+        await self.sleep(duration_ticks * self.__TICK_SIZE)
+
+
     @requires_running_simulation
     async def sleep(self, duration: float):
         """ 
