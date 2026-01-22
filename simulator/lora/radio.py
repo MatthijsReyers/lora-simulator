@@ -10,6 +10,8 @@ from simulator.lora.packet import LoraPacket
 from simulator.environment import simulation_env as sim
 from simulator.lora.packet_metadata import PacketMetadata
 from simulator.lora.radio_config import LoraConfig
+from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
+from simulator.power_consumer import PowerConsumer
 from simulator.queue import Queue
 
 # Global radio counter for unique radio IDs
@@ -35,11 +37,16 @@ class LoraRadio(ABC):
 
     position: tuple[float, float]
     logger: logging.Logger
+    power_consumer: PowerConsumer
 
     __state_log: list
     __packets_log: dict
     
-    def __init__(self, position: tuple[float, float] = (0.0, 0.0)):
+    def __init__(
+            self, 
+            position: tuple[float, float] = (0.0, 0.0), 
+            power_profile: RadioPowerProfile = Stm32wl55PowerProfile()
+        ):
         self.__packets_in_transit = {}
         self.__rx_queue = Queue()
         self.position = position
@@ -52,6 +59,9 @@ class LoraRadio(ABC):
         self._radio_id = _radio_id_counter
 
         self.logger = logging.getLogger(f"LoraRadio-{self._radio_id}")
+
+        self.power_consumer = PowerConsumer()
+        self.power_profile = power_profile
 
         self.__state_log = []
         self.__packets_log = {
@@ -74,16 +84,44 @@ class LoraRadio(ABC):
     def get_state(self) -> RadioState:
         return self.__radio_state
     
-
     def _set_state(self, state: RadioState) -> None:
         self.logger.debug(f"radio={self._radio_id} set_state(state={state})")
         self.__radio_state = state
         self.__state_log.append([
             sim.current_time(), state
         ])
+        match state:
+            case RadioState.OFF:
+                power = self.power_profile.disabled_power()
+            case RadioState.RX:
+                power = self.power_profile.rx_power(self.__rx_config)
+            case RadioState.TX:
+                power = self.power_profile.tx_power(self.__tx_power, self.__tx_config)
+            case RadioState.STANDBY:
+                power = self.power_profile.standby_power()
+        self.power_consumer.set_power_consumption(power)
 
 
-    def receive(self, continuous: bool = True) -> None:
+    async def standby(self) -> None:
+        """
+            Puts the radio into standby mode.
+        """
+        self.logger.debug(f"radio={self._radio_id} standby()")
+        if self.__radio_state != RadioState.STANDBY:
+            self._set_state(RadioState.STANDBY)
+            await sim.sleep(self.power_profile.standby_startup_time())
+
+
+    async def off(self) -> None:
+        """
+            Turns the radio off.
+        """
+        self.logger.debug(f"radio={self._radio_id} off()")
+        if self.__radio_state != RadioState.OFF:
+            self._set_state(RadioState.OFF)
+
+
+    async def receive(self, continuous: bool = True) -> None:
         """
             Puts the radio into receive mode without blocking or waiting for packets. The other
             blocking receive methods already put the radio into receive mode so this method is only
@@ -92,6 +130,13 @@ class LoraRadio(ABC):
         self.logger.debug(f"radio={self._radio_id} receive(continuous={continuous})")
         if not continuous:
             raise NotImplementedError("Non-continuous receive mode is not yet implemented.")
+
+        if self.__radio_state == RadioState.TX:
+            raise RuntimeError("Cannot enter receive mode while radio is transmitting.")
+
+        if self.__radio_state == RadioState.OFF:
+            await self.standby()
+
         self._set_state(RadioState.RX)
         self.__rx_continuous = continuous
 
@@ -101,15 +146,18 @@ class LoraRadio(ABC):
             Tries to receive data from the modem if it is available, immediately returns None if no
             data is available in the receive queue.
         """
-        self.logger.debug(f"receive_data()")
+        self.logger.debug(f"radio={self._radio_id} receive_data()")
+
         if self.__radio_state == RadioState.OFF:
+            await self.standby()
+
+        if self.__radio_state not in [RadioState.TX, RadioState.RX]:
             self._set_state(RadioState.RX)
+
         try:
             packet = await self.__rx_queue.get_timeout(0)
-            self.logger.debug(f"receive_data() got packet: {packet}")
             return packet
         except asyncio.QueueEmpty:
-            self.logger.debug(f"receive_data() got no packet")
             return None
 
 
@@ -117,9 +165,19 @@ class LoraRadio(ABC):
         """
             Blocking wait that does not return until some data is received (correctly) by the radio.
         """
-        self.logger.debug(f"receive_data_wait()")
+        self.logger.debug(f"radio={self._radio_id} receive_data_wait()")
+
+        # Has a packet already been received?
+        try: return await self.__rx_queue.get_timeout(0)
+        except asyncio.TimeoutError: pass
         
+        if self.__radio_state == RadioState.TX:
+            raise RuntimeError("Cannot receive data while radio is transmitting.")
+
         if self.__radio_state == RadioState.OFF:
+            await self.standby()
+
+        if self.__radio_state != RadioState.RX:
             self._set_state(RadioState.RX)
         
         packet = await self.__rx_queue.get()
@@ -134,8 +192,17 @@ class LoraRadio(ABC):
         """
         self.logger.debug(f"receive_data_within(timeout={timeout})")
 
+        # Has a packet already been received?
+        try: return await self.__rx_queue.get_timeout(0)
+        except asyncio.QueueEmpty: pass
+
+        if self.__radio_state != RadioState.TX:
+            raise RuntimeError("Cannot receive data while radio is transmitting.")
+
         if self.__radio_state == RadioState.OFF:
-            self.logger.debug(f"radio={self._radio_id} state = RX")
+            await self.standby()
+
+        if self.__radio_state != RadioState.RX:
             self._set_state(RadioState.RX)
 
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
@@ -151,7 +218,11 @@ class LoraRadio(ABC):
             for meta in self.__packets_in_transit.values():
                 meta.interrupted = True
 
-        self._set_state(RadioState.TX)
+        if self.__radio_state == RadioState.OFF:
+            await self.standby()
+
+        if self.__radio_state != RadioState.TX:
+            self._set_state(RadioState.TX)
 
         packet = LoraPacket(
             payload=data,

@@ -231,7 +231,7 @@ class SimulationEnvironment:
             Waits until the simulation is over, some classes use this to perform cleanup or final 
             processing at the end of the simulation.
         """
-        duration_ticks = self.last_tick() - self.__current_tick
+        duration_ticks = self.__simulation_length - self.__current_tick
         await self.sleep(duration_ticks * self.__TICK_SIZE)
 
 

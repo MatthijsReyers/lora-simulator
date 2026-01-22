@@ -29,7 +29,7 @@ class Node:
                 if packet.payload == b"Ping":
                     print(f'{sim.current_time():.4f} Node {id(self) % 1000} Sending pong')
                     await self.radio.transmit_data_blocking(b"Pong")
-                    self.radio.receive(continuous=True)
+                    await self.radio.receive(continuous=True)
             except asyncio.TimeoutError:
                 print(f'{sim.current_time():.4f} Node {id(self) % 1000} Receive timed out')
 
@@ -40,7 +40,7 @@ class Node:
             await sim.sleep(15)
             print(f'{sim.current_time():.4f} Node {id(self) % 1000} Sending ping')
             await self.radio.transmit_data_blocking(b"Ping")
-            self.radio.receive(continuous=True)
+            await self.radio.receive(continuous=True)
 
 
 if __name__ == "__main__":
