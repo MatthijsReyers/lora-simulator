@@ -18,9 +18,6 @@ class LoraPacket:
         ):
         assert isinstance(config, LoraConfig), "config must be a LoraConfig object"
         assert isinstance(payload, bytes), "Payload must be of type bytes"
-        assert isinstance(config.spreading_factor, SpreadingFactor), "Invalid spreading factor"
-        assert isinstance(config.bandwidth, Bandwidth), "Invalid bandwidth"
-        assert config.bandwidth != Bandwidth.Reserved, "Invalid bandwidth"
 
         global _packet_id_counter
         _packet_id_counter += 1
@@ -59,14 +56,6 @@ class LoraPacket:
     @property
     def iq_inverted(self) -> bool:
         return self.config.iq_inverted
-    
-    @property
-    def symbols(self) -> int:
-        return self.config.symbols
-    
-    @property
-    def payload_len(self) -> int:
-        return self.config.payload_len
 
     def __repr__(self):
         return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.spreading_factor}, bandwidth={self.bandwidth}, code_rate={self.code_rate})")
