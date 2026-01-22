@@ -50,14 +50,14 @@ class LoraPhyLayer():
     def __init__(self):
         if not hasattr(self, 'initialized'):
             self.initialized = True
-            sim.create_task(self.__on_simulation_end())
+            sim.create_task(self.__on_sim_end())
 
 
-    async def __on_simulation_end(self):
+    async def __on_sim_end(self):
         """
             Called when the simulation ends.
         """
-        await sim.sleep(sim.last_tick())
+        await sim.wait_for_sim_end()
         self.packets_log = DataFrame(self.__packets_log)
         self.__packets_log = {}
 
