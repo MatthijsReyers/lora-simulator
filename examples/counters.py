@@ -1,31 +1,14 @@
 #!/usr/bin/env python3
-import sys, time, asyncio, logging
-sys.path.append('.')
-
+import sys
+sys.path.append('.') # To allow importing the simulator package while running from root folder.
 from simulator.environment import simulation_env as sim
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+async def counter_task(counter_id: int, count_to: int, delay: int):
+    for i in range(count_to):
+        await sim.sleep(delay)
+        print(f"{sim.current_time():.2f} - Counter {counter_id}: {i}")
 
 if __name__ == "__main__":
-    
-    async def counter_task(counter_id: int, count_to: int, delay: int):
-        for i in range(count_to):
-            await sim.sleep(delay)
-            print(f"{sim.current_time():.2f} - Counter {counter_id}: {i}")
-
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-
-    formatter = logging.Formatter("%(asctime)s;%(levelname)s;%(message)s")
-
-    # add formatter to ch
-    ch.setFormatter(formatter)
-
-    # add ch to logger
-    logger.addHandler(ch)
-    sim.logger.setLevel(logging.INFO)
-    sim.logger.addHandler(ch)
 
     # Create multiple counter tasks with different parameters
     sim.create_task(counter_task(counter_id=1, count_to=5, delay=1))
@@ -34,4 +17,3 @@ if __name__ == "__main__":
     
     # Run the simulation for a sufficient length of time to allow all counters to complete
     sim.run(simulation_length=150000)
-
