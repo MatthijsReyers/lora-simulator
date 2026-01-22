@@ -194,9 +194,9 @@ class LoraRadio(ABC):
 
         # Has a packet already been received?
         try: return await self.__rx_queue.get_timeout(0)
-        except asyncio.QueueEmpty: pass
+        except asyncio.TimeoutError: pass
 
-        if self.__radio_state != RadioState.TX:
+        if self.__radio_state == RadioState.TX:
             raise RuntimeError("Cannot receive data while radio is transmitting.")
 
         if self.__radio_state == RadioState.OFF:
@@ -236,7 +236,7 @@ class LoraRadio(ABC):
         phy_layer = LoraPhyLayer()
         await phy_layer.transmit_packet_blocking(self, packet)
 
-        self._set_state(RadioState.OFF)
+        self._set_state(RadioState.STANDBY)
 
 
     def set_rx_config(
