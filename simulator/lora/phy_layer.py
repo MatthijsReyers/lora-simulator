@@ -73,27 +73,15 @@ class LoraPhyLayer():
         self.__subscribers.append(radio)
 
 
-    def transmit_packet(
-        self, 
-        sender: LoraRadio,
-        packet: LoraPacket
-    ) -> float:
-        """
-            Simulate the transmission of a LoRa packet in the environment.
-            This is a non-blocking version that schedules the transmission and returns immediately.
-        """
-        self.logger.debug(f"transmit_packet(sender={id(sender) % 1000})")
-        raise NotImplementedError(
-            "transmit_packet is not yet implemented, use transmit_packet_blocking instead"
-        )
-
     async def transmit_packet_blocking(
         self, 
         sender: LoraRadio,
         packet: LoraPacket
     ) -> float:
         """
-            Simulate the transmission of a LoRa packet in the environment.
+            Simulate the transmission of a LoRa packet in the environment. This call blocks for the
+            duration of the packet's airtime. Run this function call within a new child task in the
+            simulator if you wish to simulate non-blocking transmissions.
 
             Returns the airtime of the transmission.
         """
@@ -114,7 +102,7 @@ class LoraPhyLayer():
             rssi = self.__estimate_rssi(sender.position, radio.position)
             radio._receive_start(packet, rssi)
 
-        # Advanced simulation time by the airtime of the packet
+        # Advance simulation time by the airtime of the packet
         await sim.sleep(airtime)
 
         # Notify radios about the end of the transmission

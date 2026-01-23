@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import asyncio, logging
 from typing import Optional
 
+from simulator.exceptions import SimulatorException
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.enums.bandwidth import Bandwidth
@@ -16,6 +17,13 @@ from simulator.queue import Queue
 
 # Global radio counter for unique radio IDs
 _radio_id_counter = 0
+
+class AlreadyTransmittingException(SimulatorException):
+    """Exception raised when attempting to transmit while already transmitting."""
+    def __init__(self):
+        super().__init__(
+            "Radio is already transmitting."
+        )
 
 class LoraRadio(ABC):
     __RECEIVE_PROCESS_DELAY = 0.0001
@@ -41,11 +49,13 @@ class LoraRadio(ABC):
 
     __state_log: list
     __packets_log: dict
+
     
     def __init__(
             self, 
             position: tuple[float, float] = (0.0, 0.0), 
-            power_profile: RadioPowerProfile = Stm32wl55PowerProfile()
+            power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
+
         ):
         self.__packets_in_transit = {}
         self.__rx_queue = Queue()
@@ -129,8 +139,6 @@ class LoraRadio(ABC):
             needed to put the radio into receive mode after transmitting data.
         """
         self.logger.debug(f"radio={self._radio_id} receive(continuous={continuous})")
-        if not continuous:
-            raise NotImplementedError("Non-continuous receive mode is not yet implemented.")
 
         if self.__radio_state == RadioState.TX:
             raise RuntimeError("Cannot enter receive mode while radio is transmitting.")
@@ -210,11 +218,41 @@ class LoraRadio(ABC):
         return await self.__rx_queue.get_timeout(timeout)
 
 
-    async def transmit_data(self, data: bytes) -> None:
-        raise NotImplementedError("Non-blocking transmit_data is not yet implemented.")
+    async def transmit_data(self, data: bytes) -> asyncio.Event:
+        """ 
+            Transmit data asynchronously. Returns an asyncio.Event that is set when the
+            transmission is complete. Throws AlreadyTransmittingException if the radio is already
+            currently transmitting.
+        """
+        assert isinstance(data, bytes), "Data to transmit must be bytes"
+
+        if self.__radio_state == RadioState.TX:
+            raise AlreadyTransmittingException()
+
+        tx_finished_event = asyncio.Event()
+
+        async def transmit_task():
+            await self.transmit_data_blocking(data)
+            tx_finished_event.set()
+
+        await sim.start_child_task(transmit_task())
+
+        return tx_finished_event
 
 
-    async def transmit_data_blocking(self, data: bytes) -> None:
+    async def transmit_data_blocking(self, data: bytes):
+        """
+            Transmit data to other radios, This call does not return until the transmission is
+            complete. Throws AlreadyTransmittingException if the radio is already currently
+            transmitting (via non-blocking method).
+        """
+        assert isinstance(data, bytes), "Data to transmit must be bytes"
+
+        if self.__radio_state == RadioState.TX:
+            raise AlreadyTransmittingException()
+
+        # TODO: Technically one could keep track of preambles and delay TX until RX is done, but
+        # that's not how most radios work so for now we just interrupt any ongoing receptions.
         if self.__radio_state == RadioState.RX:
             for meta in self.__packets_in_transit.values():
                 meta.interrupted = True
@@ -222,8 +260,7 @@ class LoraRadio(ABC):
         if self.__radio_state == RadioState.OFF:
             await self.standby()
 
-        if self.__radio_state != RadioState.TX:
-            self._set_state(RadioState.TX)
+        self._set_state(RadioState.TX)
 
         packet = LoraPacket(
             payload=data,
@@ -237,7 +274,10 @@ class LoraRadio(ABC):
         phy_layer = LoraPhyLayer()
         await phy_layer.transmit_packet_blocking(self, packet)
 
-        self._set_state(RadioState.STANDBY)
+        if self.__rx_continuous:
+            self._set_state(RadioState.RX)
+        else:
+            self._set_state(RadioState.STANDBY)
 
 
     def set_rx_config(
@@ -427,7 +467,7 @@ class LoraRadio(ABC):
             Determines whether the radio can receive the given packet based on its current
             configuration.
         """
-        # Is the radio turned on?
+        # Is the radio even in receive mode?
         if self.__radio_state != RadioState.RX: 
             return False
         
