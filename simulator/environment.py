@@ -1,5 +1,6 @@
 from collections.abc import Coroutine
 from functools import wraps
+from typing import Optional
 from simulator.exceptions import SimulatorException
 from simulator.wakeup_queue import WakeUpQueue
 import asyncio
@@ -8,8 +9,10 @@ import logging
 
 def requires_running_simulation(method):
     """
+    (Internal use on SimulationEnvironment class only)
+
     Decorator that enforces the method is only called when the simulation is running.
-    Raises SimulatorException if called after the simulation has finished.
+    Raises a SimulatorException if called after the simulation has finished.
     """
     @wraps(method)
     async def wrapper(self, *args, **kwargs):
@@ -36,7 +39,7 @@ class SimulationEnvironment:
     __current_tick: int
 
     # Total length of the simulation in ticks
-    __simulation_length: int
+    __simulation_length: Optional[int]
 
     __timer_lock: asyncio.Lock
     __timer_locks: int
@@ -52,6 +55,7 @@ class SimulationEnvironment:
 
     def __init__(self, tick_size: float = 0.000001):
         self.__current_tick = 0
+        self.__simulation_length = None
         self.__wakeup_events = WakeUpQueue()
         self.__timer_lock = asyncio.Lock()
         self.__timer_locks = 0
@@ -188,7 +192,7 @@ class SimulationEnvironment:
 
     def is_finished(self) -> bool:
         """ Returns whether the simulation has finished. """
-        if not self.__simulation_length:
+        if self.__simulation_length is None:
             return False
         return self.__current_tick >= self.__simulation_length - 1
 

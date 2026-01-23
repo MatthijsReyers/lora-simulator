@@ -10,3 +10,23 @@ We recommend checking out the basic smaller examples first (listed at the top of
 | Queue | `examples/queue.py` | A basic demonstration to show how to use the Queue class provided by this simulator (note that you can *NOT* use a normal `asyncio.Queue` as the simulation might run for any amount of time while sending data between tasks).
 | HTTP Request | `example/http_req.py` | Shows how to interleave real asynchronous work (like an HTTP request to a real LoRaWAN network server) safely within the simulator.
 
+## Unit testing
+
+Those wishing to extend the simulator with new features for their own use should know that there are unit tests located in the `tests/` directory. 
+Test files should follow the naming convention `test_*.py` and test functions should be prefixed with `test_`.
+You can run/debug the unit tests using the following commands:
+
+```bash
+# Run all tests
+pipenv run pytest
+
+# Run with verbose output
+pipenv run pytest -v
+
+# Run a specific test file
+pipenv run pytest tests/test_environment.py
+
+# Run tests with print output visible
+pipenv run pytest -v -s
+```
+

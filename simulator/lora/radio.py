@@ -83,7 +83,8 @@ class LoraRadio(ABC):
 
     def get_state(self) -> RadioState:
         return self.__radio_state
-    
+
+
     def _set_state(self, state: RadioState) -> None:
         self.logger.debug(f"radio={self._radio_id} set_state(state={state})")
         self.__radio_state = state
