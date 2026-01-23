@@ -430,52 +430,52 @@ class LoraRadio(ABC):
         if self.__radio_state != RadioState.RX: 
             return False
         
-        if packet.code_rate != self.__rx_config.code_rate:
+        if packet.config.code_rate != self.__rx_config.code_rate:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to code rate \
-                    mismatch: {packet.code_rate} != {self.__rx_config.code_rate}"
+                    mismatch: {packet.config.code_rate} != {self.__rx_config.code_rate}"
             )
             return False
         
-        if packet.spreading_factor != self.__rx_config.spreading_factor:
+        if packet.config.spreading_factor != self.__rx_config.spreading_factor:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to SF \
-                    mismatch: {packet.spreading_factor} != {self.__rx_config.spreading_factor}"
+                    mismatch: {packet.config.spreading_factor} != {self.__rx_config.spreading_factor}"
             )
             return False
         
-        if packet.bandwidth != self.__rx_config.bandwidth:
+        if packet.config.bandwidth != self.__rx_config.bandwidth:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to BW \
-                    mismatch: {packet.bandwidth} != {self.__rx_config.bandwidth}"
+                    mismatch: {packet.config.bandwidth} != {self.__rx_config.bandwidth}"
             )
             return False
 
-        if packet.crc_enabled != self.__rx_config.crc_enabled:
+        if packet.config.crc_enabled != self.__rx_config.crc_enabled:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to CRC \
-                    enabled mismatch: {packet.crc_enabled} != {self.__rx_config.crc_enabled}"
+                    enabled mismatch: {packet.config.crc_enabled} != {self.__rx_config.crc_enabled}"
             )
             return False
         
-        if packet.fixed_len != self.__rx_config.fixed_payload_len:
+        if packet.config.fixed_payload_len != self.__rx_config.fixed_payload_len:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to fixed \
-                    length mode mismatch: {packet.fixed_len} != {self.__rx_config.fixed_payload_len}"
+                    length mode mismatch: {packet.config.fixed_payload_len} != {self.__rx_config.fixed_payload_len}"
             )
             return False
         
-        if packet.preamble_len != self.__rx_config.preamble_len:
+        if packet.config.preamble_len != self.__rx_config.preamble_len:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to \
-                    preamble length mismatch: {packet.preamble_len} != {self.__rx_config.preamble_len}"
+                    preamble length mismatch: {packet.config.preamble_len} != {self.__rx_config.preamble_len}"
             )
             return False
         
-        if packet.iq_inverted != self.__rx_config.iq_inverted:
+        if packet.config.iq_inverted != self.__rx_config.iq_inverted:
             self.logger.info(
                 f"radio={self._radio_id} cannot receive packet {packet.id} due to IQ \
-                    inversion mismatch: {packet.iq_inverted} != {self.__rx_config.iq_inverted}"
+                    inversion mismatch: {packet.config.iq_inverted} != {self.__rx_config.iq_inverted}"
             )
             return False
         
@@ -483,17 +483,17 @@ class LoraRadio(ABC):
         # indicate its parameters.
         if self.__rx_config.fixed_payload_len:
             
-            if packet.payload_len != self.__rx_config.payload_len:
+            if len(packet.payload) != self.__rx_config.payload_len:
                 self.logger.info(
                     f"radio={self._radio_id} cannot receive packet {packet.id} due to \
-                        payload length mismatch: {packet.payload_len} != {self.__rx_config.payload_len}"
+                        payload length mismatch: {len(packet.payload)} != {self.__rx_config.payload_len}"
                 )
                 return False
             
-            if packet.code_rate != self.__rx_config.code_rate:
+            if packet.config.code_rate != self.__rx_config.code_rate:
                 self.logger.info(
                     f"radio={self._radio_id} cannot receive packet {packet.id} due to \
-                        code rate mismatch: {packet.code_rate} != {self.__rx_config.code_rate}"
+                        code rate mismatch: {packet.config.code_rate} != {self.__rx_config.code_rate}"
                 )
                 return False
         
@@ -516,8 +516,9 @@ class LoraRadio(ABC):
             Determines whether two packets collide based on their parameters.
         """
         # Simple placeholder implementation: packets collide if they have the same SF and BW
-        if p1.spreading_factor == p2.spreading_factor and p1.bandwidth == p2.bandwidth:
-            return True
+        if p1.config.spreading_factor == p2.config.spreading_factor:
+            if p1.config.bandwidth == p2.config.bandwidth:
+                return True
         return False
 
 

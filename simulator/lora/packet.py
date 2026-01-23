@@ -1,8 +1,6 @@
 
-from simulator.lora.enums.bandwidth import Bandwidth
-from simulator.lora.enums.code_rate import CodeRate
-from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.radio_config import LoraConfig
+from simulator.lora.utils import estimate_airtime
 
 # Global packet counter for unique packet IDs
 _packet_id_counter = 0
@@ -18,6 +16,7 @@ class LoraPacket:
         ):
         assert isinstance(config, LoraConfig), "config must be a LoraConfig object"
         assert isinstance(payload, bytes), "Payload must be of type bytes"
+        assert type(tx_power) is int, "tx_power must be an integer"
 
         global _packet_id_counter
         _packet_id_counter += 1
@@ -29,40 +28,25 @@ class LoraPacket:
         self.snr = snr
         self.rssi = rssi
 
-    @property
-    def code_rate(self) -> CodeRate:
-        return self.config.code_rate
-    
-    @property
-    def spreading_factor(self) -> SpreadingFactor:
-        return self.config.spreading_factor
-    
-    @property
-    def bandwidth(self) -> Bandwidth:
-        return self.config.bandwidth
-    
-    @property
-    def crc_enabled(self) -> bool:
-        return self.config.crc_enabled
-    
-    @property
-    def preamble_len(self) -> int:
-        return self.config.preamble_len
-    
-    @property
-    def fixed_len(self) -> bool:
-        return self.config.fixed_payload_len
-    
-    @property
-    def iq_inverted(self) -> bool:
-        return self.config.iq_inverted
+    def airtime(self) -> float:
+        """ Estimates the total airtime of the packet in seconds. """
+        return estimate_airtime(
+            payload_len=len(self.payload),
+            bandwidth=self.config.bandwidth,
+            spreading_factor=self.config.spreading_factor,
+            code_rate=self.config.code_rate,
+            preamble_len=self.config.preamble_len,
+            fixed_payload_len=self.config.fixed_payload_len,
+            crc_enabled=self.config.crc_enabled,
+            low_data_rate_optimize=False, # TODO: Determine when to enable this based on SF and BW
+        )
 
     def __repr__(self):
-        return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.spreading_factor}, bandwidth={self.bandwidth}, code_rate={self.code_rate})")
+        return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.config.spreading_factor}, bandwidth={self.config.bandwidth}, code_rate={self.config.code_rate})")
     
-    def copy(self) -> 'LoraPacket':
+    def __copy__(self) -> 'LoraPacket':
         return LoraPacket(
-            payload=self.payload,
+            payload=bytes(self.payload),
             tx_power=self.tx_power,
             config=self.config.copy(),
             snr=self.snr,

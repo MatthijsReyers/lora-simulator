@@ -5,7 +5,6 @@ from pandas import DataFrame
 from simulator.environment import simulation_env as sim
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
-from simulator.lora.utils import estimate_packet_airtime
 
 class LoraPhyLayer():
     """
@@ -17,24 +16,7 @@ class LoraPhyLayer():
 
     # A log of all transmitted packets, these are stored as a dictionary because that is the most
     # performant way to construct a DataFrame later on.
-    __packets_log = {
-        "id": [],
-        "radio_id": [],
-        "start_time": [],
-        "duration": [],
-        "location.x": [],
-        "location.y": [],
-        "tx_power": [],
-        "code_rate": [],
-        "spreading_factor": [],
-        "bandwidth": [],
-        "crc_enabled": [],
-        "preamble_len": [],
-        "fixed_len": [],
-        "iq_inverted": [],
-        "symbols": [],
-        "payload": [],
-    }
+    __packets_log: dict
     
     packets_log: Optional[DataFrame] = None
     
@@ -51,6 +33,24 @@ class LoraPhyLayer():
         if not hasattr(self, 'initialized'):
             self.initialized = True
             sim.create_task(self.__on_sim_end())
+            self.__packets_log = {
+                "id": [],
+                "radio_id": [],
+                "start_time": [],
+                "duration": [],
+                "location.x": [],
+                "location.y": [],
+                "tx_power": [],
+                "code_rate": [],
+                "spreading_factor": [],
+                "bandwidth": [],
+                "crc_enabled": [],
+                "preamble_len": [],
+                "fixed_len": [],
+                "iq_inverted": [],
+                "symbols": [],
+                "payload": [],
+            }
 
 
     async def __on_sim_end(self):
@@ -58,8 +58,9 @@ class LoraPhyLayer():
             Called when the simulation ends.
         """
         await sim.wait_for_sim_end()
+        # Convert the packets log to a DataFrame for easier analysis, we do this at the end because
+        # continuously appending rows to a DataFrame is very inefficient.
         self.packets_log = DataFrame(self.__packets_log)
-        self.__packets_log = {}
 
 
     def subscribe(self, radio: 'LoraRadio'):
@@ -81,8 +82,10 @@ class LoraPhyLayer():
             Simulate the transmission of a LoRa packet in the environment.
             This is a non-blocking version that schedules the transmission and returns immediately.
         """
-        raise NotImplementedError("Non-blocking transmit_data is not implemented yet.")
-
+        self.logger.debug(f"transmit_packet(sender={id(sender) % 1000})")
+        raise NotImplementedError(
+            "transmit_packet is not yet implemented, use transmit_packet_blocking instead"
+        )
 
     async def transmit_packet_blocking(
         self, 
@@ -96,9 +99,9 @@ class LoraPhyLayer():
         """
         self.logger.debug(f"transmit_packet_blocking(sender={id(sender) % 1000})")
         
-        assert sender in self.__subscribers, "Sender radio is not subscribed to the PHY layer"
+        assert sender in self.__subscribers, "BUG: Sender radio is not subscribed to the PHY layer"
 
-        airtime = estimate_packet_airtime(packet)
+        airtime = packet.airtime()
         self.logger.debug(f"airtime estimated: {airtime:.3f} s")
 
         # Log packet for later analysis

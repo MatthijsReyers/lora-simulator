@@ -4,7 +4,6 @@ import logging
 
 sys.path.append('.')
 
-from simulator.lora.packet import LoraPacket
 from simulator.lora.phy_layer import LoraPhyLayer
 from simulator.lora.radio import LoraRadio
 from simulator.environment import simulation_env as sim
