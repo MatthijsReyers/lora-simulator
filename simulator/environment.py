@@ -41,6 +41,9 @@ class SimulationEnvironment:
     # Total length of the simulation in ticks
     __simulation_length: Optional[int]
 
+    # Every task running in the simulation environment increments this lock counter by 1. When the
+    # counter is greater than 0 the simulation time does not advance. This ensures that as long as
+    # there are active tasks the simulation time is blocked from advancing.
     __timer_lock: asyncio.Lock
     __timer_locks: int
 
@@ -152,23 +155,26 @@ class SimulationEnvironment:
 
     def create_task(self, task: 'Coroutine', name: str = None):
         """ 
-            Adds a new async task to the simulation environment to run during the simulation. This must be done before the
-            simulation starts.
+            Adds a new async task to the simulation environment to run once the simulation starts,
+            this can only be called before the simulation starts. If you want to create a task 
+            from within another task while the simulation is running use `start_child_task()` 
+            instead.
 
             Note that by calling this method you create a task that automatically blocks the
-            simulation time from advancing until the task itself calls `sleep`, `wait`, or 
-            `wait_real`.
+            simulation time from advancing until the task itself calls `sleep`, `wait`, 
+            `wait_real`, or finishes.
         """
         if self.__current_tick > 0:
-            raise SimulatorException("Cannot add tasks after the simulation has started.")
+            raise SimulatorException(
+                "Cannot add a new root task after the simulation has started, if you want to \
+                start a new task from a currently running task use start_child_task() instead."
+            )
         
         # We can increment the timer lock here without acquiring the lock because this method can
         # only be called before the async runtime is setup and the simulation has started.
         self.__timer_locks += 1
 
         async def wrapped_task():
-            # Increment the timer lock since there is now one more active task which might block
-            # the simulation time from advancing.
             await self.wait_for_sim_start()
             try:
                 await asyncio.create_task(task)
@@ -182,6 +188,48 @@ class SimulationEnvironment:
         loop = asyncio.get_event_loop()
         t = loop.create_task(wrapped_task(), name=name)
         self.__tasks.append(t)
+
+
+    async def start_child_task(self, task: 'Coroutine', name: str = None):
+        """ 
+            Add a new task to the simulation environment while the simulation is running, this can
+            and should only be called from within another task that is already running in the 
+            simulation.
+
+            Note that by calling this method you create a task that automatically blocks the
+            simulation time from advancing until the task itself calls `sleep`, `wait`, 
+            `wait_real`, or finishes.
+        """
+        task_start_event = asyncio.Event()
+
+        async def wrapped_task():
+            self.logger.debug(f'{self.current_time():.2f} start_child_task, {self.__timer_locks}')
+
+            # Increment the timer lock since there is now one more active task which might block
+            # the simulation time from advancing.
+            await self.__timer_lock.acquire()
+            self.logger.debug(f'{self.current_time():.2f} start_child_task locked')
+            self.__timer_locks += 1
+            self.__timer_lock.release()
+            task_start_event.set()
+            try:
+                await asyncio.create_task(task)
+            except Exception as e:
+                self.logger.error(f"Task raised an exception: {e}")
+                import traceback, sys
+                traceback.print_exc()
+                sys.exit(1)
+            await self.__task_finished()
+
+        loop = asyncio.get_event_loop()
+        t = loop.create_task(wrapped_task(), name=name)
+        self.__tasks.append(t)
+
+        # Wait for the task to increment the timer lock so the simulation time does not 
+        # accidentally advance before the new child task starts executing.
+        self.logger.debug(f'{self.current_time():.2f} start_child_task, waiting for task start')
+        await task_start_event.wait()
+        self.logger.debug(f'{self.current_time():.2f} start_child_task, finished')
 
 
     def is_running(self) -> bool:
@@ -282,7 +330,7 @@ class SimulationEnvironment:
     @requires_running_simulation
     async def sleep_until(self, timestamp: float):
         """ 
-            Wait for the simulation time to advance for the given duration.
+            Wait for the simulation time to advance until the given time is reached.
         """
         self.logger.debug(f'{self.current_time():.2f} sleep_until({timestamp})')
 
