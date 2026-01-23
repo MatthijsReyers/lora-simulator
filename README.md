@@ -14,7 +14,7 @@ We recommend checking out the basic smaller examples first (listed at the top of
 ## Unit testing
 
 Those wishing to extend the simulator with new features for their own use should know that there are unit tests located in the `tests/` directory. 
-Test files should follow the naming convention `test_*.py` and test functions should be prefixed with `test_`.
+Test files should follow the naming convention `test_*.py`.
 You can run/debug the unit tests using the following commands:
 
 ```bash
