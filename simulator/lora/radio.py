@@ -400,7 +400,7 @@ class LoraRadio(ABC):
         self.__tx_timeout = timeout
 
 
-    def _receive_start(self, packet: LoraPacket, rssi: float):
+    def _on_receive_start(self, packet: LoraPacket, rssi: float):
         """
             Called when the radio begins receiving a packet. This is a callback function used by the 
             PHY layer to notify the radio of incoming packets, end users should never be calling
@@ -433,11 +433,26 @@ class LoraRadio(ABC):
         )
 
 
-    async def _receive_end(self, packet: LoraPacket):
+    async def _on_receive_preamble(self, packet: LoraPacket):
         """
-            Called when the radio finishes receiving a packet. The 
+            Called when the radio detects the preamble of a packet.
         """
-        self.logger.debug(f"radio={self._radio_id} _receive_end({packet})")
+        self.logger.debug(f"radio={self._radio_id} _on_receive_preamble({packet})")
+        # TODO: cancel RX timeout for non-continuous RX mode after preamble is detected
+
+
+    async def _on_receive_header(self, packet: LoraPacket):
+        """
+            Called when the radio detects the header of a packet. 
+        """
+        self.logger.debug(f"radio={self._radio_id} _on_receive_header({packet})")
+
+
+    async def _on_receive_end(self, packet: LoraPacket):
+        """
+            Called when the radio finishes receiving a whole packet.
+        """
+        self.logger.debug(f"radio={self._radio_id} _on_receive_end({packet})")
         
         assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
 

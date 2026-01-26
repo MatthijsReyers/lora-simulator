@@ -100,7 +100,7 @@ class LoraPhyLayer():
         for radio in self.__subscribers:
             if radio == sender: continue
             rssi = self.__estimate_rssi(sender.position, radio.position)
-            radio._receive_start(packet, rssi)
+            radio._on_receive_start(packet, rssi)
 
         # Advance simulation time by the airtime of the packet
         await sim.sleep(airtime)
@@ -108,7 +108,7 @@ class LoraPhyLayer():
         # Notify radios about the end of the transmission
         for radio in self.__subscribers:
             if radio == sender: continue
-            await radio._receive_end(packet)
+            await radio._on_receive_end(packet)
 
         return airtime
 

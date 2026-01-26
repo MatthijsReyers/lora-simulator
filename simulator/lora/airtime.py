@@ -38,17 +38,50 @@ def preamble_airtime(
     return preamble_symbols * t_sym
 
 
-def payload_airtime(
+def header_airtime(
+    bandwidth: Bandwidth|int,
+    spreading_factor: SpreadingFactor|int,
+    code_rate: CodeRate|int,
+    low_data_rate_optimize: bool = False,
+) -> float:
+    """
+        Calculate the explicit header time on air for a LoRa packet (in seconds).
+        
+        The explicit header is 20 bits and contains payload length, coding rate, and CRC presence.
+        In implicit header mode (fixed_payload_len=True), there is no header.
+
+        See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
+    """
+    if type(spreading_factor) is int:
+        spreading_factor = SpreadingFactor(spreading_factor)
+    if type(code_rate) is int:
+        code_rate = CodeRate.from_denominator(code_rate)
+
+    t_sym = symbol_airtime(bandwidth, spreading_factor)
+
+    sf = spreading_factor.value
+    de = 1 if low_data_rate_optimize else 0
+    cr = code_rate.to_denominator() - 4
+
+    # Header contributes 20 bits to the payload calculation
+    # This is derived from the formula: the -20*h term when h=0 (explicit header)
+    header_symbols = math.ceil(20 / (4 * (sf - 2 * de))) * (cr + 4)
+
+    return header_symbols * t_sym
+
+
+def data_airtime(
     payload_len: int,
     bandwidth: Bandwidth|int,
     spreading_factor: SpreadingFactor|int,
     code_rate: CodeRate|int,
-    fixed_payload_len: bool = False,
     crc_enabled: bool = True,
     low_data_rate_optimize: bool = False,
 ) -> float:
     """
-        Calculate the payload (header + data) time on air for a LoRa packet (in seconds).
+        Calculate the data (without header) time on air for a LoRa packet (in seconds).
+        
+        This calculates the airtime for the payload data portion only, assuming implicit header mode.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
@@ -65,7 +98,7 @@ def payload_airtime(
     # Variable names taken from the formulas in the LoRa Design Guide
     pl = payload_len
     sf = spreading_factor.value
-    h = 1 if fixed_payload_len else 0 # Implicit header 
+    h = 1  # Implicit header (no header in this calculation)
     de = 1 if low_data_rate_optimize else 0
     cr = code_rate.to_denominator() - 4
     crc = 1 if crc_enabled else 0
@@ -79,6 +112,43 @@ def payload_airtime(
     )
 
     return payload_symbols * t_sym
+
+
+def payload_airtime(
+    payload_len: int,
+    bandwidth: Bandwidth|int,
+    spreading_factor: SpreadingFactor|int,
+    code_rate: CodeRate|int,
+    fixed_payload_len: bool = False,
+    crc_enabled: bool = True,
+    low_data_rate_optimize: bool = False,
+) -> float:
+    """
+        Calculate the payload (header + data) time on air for a LoRa packet (in seconds).
+
+        See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
+    """
+    t_data = data_airtime(
+        payload_len=payload_len,
+        bandwidth=bandwidth,
+        spreading_factor=spreading_factor,
+        code_rate=code_rate,
+        crc_enabled=crc_enabled,
+        low_data_rate_optimize=low_data_rate_optimize,
+    )
+    
+    if fixed_payload_len:
+        # Implicit header mode - no header
+        return t_data
+    else:
+        # Explicit header mode - include header
+        t_header = header_airtime(
+            bandwidth=bandwidth,
+            spreading_factor=spreading_factor,
+            code_rate=code_rate,
+            low_data_rate_optimize=low_data_rate_optimize,
+        )
+        return t_header + t_data
 
 
 def estimate_airtime(

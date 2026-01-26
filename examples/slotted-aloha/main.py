@@ -9,7 +9,7 @@ from simulator.environment import simulation_env as sim
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
-from simulator.lora.utils import estimate_airtime
+from simulator.lora.airtime import estimate_airtime
 
 # All nodes must use the exact same radio configuration
 SP = SpreadingFactor.SF7
