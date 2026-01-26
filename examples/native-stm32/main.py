@@ -58,8 +58,8 @@ class STM32Node(FFI):
 
         sim.create_task(self.__run())
 
-        @self.export('int(void)')
-        def HAL_SUBGHZ_Init() -> int:
+        @self.export('int(void*)')
+        def HAL_SUBGHZ_Init(_ptr) -> int:
             self.logger.debug('HAL_SUBGHZ_Init()')
             return HAL_StatusTypeDef.HAL_OK.value
 
@@ -69,9 +69,8 @@ class STM32Node(FFI):
             return round((sim.current_time() - self._boot_delay) * 1000)
 
         @self.export('void(double)')
-        def sim_sleep(duration: float):
+        def sim_sleep_start(duration: float):
             async def sleep_task():
-                self.lib.sim_sleep_start()
                 await sim.sleep(duration)
                 self.lib.sim_sleep_end()
             # Note that the sleep task does NOT run in the simulator tasks since we do not want to
@@ -87,7 +86,6 @@ class STM32Node(FFI):
         self.cdef('void run_sensor(void);')
         
         # Declare the sleep callback functions defined in C
-        self.cdef('void sim_sleep_start(void);')
         self.cdef('void sim_sleep_end(void);')
         
         self.lib = self.verify(
