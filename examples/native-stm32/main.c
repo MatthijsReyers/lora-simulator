@@ -1,5 +1,4 @@
 #include <pthread.h>
-#include <Python.h>
 
 // Flag that indicates if the sleep condition variable below has emitted yet, we need this because
 // of the unavoidable race condition where the Python thread may emit on the condition varible 
@@ -16,16 +15,9 @@ pthread_mutex_t sim_sleep_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Sleep for the given duration (in seconds), this is equivalent to calling sim.sleep() in Python.
  */
 void sim_sleep(double duration) {
-    // Acquire the GIL (and initialize thread state if needed)
-    PyGILState_STATE gstate;
-    gstate = PyGILState_Ensure();
-
     // Tell the Python side code to create a new async sleep task.
     sim_sleep_start(duration);
 
-    // Release GIL
-    PyGILState_Release(gstate);
-    
     // Wait for the Python/simulator side of things to setup the simulation in the async runtime
     // and then wait for the sleep to finish.
     pthread_mutex_lock(&sim_sleep_mutex);
@@ -49,12 +41,26 @@ extern void sim_sleep_end(void) {
     pthread_mutex_unlock(&sim_sleep_mutex);
 }
 
+int main(void);
+
+/**
+ * DO NOT CALL DIRECTLY!
+ * Callback for simulator for then the simulation should start running the sensor code.
+ */
+extern void run_sensor() {
+    main();
+}
+
+int HAL_GetTick() {
+    return sim_current_time() * 1000.0;
+}
+
 void HAL_Delay(int delay_ms) {
     double duration = delay_ms / 1000.0;
     sim_sleep(duration);
 }
 
-void main() {
+int main(void) {
     int subghz;
     HAL_SUBGHZ_Init(&subghz);
 
@@ -69,6 +75,3 @@ void main() {
     printf("5\n");
 }
 
-extern void run_sensor() {
-    main();
-}

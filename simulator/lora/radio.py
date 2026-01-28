@@ -272,12 +272,14 @@ class LoraRadio(ABC):
         from simulator.lora.phy_layer import LoraPhyLayer
 
         phy_layer = LoraPhyLayer()
-        await phy_layer.transmit_packet_blocking(self, packet)
+        airtime = await phy_layer.transmit_packet_blocking(self, packet)
 
         if self.__rx_continuous:
             self._set_state(RadioState.RX)
         else:
             self._set_state(RadioState.STANDBY)
+        
+        return airtime
 
 
     def set_rx_config(
