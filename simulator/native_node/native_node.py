@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-from abc import abstractmethod
 import sys, asyncio, logging
-from typing import Tuple
+from typing import List
 from cffi import FFI
+from os import path
 
 sys.path.append('.')
 
@@ -23,6 +23,7 @@ class NativeNode(FFI):
     _boot_delay: float
     __exports: dict
     logger: logging.Logger
+    source_files: List[str]
 
     def __init__(
             self, 
@@ -43,10 +44,18 @@ class NativeNode(FFI):
         self.__exports = {}
         self._boot_delay = boot_delay
         self.logger = logging.getLogger(f'Node{id(self) % 1000}@{source_file}')
-        self.source_file = source_file
         self.setup_callbacks()
-        with open(self.source_file, 'r') as f:
-            source_code = f.read()
+        self.source_files =[
+            path.dirname(path.realpath(__file__))+'/native_node.c'
+        ]
+        if source_file:
+            self.source_files.append(source_file)
+
+        source_code = ''
+        for sf in self.source_files:
+            with open(sf, 'r') as f:
+                source_code += f.read() + '\n'
+
         self.lib = self.verify(
             source_code,
             extra_compile_args=['-std=c11', '-O2'],
@@ -79,10 +88,12 @@ class NativeNode(FFI):
             # create a new sim lock.
             self.loop.create_task(sleep_task())
 
+
     async def __run(self):
         self.loop = asyncio.get_event_loop()
         self.thread = asyncio.create_task(asyncio.to_thread(self.lib.run_sensor))
         await self.thread
+
 
     def export(self, signature):
         """ Returns a decorator that exports a Python function to C with the given signature. """
@@ -94,6 +105,7 @@ class NativeNode(FFI):
             self.cdef('extern %s;' % callback_var)
             self.__exports[name] = (func_type, func)
         return decorator
+
 
     def verify(self, source='', **kwargs):
         extras = []
