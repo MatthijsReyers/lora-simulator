@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import asyncio, logging
-from typing import Optional
+from typing import Optional, Tuple
 
 from simulator.exceptions import SimulatorException
 from simulator.lora.enums.code_rate import CodeRate
@@ -150,34 +150,46 @@ class LoraRadio(ABC):
         self.__rx_continuous = continuous
 
 
-    async def receive_data_nowait(self) -> Optional[LoraPacket]:
+    async def receive_data_nowait(
+            self, metadata = False
+        ) -> Optional[LoraPacket | Tuple[LoraPacket, PacketMetadata]]:
         """
             Tries to receive data from the modem if it is available, immediately returns None if no
-            data is available in the receive queue.
+            data is available in the receive queue. Note that this call does not put the radio in
+            receive mode.
+
+            :param metadata: If true, also returns the PacketMetadata along with the LoraPacket.
         """
         self.logger.debug(f"radio={self._radio_id} receive_data()")
 
-        if self.__radio_state == RadioState.OFF:
-            await self.standby()
-
-        if self.__radio_state not in [RadioState.TX, RadioState.RX]:
-            self._set_state(RadioState.RX)
-
         try:
-            packet = await self.__rx_queue.get_timeout(0)
+            (packet, meta) = await self.__rx_queue.get_timeout(0)
+            await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
+            if metadata: 
+                return (packet, meta)
             return packet
         except asyncio.QueueEmpty:
             return None
 
 
-    async def receive_data_wait(self) -> LoraPacket:
+    async def receive_data_wait(
+            self, metadata = False
+        ) -> LoraPacket | Tuple[LoraPacket, PacketMetadata]:
         """
             Blocking wait that does not return until some data is received (correctly) by the radio.
+            Note that if a packet is already in the reception queue it does not put the radio in 
+            receive mode.
+
+            :param metadata: If true, also returns the PacketMetadata along with the LoraPacket.
         """
         self.logger.debug(f"radio={self._radio_id} receive_data_wait()")
 
         # Has a packet already been received?
-        try: return await self.__rx_queue.get_timeout(0)
+        try: 
+            (packet, meta) = await self.__rx_queue.get_timeout(0)
+            if metadata: 
+                return (packet, meta)
+            return packet
         except asyncio.TimeoutError: pass
         
         if self.__radio_state == RadioState.TX:
@@ -194,15 +206,22 @@ class LoraRadio(ABC):
         return packet
 
 
-    async def receive_data_within(self, timeout: float) -> LoraPacket:
+    async def receive_data_within(self, timeout: float, metadata = False) -> LoraPacket:
         """
             Waits for the given amount of time until some data is received over the radio and
             throws a TimeoutError if no data is received within that time.
+
+            :param timeout: In seconds, time to wait for a packet to be received.
+            :param metadata: If true, also returns the PacketMetadata along with the LoraPacket.
         """
         self.logger.debug(f"receive_data_within(timeout={timeout})")
 
         # Has a packet already been received?
-        try: return await self.__rx_queue.get_timeout(0)
+        try: 
+            (packet, meta) = await self.__rx_queue.get_timeout(0)
+            if metadata: 
+                return (packet, meta)
+            return packet
         except asyncio.TimeoutError: pass
 
         if self.__radio_state == RadioState.TX:
@@ -215,7 +234,11 @@ class LoraRadio(ABC):
             self._set_state(RadioState.RX)
 
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
-        return await self.__rx_queue.get_timeout(timeout)
+
+        (packet, meta) = await self.__rx_queue.get_timeout(timeout)
+        if metadata: 
+            return (packet, meta)
+        return packet
 
 
     async def transmit_data(self, data: bytes) -> asyncio.Event:
@@ -265,6 +288,7 @@ class LoraRadio(ABC):
         packet = LoraPacket(
             payload=data,
             tx_power=self.__tx_power,
+            tx_location=self.position,
             config=self.__tx_config.copy(),
         )
 
@@ -277,7 +301,7 @@ class LoraRadio(ABC):
         if self.__rx_continuous:
             self._set_state(RadioState.RX)
         else:
-            self._set_state(RadioState.STANDBY)
+            await self.standby()
         
         return airtime
 
@@ -408,7 +432,7 @@ class LoraRadio(ABC):
             PHY layer to notify the radio of incoming packets, end users should never be calling
             this directly.
         """
-        self.logger.debug(f"radio={self._radio_id} _receive_start({packet}, rssi={rssi})")
+        self.logger.debug(f"radio={self._radio_id} _receive_start(packet={packet.id}, rssi={rssi})")
 
         # Is the radio turned on and able to receive the packets?
         missed_start = not self.__can_receive(packet)
@@ -431,7 +455,8 @@ class LoraRadio(ABC):
             rssi=rssi,
             snr=snr,
             collision=found_collision,
-            missed_start=missed_start
+            missed_start=missed_start,
+            rx_location=self.position
         )
 
 
@@ -469,7 +494,7 @@ class LoraRadio(ABC):
         # Did we successfully receive the whole packet?
         if metadata.received_successfully():
             self.logger.debug(f"putting packet into rx queue: {packet}")
-            await self.__rx_queue.put(packet)
+            await self.__rx_queue.put((packet, metadata))
 
             # Turn off the radio if it was not in continuous receive mode
             if self.__radio_state == RadioState.RX and not self.__rx_continuous:

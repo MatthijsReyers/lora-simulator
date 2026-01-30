@@ -22,6 +22,8 @@ class LoraPhyLayer():
     
     logger = logging.getLogger("LoraPhyLayer")
 
+    _path_loss_exponent: float
+    _path_loss_sigma: float
 
     def __new__(cls, *args, **kwargs):
         if not cls.__instance:
@@ -29,7 +31,9 @@ class LoraPhyLayer():
         return cls.__instance
 
 
-    def __init__(self):
+    def __init__(self, path_loss_exponent = 2, path_loss_sigma = 6):
+        self._path_loss_exponent = path_loss_exponent
+        self._path_loss_sigma = path_loss_sigma
         if not hasattr(self, 'initialized'):
             self.initialized = True
             sim.create_task(self.__on_sim_end())
@@ -89,28 +93,24 @@ class LoraPhyLayer():
         
         assert sender in self.__subscribers, "BUG: Sender radio is not subscribed to the PHY layer"
 
-        airtime = packet.airtime()
-        self.logger.debug(f"airtime estimated: {airtime:.3f} s")
-
         # Log packet for later analysis
-        self.__log_packet(packet, sender, sim.current_time(), airtime)
+        self.__log_packet(packet, sender, sim.current_time(), packet.airtime)
 
         # Notify radios about the start of the transmission
-        self.logger.debug(f"subscribers count: {len(self.__subscribers)}")
         for radio in self.__subscribers:
             if radio == sender: continue
             rssi = self.__estimate_rssi(sender.position, radio.position)
             radio._on_receive_start(packet, rssi)
 
         # Advance simulation time by the airtime of the packet
-        await sim.sleep(airtime)
+        await sim.sleep(packet.airtime)
 
         # Notify radios about the end of the transmission
         for radio in self.__subscribers:
             if radio == sender: continue
             await radio._on_receive_end(packet)
 
-        return airtime
+        return packet.airtime
 
 
     @classmethod

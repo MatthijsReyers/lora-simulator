@@ -1,4 +1,5 @@
 
+from typing import Tuple
 from simulator.lora.radio_config import LoraConfig
 from simulator.lora.airtime import estimate_airtime
 
@@ -10,6 +11,7 @@ class LoraPacket:
             self, 
             payload: bytes, 
             tx_power: int,
+            tx_location: Tuple[float, float],
             config: LoraConfig,
             snr: float = None,
             rssi: float = None,
@@ -26,15 +28,32 @@ class LoraPacket:
         self.config = config
         self.payload = payload
         self.tx_power = tx_power
+        self.tx_location = tx_location
         self.snr = snr
         self.rssi = rssi
-        self._airtime = airtime
 
+        # Lazy properties
+        self.__airtime = airtime
+
+    def __repr__(self):
+        return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.config.spreading_factor}, bandwidth={self.config.bandwidth}, code_rate={self.config.code_rate})")
+    
+    def __copy__(self) -> 'LoraPacket':
+        return LoraPacket(
+            payload=bytes(self.payload),
+            tx_power=self.tx_power,
+            tx_location=self.tx_location,
+            config=self.config.copy(),
+            snr=self.snr,
+            rssi=self.rssi,
+        )
+
+    @property
     def airtime(self) -> float:
         """ Estimates the total airtime of the packet in seconds. """
         # Airtime is cached after first calculation since its kind of expensive to compute
-        if self._airtime is not None:
-            return self._airtime
+        if self.__airtime is not None:
+            return self.__airtime
         airtime = estimate_airtime(
             payload_len=len(self.payload),
             bandwidth=self.config.bandwidth,
@@ -45,17 +64,7 @@ class LoraPacket:
             crc_enabled=self.config.crc_enabled,
             low_data_rate_optimize=False, # TODO: Determine when to enable this based on SF and BW
         )
-        self._airtime = airtime
+        self.__airtime = airtime
         return airtime
 
-    def __repr__(self):
-        return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.config.spreading_factor}, bandwidth={self.config.bandwidth}, code_rate={self.config.code_rate})")
-    
-    def __copy__(self) -> 'LoraPacket':
-        return LoraPacket(
-            payload=bytes(self.payload),
-            tx_power=self.tx_power,
-            config=self.config.copy(),
-            snr=self.snr,
-            rssi=self.rssi,
-        )
+
