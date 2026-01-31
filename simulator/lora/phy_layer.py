@@ -31,9 +31,17 @@ class LoraPhyLayer():
         return cls.__instance
 
 
-    def __init__(self, path_loss_exponent = 2, path_loss_sigma = 6):
-        self._path_loss_exponent = path_loss_exponent
-        self._path_loss_sigma = path_loss_sigma
+    def __init__(self, path_loss_exponent: float = None, path_loss_sigma: float = None):
+        if path_loss_exponent is not None:
+            self._path_loss_exponent = path_loss_exponent
+        if self._path_loss_exponent is None:
+            self._path_loss_exponent = 2.0 # Free space
+        
+        if path_loss_sigma is not None:
+            self._path_loss_sigma = path_loss_sigma
+        if self._path_loss_sigma is None:
+            self._path_loss_sigma = 0.5 
+
         if not hasattr(self, 'initialized'):
             self.initialized = True
             sim.create_task(self.__on_sim_end())
