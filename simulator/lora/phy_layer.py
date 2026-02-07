@@ -113,12 +113,15 @@ class LoraPhyLayer():
         for radio in self.__subscribers:
             if radio == sender: continue
             p = deepcopy(packet)
-            assert p.id == packet.id, "Packet copy failed, ID mismatch"
             p.rx_location = radio.position
             radio._on_receive_start(p)
 
-        # Advance simulation time by the airtime of the packet
-        await sim.sleep(packet.airtime)
+        # Advance simulation time by the preamble airtime
+        await sim.sleep(packet.preamble_airtime)
+
+        for radio in self.__subscribers:
+            if radio == sender: continue
+            await radio._on_receive_preamble(packet.id)
 
         # Notify radios about the end of the transmission
         for radio in self.__subscribers:

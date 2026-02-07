@@ -16,6 +16,7 @@ class PacketMetadata:
         self.demodulate_failure = demodulate_failure
         self.missed_end = None
         self.interrupted = None
+        self.received_preamble = None
 
     def __repr__(self):
         status = []
@@ -29,6 +30,8 @@ class PacketMetadata:
             status.append("missed_end")
         if self.demodulate_failure:
             status.append("demodulate_failure")
+        if self.received_preamble:
+            status.append("received_preamble")
         status_str = ", ".join(status) if status else "successful"
         return f"PacketMetadata(status={status_str}, packet=Packet(id={self.packet.id}))"
     

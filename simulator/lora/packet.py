@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 from simulator.lora.distance import distance
 from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
 from simulator.lora.radio_config import LoraConfig
-from simulator.lora.airtime import estimate_airtime
+from simulator.lora.airtime import estimate_airtime, payload_airtime, preamble_airtime
 
 # Global packet counter for unique packet IDs
 _packet_id_counter = 0
@@ -17,7 +17,8 @@ class LoraPacket:
             config: LoraConfig,
             snr: float = None,
             rssi: float = None,
-            airtime: float = None,
+            preamble_t: float = None,
+            payload_t: float = None,
             packet_id: Optional[int] = None,
         ):
         assert isinstance(config, LoraConfig), "config must be a LoraConfig object"
@@ -39,8 +40,25 @@ class LoraPacket:
         self.__snr = snr
         self.__rssi = rssi
 
-        # Lazy properties
-        self.__airtime = airtime
+        self.preamble_airtime = preamble_t
+        self.payload_airtime = payload_t
+        if self.preamble_airtime is None:
+            self.preamble_airtime = preamble_airtime(
+                bandwidth=self.config.bandwidth,
+                spreading_factor=self.config.spreading_factor,
+                preamble_len=self.config.preamble_len,
+            )
+        if self.payload_airtime is None:
+            self.payload_airtime = payload_airtime(
+                payload_len=len(self.payload),
+                bandwidth=self.config.bandwidth,
+                spreading_factor=self.config.spreading_factor,
+                code_rate=self.config.code_rate,
+                fixed_payload_len=self.config.fixed_payload_len,
+                crc_enabled=self.config.crc_enabled,
+                # TODO: Determine when to enable this based on SF and BW
+                low_data_rate_optimize=False, 
+            )
 
     def __repr__(self):
         return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.config.spreading_factor}, bandwidth={self.config.bandwidth}, code_rate={self.config.code_rate})")
@@ -53,8 +71,14 @@ class LoraPacket:
             config=self.config.copy(),
             snr=self.__snr,
             rssi=self.__rssi,
-            packet_id=self.id
+            preamble_t=self.preamble_airtime,
+            payload_t=self.payload_airtime,
+            packet_id=self.id,
         )
+    
+    @property
+    def airtime(self) -> float:
+        return self.preamble_airtime + self.payload_airtime
 
     @property
     def rssi(self) -> float:
@@ -83,24 +107,5 @@ class LoraPacket:
         phy = LoraPhyLayer()
         self.__snr = self.rssi - phy.noise_floor
         return self.__snr
-
-    @property
-    def airtime(self) -> float:
-        """ Estimates the total airtime of the packet in seconds. """
-        # Airtime is cached after first calculation since its kind of expensive to compute
-        if self.__airtime is not None:
-            return self.__airtime
-        airtime = estimate_airtime(
-            payload_len=len(self.payload),
-            bandwidth=self.config.bandwidth,
-            spreading_factor=self.config.spreading_factor,
-            code_rate=self.config.code_rate,
-            preamble_len=self.config.preamble_len,
-            fixed_payload_len=self.config.fixed_payload_len,
-            crc_enabled=self.config.crc_enabled,
-            low_data_rate_optimize=False, # TODO: Determine when to enable this based on SF and BW
-        )
-        self.__airtime = airtime
-        return airtime
 
 

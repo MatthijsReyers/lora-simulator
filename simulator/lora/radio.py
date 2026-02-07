@@ -462,22 +462,28 @@ class LoraRadio(ABC):
         )
 
 
-    async def _on_receive_preamble(self, packet: LoraPacket):
+    async def _on_receive_preamble(self, packet_id: int):
         """
             Called when the radio detects the preamble of a packet.
         """
-        self.logger.debug(f"radio={self._radio_id} _on_receive_preamble({packet})")
+        self.logger.debug(f"radio={self._radio_id} _on_receive_preamble({packet_id})")
         # TODO: cancel RX timeout for non-continuous RX mode after preamble is detected
-        assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
+        assert packet_id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet_id} not found in transit?"
+        metadata = self.__packets_in_transit[packet_id]
+        metadata.received_preamble = (
+            not metadata.missed_start and 
+            not metadata.demodulate_failure and 
+            not metadata.collision and
+            not metadata.interrupted
+        )
 
 
-    async def _on_receive_header(self, packet: LoraPacket):
-        """
-            Called when the radio detects the header of a packet. 
-        """
-        self.logger.debug(f"radio={self._radio_id} _on_receive_header({packet})")
-
-        assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
+    # async def _on_receive_header(self, packet_id: int):
+    #     """
+    #         Called when the radio detects the header of a packet. 
+    #     """
+    #     self.logger.debug(f"radio={self._radio_id} _on_receive_header({packet})")
+    #     assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
 
 
     async def _on_receive_end(self, packet_id: int):
@@ -598,15 +604,25 @@ class LoraRadio(ABC):
         return collisions
 
 
-    def __packets_collide(self, p1: LoraPacket, p2: LoraPacket) -> bool:
+    def __packets_collide(self, first: LoraPacket, second: LoraPacket) -> bool:
         """
-            Determines whether two packets collide based on their parameters.
+            Determines whether the second packet collides with the first packet based on their 
+            TX parameters.
+
+            Note: this method assumes that the first packet was sent first and that the packets do
+            actually overlap in time.
         """
-        # Simple placeholder implementation: packets collide if they have the same SF and BW
-        if p1.config.spreading_factor == p2.config.spreading_factor:
-            if p1.config.bandwidth == p2.config.bandwidth:
-                return True
-        return False
+        if first.config.bandwidth == second.config.bandwidth:
+            return False
+        
+        power_delta = first.snr - second.snr
+
+        # From SEMTech collision rules https://privatevideos.hubs.vidyard.com/watch/iXBL8d2mjyjubK8DhuGcKq
+        if first.config.spreading_factor == second.config.spreading_factor:
+            return power_delta < 6.0
+        else:
+            snir = first.config.spreading_factor.minimum_snr()
+            return power_delta < snir
 
 
     def __log_packet_metadata(self, metadata: PacketMetadata):
@@ -621,11 +637,3 @@ class LoraRadio(ABC):
         self.__packets_log["missed_start"].append(metadata.missed_start)
         self.__packets_log["missed_end"].append(metadata.missed_end)
         self.__packets_log["interrupted"].append(metadata.interrupted)
-
-
-    def __estimate_snr(self) -> float:
-        """
-            Estimate the SNR of a packet based on the positions of the transmitter and receiver.
-        """
-        # Placeholder implementation
-        return 10.0
