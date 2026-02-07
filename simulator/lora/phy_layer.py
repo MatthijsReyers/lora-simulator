@@ -1,10 +1,12 @@
 import logging
-from typing import Optional, Tuple
+from typing import Callable, Optional
 
 from pandas import DataFrame
 from simulator.environment import simulation_env as sim
+from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
+from copy import deepcopy
 
 class LoraPhyLayer():
     """
@@ -22,8 +24,9 @@ class LoraPhyLayer():
     
     logger = logging.getLogger("LoraPhyLayer")
 
-    _path_loss_exponent: float
-    _path_loss_sigma: float
+    path_loss_estimator: Callable[[float, float], float]
+    noise_floor: float
+
 
     def __new__(cls, *args, **kwargs):
         if not cls.__instance:
@@ -31,25 +34,23 @@ class LoraPhyLayer():
         return cls.__instance
 
 
-    def __init__(self, path_loss_exponent: float = None, path_loss_sigma: float = None):
-        if path_loss_exponent is not None:
-            self._path_loss_exponent = path_loss_exponent
-        if self._path_loss_exponent is None:
-            self._path_loss_exponent = 2.0 # Free space
-        
-        if path_loss_sigma is not None:
-            self._path_loss_sigma = path_loss_sigma
-        if self._path_loss_sigma is None:
-            self._path_loss_sigma = 0.5 
-
+    def __init__(
+            self, 
+            path_loss: Callable[[float, float], float] = None, 
+            noise_floor: float = None,    
+        ):
         if not hasattr(self, 'initialized'):
             self.initialized = True
+            self.noise_floor = -120.0
+            self.path_loss_estimator = log_distance_path_loss(
+                exponent=2.0, sigma=0.5
+            )
             sim.create_task(self.__on_sim_end())
             self.__packets_log = {
                 "id": [],
                 "radio_id": [],
                 "start_time": [],
-                "duration": [],
+                "airtime": [],
                 "location.x": [],
                 "location.y": [],
                 "tx_power": [],
@@ -63,6 +64,10 @@ class LoraPhyLayer():
                 "symbols": [],
                 "payload": [],
             }
+        if path_loss is not None:
+            self.path_loss_estimator = path_loss
+        if noise_floor is not None:
+            self.noise_floor = noise_floor
 
 
     async def __on_sim_end(self):
@@ -102,13 +107,15 @@ class LoraPhyLayer():
         assert sender in self.__subscribers, "BUG: Sender radio is not subscribed to the PHY layer"
 
         # Log packet for later analysis
-        self.__log_packet(packet, sender, sim.current_time(), packet.airtime)
+        self.__log_packet(packet, sender, sim.current_time())
 
         # Notify radios about the start of the transmission
         for radio in self.__subscribers:
             if radio == sender: continue
-            rssi = self.__estimate_rssi(sender.position, radio.position)
-            radio._on_receive_start(packet, rssi)
+            p = deepcopy(packet)
+            assert p.id == packet.id, "Packet copy failed, ID mismatch"
+            p.rx_location = radio.position
+            radio._on_receive_start(p)
 
         # Advance simulation time by the airtime of the packet
         await sim.sleep(packet.airtime)
@@ -116,25 +123,16 @@ class LoraPhyLayer():
         # Notify radios about the end of the transmission
         for radio in self.__subscribers:
             if radio == sender: continue
-            await radio._on_receive_end(packet)
+            await radio._on_receive_end(packet.id)
 
         return packet.airtime
 
 
-    @classmethod
-    def __estimate_rssi(cls, pos_tx: Tuple[float, float], pos_rx: Tuple[float, float]) -> float:
-        """ 
-            Estimate the Received Signal Strength Indicator (RSSI) at the receiver based on the
-            positions of the transmitter and receiver.
-        """
-        return 0
-
-
-    def __log_packet(self, packet: LoraPacket, radio: LoraRadio, start_time: float, duration: float):
+    def __log_packet(self, packet: LoraPacket, radio: LoraRadio, start_time: float):
         self.__packets_log["id"].append(packet.id)
         self.__packets_log["radio_id"].append(id(radio))
         self.__packets_log["start_time"].append(start_time)
-        self.__packets_log["duration"].append(duration)
+        self.__packets_log["airtime"].append(packet.airtime)
         self.__packets_log["location.x"].append(radio.position[0])
         self.__packets_log["location.y"].append(radio.position[1])
         self.__packets_log["tx_power"].append(packet.tx_power)

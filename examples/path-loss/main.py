@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import logging
 import sys, random
 import pandas as pd
 
 sys.path.append('.')
 
+from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
 from simulator.lora.radio import LoraRadio
 from simulator.environment import simulation_env as sim
 from simulator.lora.enums.bandwidth import Bandwidth
@@ -11,13 +13,16 @@ from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.phy_layer import LoraPhyLayer
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
 SP = SpreadingFactor.SF7
 BW = Bandwidth.KHz125
 CR = CodeRate.CR4_5
 
 data = {
     "distance": [],
-    "rx_power"  : [],
+    "rssi"  : [],
 }
 
 class Node:
@@ -40,25 +45,45 @@ class Receiver:
         try:
             while sim.is_running():
                 (packet, meta) = await self.radio.receive_data_wait(metadata=True)
-                data["rx_power"].append(meta.rx_power)
-                print(f"Received packet: {packet.id}, rx={meta.rx_power:.2f}dbm")
+                data["rssi"].append(packet.rssi)
+                print(f"Received packet: {packet.id}, rssi={packet.rssi:.2f}dbm")
         except TimeoutError as e:
             return
 
 if __name__ == "__main__":
-    phy = LoraPhyLayer(
-        path_loss_exponent=3,
-        path_loss_sigma=2,
-    )
+    phy = LoraPhyLayer(path_loss=log_distance_path_loss(exponent=3, sigma=2))
+
+    receiver = Receiver()
 
     nodes = [ Node(pos=(i, 0)) for i in range(10) ]
     nodes += [ Node(pos=(i, 0)) for i in range(10, 100, 10) ]
     nodes += [ Node(pos=(i, 0)) for i in range(100, 1000, 50) ]
     nodes += [ Node(pos=(i, 0)) for i in range(1000, 10000, 100) ]
     nodes += [ Node(pos=(i, 0)) for i in range(10000, 100000, 1000) ]
-    
-    receiver = Receiver()
+    nodes += [ Node(pos=(i, 0)) for i in range(100000, 1000000, 10000) ]
     
     sim.run(1000000000)
+
+    level = logging.DEBUG
+
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    formatter = logging.Formatter("%(levelname)s;%(message)s")
+    ch.setFormatter(formatter)
+
+    logger.addHandler(ch)
+
+    sim.logger.setLevel(logging.INFO)
+    sim.logger.addHandler(ch)
+
+    phy_layer = LoraPhyLayer()
+    phy_layer.logger.setLevel(level)
+    phy_layer.logger.addHandler(ch)
+
+    nodes[0].radio.logger.setLevel(level)
+    nodes[0].radio.logger.addHandler(ch)
+
+    receiver.radio.logger.setLevel(level)
+    receiver.radio.logger.addHandler(ch)
 
     pd.DataFrame(data).to_csv("path_loss_data.csv", index=False)

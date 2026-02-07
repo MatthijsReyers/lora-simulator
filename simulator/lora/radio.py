@@ -201,8 +201,10 @@ class LoraRadio(ABC):
         if self.__radio_state != RadioState.RX:
             self._set_state(RadioState.RX)
         
-        packet = await self.__rx_queue.get()
+        (packet, meta) = await self.__rx_queue.get()
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
+        if metadata: 
+            return (packet, meta)
         return packet
 
 
@@ -426,19 +428,23 @@ class LoraRadio(ABC):
         self.__tx_timeout = timeout
 
 
-    def _on_receive_start(self, packet: LoraPacket, rssi: float):
+    def _on_receive_start(self, packet: LoraPacket):
         """
             Called when the radio begins receiving a packet. This is a callback function used by the 
             PHY layer to notify the radio of incoming packets, end users should never be calling
             this directly.
         """
-        self.logger.debug(f"radio={self._radio_id} _receive_start(packet={packet.id}, rssi={rssi})")
+        self.logger.debug(f"radio={self._radio_id} _receive_start(packet={packet.id}, rssi={packet.rssi})")
 
         # Is the radio turned on and able to receive the packets?
         missed_start = not self.__can_receive(packet)
 
         # Does this packet overlap with any other packets currently being sent?
         possible_collisions = self.__find_overlap(packet)
+
+        # Is the radio able to distinguish this packet from the noise floor?
+        required = self.__rx_config.spreading_factor.minimum_snr()
+        demodulate_failure = packet.snr < required
 
         # Overlapping packets do not have to collide if they use different enough parameters
         found_collision = False
@@ -447,16 +453,12 @@ class LoraRadio(ABC):
                 meta.collision = True
                 found_collision = True
 
-        snr = self.__estimate_snr()
-
         # Add this packet to the list of packets in transit
         self.__packets_in_transit[packet.id] = PacketMetadata(   
             packet=packet,
-            rssi=rssi,
-            snr=snr,
             collision=found_collision,
             missed_start=missed_start,
-            rx_location=self.position
+            demodulate_failure=demodulate_failure,
         )
 
 
@@ -466,6 +468,7 @@ class LoraRadio(ABC):
         """
         self.logger.debug(f"radio={self._radio_id} _on_receive_preamble({packet})")
         # TODO: cancel RX timeout for non-continuous RX mode after preamble is detected
+        assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
 
 
     async def _on_receive_header(self, packet: LoraPacket):
@@ -474,18 +477,19 @@ class LoraRadio(ABC):
         """
         self.logger.debug(f"radio={self._radio_id} _on_receive_header({packet})")
 
+        assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
 
-    async def _on_receive_end(self, packet: LoraPacket):
+
+    async def _on_receive_end(self, packet_id: int):
         """
             Called when the radio finishes receiving a whole packet.
         """
-        self.logger.debug(f"radio={self._radio_id} _on_receive_end({packet})")
-        
-        assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
+        self.logger.debug(f"radio={self._radio_id} _on_receive_end({packet_id})")
+        assert packet_id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet_id} not found in transit?"
 
         # Remove packet from in transit list
-        metadata = self.__packets_in_transit.pop(packet.id, None)
-        if not self.__can_receive(packet):
+        metadata = self.__packets_in_transit.pop(packet_id, None)
+        if not self.__can_receive(metadata.packet):
             metadata.missed_end = True
 
         # Log packet metadata for later analysis
@@ -493,8 +497,8 @@ class LoraRadio(ABC):
 
         # Did we successfully receive the whole packet?
         if metadata.received_successfully():
-            self.logger.debug(f"putting packet into rx queue: {packet}")
-            await self.__rx_queue.put((packet, metadata))
+            self.logger.debug(f"putting packet into rx queue: {metadata.packet}")
+            await self.__rx_queue.put((metadata.packet, metadata))
 
             # Turn off the radio if it was not in continuous receive mode
             if self.__radio_state == RadioState.RX and not self.__rx_continuous:
@@ -592,7 +596,7 @@ class LoraRadio(ABC):
             if self.__packets_collide(meta.packet, packet):
                 collisions.append(meta)
         return collisions
-    
+
 
     def __packets_collide(self, p1: LoraPacket, p2: LoraPacket) -> bool:
         """
@@ -611,8 +615,8 @@ class LoraRadio(ABC):
         """
         self.__packets_log["id"].append(metadata.packet.id)
         self.__packets_log["time"].append(sim.current_time())
-        self.__packets_log["snr"].append(metadata.snr)
-        self.__packets_log["rssi"].append(metadata.rssi)
+        self.__packets_log["snr"].append(metadata.packet.snr)
+        self.__packets_log["rssi"].append(metadata.packet.rssi)
         self.__packets_log["collision"].append(metadata.collision)
         self.__packets_log["missed_start"].append(metadata.missed_start)
         self.__packets_log["missed_end"].append(metadata.missed_end)
