@@ -123,6 +123,8 @@ class LoraPhyLayer():
             if radio == sender: continue
             await radio._on_receive_preamble(packet.id)
 
+        await sim.sleep(packet.payload_airtime)
+
         # Notify radios about the end of the transmission
         for radio in self.__subscribers:
             if radio == sender: continue
@@ -133,7 +135,7 @@ class LoraPhyLayer():
 
     def __log_packet(self, packet: LoraPacket, radio: LoraRadio, start_time: float):
         self.__packets_log["id"].append(packet.id)
-        self.__packets_log["radio_id"].append(id(radio))
+        self.__packets_log["radio_id"].append(radio._radio_id)
         self.__packets_log["start_time"].append(start_time)
         self.__packets_log["airtime"].append(packet.airtime)
         self.__packets_log["location.x"].append(radio.position[0])
