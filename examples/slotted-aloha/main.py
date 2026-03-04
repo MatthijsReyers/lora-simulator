@@ -4,12 +4,13 @@ import pandas as pd
 
 sys.path.append('.')
 
+from simulator.lora.phy_layer import LoraPhyLayer
 from simulator.lora.radio import LoraRadio
 from simulator.environment import simulation_env as sim
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
-from simulator.lora.airtime import estimate_airtime
+from simulator.lora.airtime import symbol_airtime, estimate_airtime, header_airtime, preamble_airtime
 
 # All nodes must use the exact same radio configuration
 SP = SpreadingFactor.SF7
@@ -17,7 +18,7 @@ BW = Bandwidth.KHz125
 CR = CodeRate.CR4_5
 
 # Target offered load (real value is computed from collected data)
-G = 4.7
+G = float(sys.argv[1].replace(',', '.')) if len(sys.argv) > 1 else 4.0
 
 # Number of nodes to use for the simulation
 NUM_NODES = 100
@@ -34,7 +35,7 @@ SLOT_DURATION = 0.1 + estimate_airtime(
 )
 
 # Total simulation duration (in seconds)
-SIM_DURATION = 1000
+SIM_DURATION = 200
 
 RESULTS_CSV = "examples/slotted-aloha/results.csv"
 
@@ -87,6 +88,11 @@ class Receiver:
 
 
 if __name__ == "__main__":
+    # ALOHA throughput analysis assumes that any overlapping packets cause a collision and full
+    # packet loss so we disable the capture effect for this experiment.
+    phy = LoraPhyLayer()
+    phy.enable_capture_effect = False
+
     nodes = [ Node(node_id=i) for i in range(NUM_NODES) ]
     receiver = Receiver(nodes)
     sim.run(SIM_DURATION)
