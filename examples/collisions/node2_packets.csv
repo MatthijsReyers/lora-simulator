@@ -1,0 +1,9 @@
+id,time,snr,rssi,collision,missed_start,missed_end,interrupted
+1,0.042218,140.0,20.0,False,True,True,
+5,0.583434,140.0,20.0,False,True,False,
+8,1.12465,140.0,20.0,False,True,False,
+11,1.6658659999999998,140.0,20.0,False,False,False,
+14,2.207083,140.0,20.0,False,False,False,
+17,2.7483,140.0,20.0,False,False,False,
+20,3.289517,140.0,20.0,False,False,False,
+23,3.8307339999999996,140.0,20.0,False,False,False,
