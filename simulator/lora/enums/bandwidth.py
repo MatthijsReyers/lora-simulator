@@ -18,6 +18,15 @@ class Bandwidth(IntEnum):
             case Bandwidth.KHz500 | 2:
                 return 500_000
 
+    def to_khz(self) -> int:
+        match self:
+            case Bandwidth.KHz125 | 0:
+                return 125
+            case Bandwidth.KHz250 | 1:
+                return 250
+            case Bandwidth.KHz500 | 2:
+                return 500
+
     @staticmethod
     def from_hz(hz: int) -> 'Bandwidth':
         match hz:

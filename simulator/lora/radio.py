@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 import asyncio, logging
 from typing import Optional, Tuple
+import pandas as pd
+import random
 
 from simulator.exceptions import SimulatorException
 from simulator.lora.enums.code_rate import CodeRate
@@ -50,7 +52,6 @@ class LoraRadio(ABC):
     __state_log: list
     __packets_log: dict
 
-    
     def __init__(
             self, 
             position: tuple[float, float] = (0.0, 0.0), 
@@ -87,8 +88,14 @@ class LoraRadio(ABC):
 
         # Prevents circular import
         from simulator.lora.phy_layer import LoraPhyLayer
-        phy = LoraPhyLayer()
-        phy.subscribe(self)
+        self.phy = LoraPhyLayer()
+        self.phy.subscribe(self)
+
+        sim.create_task(self.__on_sim_end())
+
+    async def __on_sim_end(self):
+        await sim.wait_for_sim_end()
+        self.packets_log = pd.DataFrame(self.__packets_log)
 
 
     def get_state(self) -> RadioState:
@@ -434,13 +441,13 @@ class LoraRadio(ABC):
             PHY layer to notify the radio of incoming packets, end users should never be calling
             this directly.
         """
-        self.logger.debug(f"radio={self._radio_id} _receive_start(packet={packet.id}, rssi={packet.rssi})")
+        self.logger.debug(f"{sim.current_time():.4f} radio={self._radio_id} _on_receive_start(packet={packet.id}, rssi={packet.rssi})")
 
         # Is the radio turned on and able to receive the packets?
         missed_start = not self.__can_receive(packet)
 
         # Does this packet overlap with any other packets currently being sent?
-        possible_collisions = self.__find_overlap(packet)
+        possible_collisions = self.__packets_in_transit.values()
 
         # Is the radio able to distinguish this packet from the noise floor?
         required = self.__rx_config.spreading_factor.minimum_snr()
@@ -449,8 +456,10 @@ class LoraRadio(ABC):
         # Overlapping packets do not have to collide if they use different enough parameters
         found_collision = False
         for meta in possible_collisions:
-            if self.__packets_collide(meta.packet, packet):
+            (fst, snd) = self.__capture_effect(meta.packet, packet)
+            if not fst:
                 meta.collision = True
+            if not snd:
                 found_collision = True
 
         # Add this packet to the list of packets in transit
@@ -466,7 +475,7 @@ class LoraRadio(ABC):
         """
             Called when the radio detects the preamble of a packet.
         """
-        self.logger.debug(f"radio={self._radio_id} _on_receive_preamble({packet_id})")
+        self.logger.debug(f"{sim.current_time():.4f} radio={self._radio_id} _on_receive_preamble({packet_id})")
         # TODO: cancel RX timeout for non-continuous RX mode after preamble is detected
         assert packet_id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet_id} not found in transit?"
         metadata = self.__packets_in_transit[packet_id]
@@ -478,25 +487,16 @@ class LoraRadio(ABC):
         )
 
 
-    # async def _on_receive_header(self, packet_id: int):
-    #     """
-    #         Called when the radio detects the header of a packet. 
-    #     """
-    #     self.logger.debug(f"radio={self._radio_id} _on_receive_header({packet})")
-    #     assert packet.id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet.id} not found in transit?"
-
-
     async def _on_receive_end(self, packet_id: int):
         """
             Called when the radio finishes receiving a whole packet.
         """
-        self.logger.debug(f"radio={self._radio_id} _on_receive_end({packet_id})")
+        self.logger.debug(f"{sim.current_time():.4f} radio={self._radio_id} _on_receive_end({packet_id})")
         assert packet_id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet_id} not found in transit?"
 
         # Remove packet from in transit list
         metadata = self.__packets_in_transit.pop(packet_id, None)
-        if not self.__can_receive(metadata.packet):
-            metadata.missed_end = True
+        metadata.missed_end = (not self.__can_receive(metadata.packet))
 
         # Log packet metadata for later analysis
         self.__log_packet_metadata(metadata)
@@ -593,36 +593,80 @@ class LoraRadio(ABC):
         return True
     
 
-    def __find_overlap(self, packet: LoraPacket) -> list[PacketMetadata]:
-        """
-            Finds all packets in transit whose send time overlaps with the given packet.
-        """
-        collisions = []
-        for meta in self.__packets_in_transit.values():
-            if self.__packets_collide(meta.packet, packet):
-                collisions.append(meta)
-        return collisions
-
-
-    def __packets_collide(self, first: LoraPacket, second: LoraPacket) -> bool:
+    def __capture_effect(self, first: LoraPacket, second: LoraPacket) -> Tuple[bool, bool]:
         """
             Determines whether the second packet collides with the first packet based on their 
             TX parameters.
 
-            Note: this method assumes that the first packet was sent first and that the packets do
-            actually overlap in time.
+            Note: this method assumes that packets do actually overlap in time.
         """
-        if first.config.bandwidth == second.config.bandwidth:
-            return False
+        # If the packets have different bandwidths they won't interfere with each other
+        if first.config.bandwidth != second.config.bandwidth:
+            return (False, False)
         
+        # Traditional SEMTech collision rules if one packet is this much stronger than the other
+        # we can definitely demodulate the stronger packet.
+        # https://privatevideos.hubs.vidyard.com/watch/iXBL8d2mjyjubK8DhuGcKq
         power_delta = first.snr - second.snr
-
-        # From SEMTech collision rules https://privatevideos.hubs.vidyard.com/watch/iXBL8d2mjyjubK8DhuGcKq
         if first.config.spreading_factor == second.config.spreading_factor:
-            return power_delta < 6.0
+            if power_delta > 6.0:
+                return (True, False)
         else:
             snir = first.config.spreading_factor.minimum_snr()
-            return power_delta < snir
+            if power_delta > snir:
+                return (True, False)
+            
+        # Detailed capture effect calculations can be disabled for performance or when not needed,
+        # in which case we just assume all overlapping packets are lost.
+        if not self.phy.enable_capture_effect:
+            return (False, False)
+
+        uninterrupted_t = first.symbol_t * 6
+
+        # See: LoRa Scalability: A Simulation Model Based on Interference Measurements (2017)
+        # Measurements show that the probability of the second packet being received successfully
+        # relates direct to how much of the preamble of the second packet is received without 
+        # interference from the first packet.
+        p1_end = first.tx_start + first.airtime
+        p2_start = second.tx_start
+
+        interfered_t = p1_end - (p2_start + uninterrupted_t)
+        interfered_ratio = interfered_t / uninterrupted_t
+        snd = interfered_ratio < random.random()
+
+        # Is the first packet stronger or equal in reception to the second?
+        if first.rssi >= second.rssi:
+
+            # At least 6 symbols of the preamble of the first packet must be received without collision
+            # in order to still have any chance of demodulating the first packet.
+            # See: LoRa Scalability: A Simulation Model Based on Interference Measurements (2017)
+            if first.tx_start + uninterrupted_t < second.tx_start:
+                fst = random.random() < 0.95  # 95% chance to receive the first packet successfully
+                return (fst, snd)
+            else:
+                return (False, snd)
+            
+        # Second packet is stronger than the first.
+        if snd: return (False, True)
+
+        # The second packet may be received if it interrupts the header and causes the header
+        # CRC of the first packet to fail, giving the radio a chance to sync on the second packet 
+        # instead of the first.
+        if not first.config.fixed_payload_len:
+
+            header_start = first.tx_start + first.preamble_airtime
+            header_end = header_start + first.header_airtime
+            if second.tx_start < header_end:
+
+                # Same calculation as before now, but we use the end of the header as the "end" of
+                # the first packet..
+                interfered_t = header_end - (p2_start + uninterrupted_t)
+                interfered_ratio = interfered_t / uninterrupted_t
+                snd = interfered_ratio < random.random()
+
+                return (False, snd)
+            
+        return (False, snd)
 
 
     def __log_packet_metadata(self, metadata: PacketMetadata):

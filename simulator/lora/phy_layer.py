@@ -41,6 +41,7 @@ class LoraPhyLayer():
         ):
         if not hasattr(self, 'initialized'):
             self.initialized = True
+            self.enable_capture_effect = True
             self.noise_floor = -120.0
             self.path_loss_estimator = log_distance_path_loss(
                 exponent=2.0, sigma=0.5

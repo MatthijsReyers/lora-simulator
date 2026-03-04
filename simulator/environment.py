@@ -57,6 +57,11 @@ class SimulationEnvironment:
 
 
     def __init__(self, tick_size: float = 0.000001):
+        try:
+            self.__loop = asyncio.get_event_loop()
+        except RuntimeError as e:
+            self.__loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.__loop)
         self.__current_tick = 0
         self.__simulation_length = None
         self.__wakeup_events = WakeUpQueue()

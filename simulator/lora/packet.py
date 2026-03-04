@@ -1,9 +1,9 @@
 
 from typing import Optional, Tuple
 from simulator.lora.distance import distance
-from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
 from simulator.lora.radio_config import LoraConfig
-from simulator.lora.airtime import estimate_airtime, payload_airtime, preamble_airtime
+from simulator.lora.airtime import header_airtime, payload_airtime, symbol_airtime, preamble_airtime
+from simulator.environment import simulation_env as sim
 
 # Global packet counter for unique packet IDs
 _packet_id_counter = 0
@@ -17,6 +17,8 @@ class LoraPacket:
             config: LoraConfig,
             snr: float = None,
             rssi: float = None,
+            symbol_t: float = None,
+            header_t: float = None,
             preamble_t: float = None,
             payload_t: float = None,
             packet_id: Optional[int] = None,
@@ -39,9 +41,24 @@ class LoraPacket:
         self.rx_location = None
         self.__snr = snr
         self.__rssi = rssi
+        self.tx_start = sim.current_time()
 
+        self.symbol_t = symbol_t
         self.preamble_airtime = preamble_t
+        self.header_airtime = header_t
         self.payload_airtime = payload_t
+        if self.symbol_t is None:
+            self.symbol_t = symbol_airtime(
+                bandwidth=self.config.bandwidth,
+                spreading_factor=self.config.spreading_factor,
+            )
+        if self.header_airtime is None:
+            self.header_airtime = header_airtime(
+                bandwidth=self.config.bandwidth,
+                spreading_factor=self.config.spreading_factor,
+                code_rate=self.config.code_rate,
+                low_data_rate_optimize=False, # TODO: Determine when to enable this based on SF and BW
+            )
         if self.preamble_airtime is None:
             self.preamble_airtime = preamble_airtime(
                 bandwidth=self.config.bandwidth,
@@ -71,7 +88,9 @@ class LoraPacket:
             config=self.config.copy(),
             snr=self.__snr,
             rssi=self.__rssi,
+            symbol_t=self.symbol_t,
             preamble_t=self.preamble_airtime,
+            header_t=self.header_airtime,
             payload_t=self.payload_airtime,
             packet_id=self.id,
         )
