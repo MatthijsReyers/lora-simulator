@@ -44,7 +44,7 @@ class RadioPowerProfile(ABC):
         pass
 
     @abstractmethod
-    def tx_startup_time(self, power: float, config: LoraConfig) -> float:
+    def tx_startup_time(self, power: int, config: LoraConfig) -> float:
         """
             Get the time in seconds it takes for the radio to power up and be ready to transmit.
             
@@ -62,7 +62,7 @@ class RadioPowerProfile(ABC):
         pass
 
     @abstractmethod
-    def tx_power(self, power: float, config: LoraConfig) -> float:
+    def tx_power(self, power: int, config: LoraConfig) -> float:
         """
             Get the power consumption in watts when transmitting at the specified power level in
             dBm.
@@ -128,14 +128,14 @@ class Stm32wl55PowerProfile(RadioPowerProfile):
         super().__init__()
         self._randomize = randomize
 
-    def tx_startup_time(self, power: float, config: LoraConfig) -> float:
+    def tx_startup_time(self, power: int, config: LoraConfig) -> float:
         startup_ms_std = 0.001367
         startup_mean_ms = 0.024141 + 0.055071 * (1 - math.exp(-power / 7.65599))
         if self._randomize:
             startup_mean_ms += random.gauss(0.0, startup_ms_std)
         return startup_mean_ms / 1000
 
-    def tx_power(self, power: float, config: LoraConfig) -> float:
+    def tx_power(self, power: int, config: LoraConfig) -> float:
         assert power in self._TX_POWER_USAGE, "Unsupported TX power level for STM32WL55 profile"
         return self._TX_POWER_USAGE[power]
 
