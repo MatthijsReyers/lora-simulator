@@ -1,6 +1,6 @@
 from collections.abc import Coroutine
 from functools import wraps
-from typing import Optional
+from typing import Any, List, Optional
 from simulator.exceptions import SimulatorException
 from simulator.wakeup_queue import WakeUpQueue
 import asyncio
@@ -48,10 +48,10 @@ class SimulationEnvironment:
     __timer_locks: int
 
     __wakeup_events: WakeUpQueue
-    __tasks: list
+    __tasks: List[Coroutine[Any, Any, Any]]
 
     # Length of a single simulation tick in seconds
-    __TICK_SIZE: float
+    __tick_size: float
 
     logger = logging.getLogger('simulator')
 
@@ -68,7 +68,7 @@ class SimulationEnvironment:
         self.__timer_lock = asyncio.Lock()
         self.__timer_locks = 0
         self.__tasks = []
-        self.__TICK_SIZE = tick_size
+        self.__tick_size = tick_size
         self.logger.setLevel(logging.WARN)
 
 
@@ -125,7 +125,7 @@ class SimulationEnvironment:
 
             self.__timer_lock.release()
 
-        self.logger.info(f"Simulation reached the specified length of {self.__simulation_length * self.__TICK_SIZE}s")
+        self.logger.info(f"Simulation reached the specified length of {self.__simulation_length * self.__tick_size}s")
         await asyncio.sleep(0.1)
         for task in self.__tasks:
             if not task.done():
@@ -148,7 +148,7 @@ class SimulationEnvironment:
         """
         assert self.__current_tick == 0, "Simulation can only be run once."
 
-        self.__simulation_length = round(simulation_length / self.__TICK_SIZE)
+        self.__simulation_length = round(simulation_length / self.__tick_size)
 
         loop = asyncio.get_event_loop()
         loop.run_until_complete(asyncio.wait([
@@ -158,7 +158,7 @@ class SimulationEnvironment:
         loop.close()
 
 
-    def create_task(self, task: 'Coroutine', name: str = None):
+    def create_task(self, task: Coroutine[Any, Any, Any], name: str|None = None):
         """ 
             Adds a new async task to the simulation environment to run once the simulation starts,
             this can only be called before the simulation starts. If you want to create a task 
@@ -195,7 +195,7 @@ class SimulationEnvironment:
         self.__tasks.append(t)
 
 
-    async def start_child_task(self, task: 'Coroutine', name: str = None):
+    async def start_child_task(self, task: Coroutine[Any, Any, Any], name: str|None = None):
         """ 
             Add a new task to the simulation environment while the simulation is running, this can
             and should only be called from within another task that is already running in the 
@@ -239,8 +239,10 @@ class SimulationEnvironment:
 
     def is_running(self) -> bool:
         """ Returns whether the simulation is currently running. """
-        return self.__current_tick > 0 and self.__simulation_length and \
-            self.__current_tick < self.__simulation_length - 1
+        return (self.__current_tick > 0) and \
+            (type(self.__simulation_length) == int) and \
+            (self.__simulation_length > 0) and \
+            (self.__current_tick < self.__simulation_length - 1)
 
 
     def is_finished(self) -> bool:
@@ -252,17 +254,18 @@ class SimulationEnvironment:
 
     def current_time(self) -> float:
         """ Returns the current simulation time in seconds. """
-        return self.__current_tick * self.__TICK_SIZE
+        return self.__current_tick * self.__tick_size
 
 
     def next_tick(self) -> float:
         """ Returns the simulation timestamp of the next tick in seconds. """
-        return (self.__current_tick + 1) * self.__TICK_SIZE
+        return (self.__current_tick + 1) * self.__tick_size
 
 
     def last_tick(self) -> float:
         """ Returns the simulation timestamp at which the simulation will end in seconds. """
-        return (self.__simulation_length - 1) * self.__TICK_SIZE
+        return (type(self.__simulation_length) == int) and \
+            (self.__simulation_length - 1) * self.__tick_size
 
 
     async def wait_for_sim_start(self):
@@ -280,7 +283,7 @@ class SimulationEnvironment:
         # Sleeping for 1 tick at the start of the simulation essentially just detects the moment
         # the simulation time starts advancing.
         if self.__current_tick == 0:
-            await self.sleep(self.__TICK_SIZE)
+            await self.sleep(self.__tick_size)
 
 
     async def wait_for_sim_end(self):
@@ -289,7 +292,7 @@ class SimulationEnvironment:
             processing at the end of the simulation.
         """
         duration_ticks = self.__simulation_length - self.__current_tick
-        await self.sleep(duration_ticks * self.__TICK_SIZE)
+        await self.sleep(duration_ticks * self.__tick_size)
 
 
     @requires_running_simulation
@@ -300,7 +303,7 @@ class SimulationEnvironment:
         self.logger.debug(f'{self.current_time():.2f} sleep({duration})')
 
         # Compute timestamp at which we need to wake up the task.
-        wakeup_time = self.__current_tick + round(duration / self.__TICK_SIZE)
+        wakeup_time = self.__current_tick + round(duration / self.__tick_size)
         
         # Register an event to be set when the timer hits the wakeup time
         event = asyncio.Event()
@@ -340,7 +343,7 @@ class SimulationEnvironment:
         self.logger.debug(f'{self.current_time():.2f} sleep_until({timestamp})')
 
         # Compute timestamp at which we need to wake up the task.
-        wakeup_time = round(timestamp / self.__TICK_SIZE)
+        wakeup_time = round(timestamp / self.__tick_size)
 
         assert wakeup_time > self.__current_tick, "Cannot sleep until a time in the past"
         
@@ -380,7 +383,7 @@ class SimulationEnvironment:
         """
         self.logger.debug(f'{self.current_time():.2f} schedule_event_no_await({id(event) % 1000}, {timestamp})')
 
-        wakeup_time = round(timestamp / self.__TICK_SIZE)
+        wakeup_time = round(timestamp / self.__tick_size)
 
         # Use the next tick if the event is scheduled for the current tick
         if wakeup_time == self.__current_tick:
@@ -427,7 +430,7 @@ class SimulationEnvironment:
     @requires_running_simulation
     async def advance_tick(self):
         """ Advances the simulation by a single tick. """
-        await self.sleep(self.__TICK_SIZE)
+        await self.sleep(self.__tick_size)
 
 
     @requires_running_simulation

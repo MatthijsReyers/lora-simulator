@@ -1,15 +1,19 @@
 from simulator.environment import simulation_env as sim
 import asyncio, logging
 
-class Queue():
+from typing import List, TypeVar, Generic
+
+T = TypeVar('T')
+
+class Queue(Generic[T]):
     """
         A Queue that works well within the simulator environment.
     """
 
     logger = logging.getLogger(__name__)
 
-    __data: list
-    __get_events: list[asyncio.Event]
+    __data: List[T]
+    __get_events: List[asyncio.Event]
 
     def __init__(self):
         self.__data = []
@@ -20,7 +24,7 @@ class Queue():
         return len(self.__data)
 
 
-    async def put(self, item):
+    async def put(self, item: T):
         """
             Put an item into the queue, note that this will advance the simulation by one tick.
         """
@@ -61,7 +65,7 @@ class Queue():
         return await self.__get(sim.current_time() + timeout)
 
 
-    async def __get(self, timeout_at=float):
+    async def __get(self, timeout_at: float|None = None):
         # If there is data available and no one is waiting, return immediately
         if len(self.__data) > 0 and len(self.__get_events) == 0:
             return self.__data.pop(0)
