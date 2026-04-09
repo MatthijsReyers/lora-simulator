@@ -8,6 +8,7 @@ asyncio = "*"
 logger = "*"
 cffi = "*"
 setuptools = "*"
+cryptography = "*"
 
 [dev-packages]
 pytest = "*"
