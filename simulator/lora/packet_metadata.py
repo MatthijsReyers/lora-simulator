@@ -1,8 +1,17 @@
-from typing import Optional
+from typing import List, Optional
 from simulator.lora.packet import LoraPacket
 
 class PacketMetadata:
     """ Radio specific metadata about a packet. """
+
+    packet: LoraPacket
+    collision: bool
+    missed_start: bool
+    demodulate_failure: None|bool
+    missed_end: None|bool
+    interrupted: None|bool
+    received_preamble: None|bool
+
     def __init__(
         self, 
         packet: LoraPacket, 
@@ -19,7 +28,7 @@ class PacketMetadata:
         self.received_preamble = None
 
     def __repr__(self):
-        status = []
+        status: List[str] = []
         if self.collision:
             status.append("collision")
         if self.missed_start:

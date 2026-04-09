@@ -1,10 +1,11 @@
-from abc import ABC, abstractmethod
+from abc import ABC
 import asyncio, logging
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import random
 
 from simulator.exceptions import SimulatorException
+from simulator.lora.airtime import symbol_airtime
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.enums.bandwidth import Bandwidth
@@ -32,16 +33,16 @@ class LoraRadio(ABC):
 
     __radio_state: RadioState
     __packets_in_transit: dict[int, PacketMetadata]
-    __rx_queue: Queue
+    __rx_queue: Queue[Tuple[LoraPacket, PacketMetadata]]
     
     __rx_config: LoraConfig
     __rx_continuous: bool = True
 
     __tx_config: LoraConfig
     __tx_power: int = 14  # in dBm
-    __tx_freq_hop_enable: bool = False
-    __tx_freq_hop_period: int = 0
-    __tx_timeout: int = 3_000  # in milliseconds
+    # __tx_freq_hop_enable: bool = False
+    # __tx_freq_hop_period: int = 0
+    # __tx_timeout: int = 3_000  # in milliseconds
 
     _radio_id: int
 
@@ -49,8 +50,9 @@ class LoraRadio(ABC):
     logger: logging.Logger
     power_consumer: PowerConsumer
 
-    __state_log: list
-    __packets_log: dict
+    __state_log: List[Tuple[float, RadioState]]
+    __packets_log: Dict[str, Any]
+
 
     def __init__(
             self, 
@@ -93,6 +95,7 @@ class LoraRadio(ABC):
 
         sim.create_task(self.__on_sim_end())
 
+
     async def __on_sim_end(self):
         await sim.wait_for_sim_end()
         self.packets_log = pd.DataFrame(self.__packets_log)
@@ -105,9 +108,7 @@ class LoraRadio(ABC):
     def _set_state(self, state: RadioState) -> None:
         self.logger.debug(f"radio={self._radio_id} set_state(state={state})")
         self.__radio_state = state
-        self.__state_log.append([
-            sim.current_time(), state
-        ])
+        self.__state_log.append((sim.current_time(), state))
         match state:
             case RadioState.OFF:
                 power = self.power_profile.disabled_power()
@@ -157,8 +158,55 @@ class LoraRadio(ABC):
         self.__rx_continuous = continuous
 
 
+    async def carrier_sense(self) -> bool:
+        """
+            Performs carrier sensing to determine if the channel is currently busy.
+
+            :returns: True if the channel is busy, False otherwise.
+        """
+        self.logger.debug(f"radio={self._radio_id} carrier_sense()")
+
+        old_state = self.__radio_state
+
+        if self.__radio_state == RadioState.OFF:
+            await self.standby()
+        if self.__radio_state == RadioState.TX:
+            raise RuntimeError("Cannot perform carrier sensing while radio is transmitting.")
+        if self.__radio_state != RadioState.RX:
+            self._set_state(RadioState.RX)
+
+        sense_time = symbol_airtime(self.__rx_config.spreading_factor, self.__rx_config.bandwidth) * 6
+        await sim.sleep(sense_time)
+
+        medium_busy = self.carrier_sense_instant()
+
+        # Go back to whatever state the radio was in before carrier sensing started.
+        self._set_state(old_state)
+
+        return medium_busy
+    
+
+    def carrier_sense_instant(self) -> bool:
+        """
+            Unrealistic ideal instantaneous carrier sense that just checks if there are any packets
+            currently being received with matching parameters. This is not how real carrier sensing
+            works but it can be useful for testing or implementing idealized protocols that assume
+            perfect carrier sensing.
+
+            :returns: True if the channel is busy, False otherwise.
+        """
+
+        packets = [ 
+            p for p in self.__packets_in_transit.values() if (
+                p.packet.config.spreading_factor == self.__rx_config.spreading_factor and 
+                p.packet.config.bandwidth == self.__rx_config.bandwidth
+            )
+        ]
+        return len(packets) > 0
+
+
     async def receive_data_nowait(
-            self, metadata = False
+            self, metadata: bool = False
         ) -> Optional[LoraPacket | Tuple[LoraPacket, PacketMetadata]]:
         """
             Tries to receive data from the modem if it is available, immediately returns None if no
@@ -180,7 +228,7 @@ class LoraRadio(ABC):
 
 
     async def receive_data_wait(
-            self, metadata = False
+            self, metadata: bool = False
         ) -> LoraPacket | Tuple[LoraPacket, PacketMetadata]:
         """
             Blocking wait that does not return until some data is received (correctly) by the radio.
@@ -215,7 +263,9 @@ class LoraRadio(ABC):
         return packet
 
 
-    async def receive_data_within(self, timeout: float, metadata = False) -> LoraPacket:
+    async def receive_data_within(
+            self, timeout: float, metadata: bool = False
+        ) -> LoraPacket | Tuple[LoraPacket, PacketMetadata]:
         """
             Waits for the given amount of time until some data is received over the radio and
             throws a TimeoutError if no data is received within that time.
@@ -495,7 +545,7 @@ class LoraRadio(ABC):
         assert packet_id in self.__packets_in_transit, f"radio={self._radio_id} BUG: Packet {packet_id} not found in transit?"
 
         # Remove packet from in transit list
-        metadata = self.__packets_in_transit.pop(packet_id, None)
+        metadata: PacketMetadata = self.__packets_in_transit.pop(packet_id)
         metadata.missed_end = (not self.__can_receive(metadata.packet))
 
         # Log packet metadata for later analysis
