@@ -5,11 +5,14 @@ Handles uplink processing (MIC verification, decryption, application routing)
 and downlink scheduling. In a real deployment, the network server is a cloud
 service; here it runs as a simulation component that the gateway forwards frames to.
 
+Supports both ABP device registration and OTAA join handling.
+
 Reference: LoRaWAN L2 1.0.4 Specification §4, §6.
 """
 
 from __future__ import annotations
 import logging
+import random
 from dataclasses import dataclass
 from collections import deque
 
@@ -20,6 +23,15 @@ from simulator.lorawan.frame import (
     MHDR, FCtrl, FHDR, MACPayload, PHYPayload,
 )
 from simulator.lorawan.crypto import compute_data_mic, encrypt_frm_payload
+from simulator.lorawan.join import (
+    OTAADeviceRecord, process_join_request,
+)
+from simulator.lorawan.mac_commands import (
+    MACCommand, MACCommandType, encode_mac_commands, parse_uplink_commands,
+    LinkCheckReq, LinkCheckAns, LinkADRReq, LinkADRAns,
+    DevStatusAns, RXParamSetupAns, RXTimingSetupAns,
+    DutyCycleAns, NewChannelAns,
+)
 from simulator.lorawan.region import MAX_FCNT
 
 logger = logging.getLogger(__name__)
@@ -48,19 +60,26 @@ class NetworkServer:
     """Simplified LoRaWAN network server for simulation.
 
     Responsibilities:
-    - Device registration (ABP sessions)
+    - Device registration (ABP sessions and OTAA credentials)
+    - OTAA join handling: JoinRequest verification, JoinAccept generation
     - Uplink processing: MIC verification, decryption, application routing
     - Downlink scheduling: queued downlinks sent via gateway in RX windows
     """
     _devices: dict[int, DeviceRecord]
     _applications: dict[int, Application]
     _downlink_queue: dict[int, deque[PendingDownlink]]
+    _pending_mac_commands: dict[int, list[MACCommand]]
 
 
-    def __init__(self) -> None:
+    def __init__(self, net_id: int = 0x000001) -> None:
         self._devices = {} # dev_addr -> DeviceRecord
         self._applications = {} # fport -> Application
         self._downlink_queue = {} # dev_addr -> queue
+        self._pending_mac_commands = {} # dev_addr -> list of MAC commands
+        self._otaa_devices: dict[bytes, OTAADeviceRecord] = {}  # dev_eui -> record
+        self._net_id = net_id
+        self._app_nonce_counter = 0
+        self._dev_addr_counter = 0x01000001  # Starting DevAddr for OTAA devices
 
 
     def register_device(self, dev_addr: int, nwk_s_key: bytes, app_s_key: bytes) -> None:
@@ -69,6 +88,18 @@ class NetworkServer:
             dev_addr=dev_addr, nwk_s_key=nwk_s_key, app_s_key=app_s_key,
         )
         self._downlink_queue[dev_addr] = deque()
+        self._pending_mac_commands[dev_addr] = []
+
+
+    def register_otaa_device(
+        self, app_eui: bytes, dev_eui: bytes, app_key: bytes,
+    ) -> None:
+        """Register an OTAA-capable device (pre-provisioned root keys)."""
+        self._otaa_devices[dev_eui] = OTAADeviceRecord(
+            app_eui=app_eui,
+            dev_eui=dev_eui,
+            app_key=app_key,
+        )
 
 
     def register_application(self, app: Application) -> None:
@@ -87,14 +118,81 @@ class NetworkServer:
         )
 
 
+    def queue_mac_command(self, dev_addr: int, command: MACCommand) -> None:
+        """Queue a MAC command to be sent to the device in the next downlink."""
+        assert dev_addr in self._devices, f"Unknown device 0x{dev_addr:08X}"
+        self._pending_mac_commands[dev_addr].append(command)
+
+
     async def handle_uplink(self, raw: bytes) -> bytes | None:
         """Process an uplink frame received from a gateway.
 
         Returns an encoded downlink PHYPayload if one is pending, or None.
+        Handles both JoinRequest and data uplinks.
 
         Args:
             raw: Raw PHYPayload bytes as received over the air.
         """
+        if len(raw) < 1:
+            return None
+
+        # Check MType to distinguish JoinRequest from data frames
+        mhdr = MHDR.decode(raw[0])
+        if mhdr.mtype == MType.JOIN_REQUEST:
+            return self._handle_join_request(raw)
+
+        return await self._handle_data_uplink(raw)
+
+
+    def _handle_join_request(self, raw: bytes) -> bytes | None:
+        """Process a JoinRequest and generate a JoinAccept if valid."""
+        app_nonce = self._app_nonce_counter
+        self._app_nonce_counter += 1
+
+        dev_addr = self._dev_addr_counter
+        self._dev_addr_counter += 1
+
+        result = process_join_request(
+            raw=raw,
+            device_db=self._otaa_devices,
+            net_id=self._net_id,
+            assign_dev_addr=dev_addr,
+            app_nonce=app_nonce,
+        )
+
+        if result is None:
+            return None
+
+        join_accept_raw, otaa_record = result
+
+        # Derive the same session keys the device will derive so we can
+        # communicate with it after the join.
+        from simulator.lorawan.crypto import derive_session_keys
+        from simulator.lorawan.frame import JoinRequestPayload
+
+        # Re-decode the JoinRequest to get dev_nonce
+        phy = PHYPayload.decode_join_request(raw)
+        assert phy.join_request is not None
+        dev_nonce = phy.join_request.dev_nonce
+
+        nwk_s_key, app_s_key = derive_session_keys(
+            otaa_record.app_key, app_nonce, self._net_id, dev_nonce,
+        )
+
+        # Register the device with its new session
+        self.register_device(dev_addr, nwk_s_key, app_s_key)
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  NS  JoinAccept sent  "
+            f"DevEUI={phy.join_request.dev_eui.hex()}  "
+            f"DevAddr=0x{dev_addr:08X}"
+        )
+
+        return join_accept_raw
+
+
+    async def _handle_data_uplink(self, raw: bytes) -> bytes | None:
+        """Process a data uplink frame."""
         try:
             phy = PHYPayload.decode_data(raw)
         except (AssertionError, Exception) as e:
@@ -138,8 +236,23 @@ class NetworkServer:
             return None
         device.fcnt_up = mac.fhdr.fcnt + 1
 
+        # Process MAC command answers from FOpts
+        if mac.fhdr.fopts:
+            self._handle_mac_answers(device, parse_uplink_commands(mac.fhdr.fopts))
+
+        # Process MAC commands from FPort 0 (encrypted with NwkSKey)
+        if mac.fport == 0 and len(mac.frm_payload) > 0:
+            decrypted = encrypt_frm_payload(
+                device.nwk_s_key,
+                dev_addr=dev_addr,
+                fcnt=mac.fhdr.fcnt,
+                uplink=True,
+                payload=mac.frm_payload,
+            )
+            self._handle_mac_answers(device, parse_uplink_commands(decrypted))
+
         # Decrypt and route to application
-        if mac.fport is not None and mac.fport > 0 and len(mac.frm_payload) > 0:
+        elif mac.fport is not None and mac.fport > 0 and len(mac.frm_payload) > 0:
             plaintext = encrypt_frm_payload(
                 device.app_s_key,
                 dev_addr=dev_addr,
@@ -182,9 +295,17 @@ class NetworkServer:
                     break
 
         if pending is None:
-            return None
+            # No application data, but check if we have MAC commands to send
+            mac_cmds = self._pending_mac_commands.get(device.dev_addr, [])
+            if not mac_cmds:
+                return None
+            # Send a frame with only MAC commands in FOpts (no FPort/FRMPayload)
+            return self._build_mac_only_downlink(device)
 
         assert device.fcnt_down <= MAX_FCNT, "Downlink frame counter overflow"
+
+        # Collect pending MAC commands for FOpts
+        fopts = self._drain_mac_commands(device.dev_addr)
 
         # Encrypt payload
         encrypted = encrypt_frm_payload(
@@ -201,6 +322,7 @@ class NetworkServer:
             dev_addr=device.dev_addr,
             fctrl=FCtrl(),
             fcnt=device.fcnt_down,
+            fopts=fopts,
         )
         mac_payload = MACPayload(fhdr=fhdr, fport=pending.fport, frm_payload=encrypted)
         mhdr = MHDR(mtype=mtype)
@@ -225,3 +347,115 @@ class NetworkServer:
 
         device.fcnt_down += 1
         return raw
+
+
+    def _build_mac_only_downlink(self, device: DeviceRecord) -> bytes | None:
+        """Build a downlink frame containing only MAC commands in FOpts."""
+        assert device.fcnt_down <= MAX_FCNT, "Downlink frame counter overflow"
+
+        fopts = self._drain_mac_commands(device.dev_addr)
+        if not fopts:
+            return None
+
+        fhdr = FHDR(
+            dev_addr=device.dev_addr,
+            fctrl=FCtrl(),
+            fcnt=device.fcnt_down,
+            fopts=fopts,
+        )
+        mac_payload = MACPayload(fhdr=fhdr)
+        mhdr = MHDR(mtype=MType.UNCONFIRMED_DATA_DN)
+
+        mhdr_and_payload = bytes([mhdr.encode()]) + mac_payload.encode(uplink=False)
+        mic = compute_data_mic(
+            device.nwk_s_key,
+            dev_addr=device.dev_addr,
+            fcnt=device.fcnt_down,
+            uplink=False,
+            mhdr_and_payload=mhdr_and_payload,
+        )
+
+        phy = PHYPayload(mhdr=mhdr, mac_payload=mac_payload, mic=mic)
+        raw = phy.encode()
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  NS  MAC-only downlink  "
+            f"DevAddr=0x{device.dev_addr:08X}  FCnt={device.fcnt_down}  "
+            f"FOpts={len(fopts)} bytes"
+        )
+
+        device.fcnt_down += 1
+        return raw
+
+
+    def _handle_mac_answers(self, device: DeviceRecord, commands: list[MACCommandType]) -> None:
+        """Process MAC command answers received from a device."""
+        for cmd in commands:
+            match cmd:
+                case LinkCheckReq():
+                    # Device is requesting a link check — respond with LinkCheckAns
+                    self._pending_mac_commands.setdefault(device.dev_addr, []).append(
+                        LinkCheckAns(margin=10, gw_cnt=1)
+                    )
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  LinkCheckReq from "
+                        f"DevAddr=0x{device.dev_addr:08X}"
+                    )
+
+                case LinkADRAns():
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  LinkADRAns from "
+                        f"DevAddr=0x{device.dev_addr:08X}: "
+                        f"ch_mask={cmd.channel_mask_ack} dr={cmd.data_rate_ack} "
+                        f"power={cmd.power_ack}"
+                    )
+
+                case DutyCycleAns():
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  DutyCycleAns from "
+                        f"DevAddr=0x{device.dev_addr:08X}"
+                    )
+
+                case RXParamSetupAns():
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  RXParamSetupAns from "
+                        f"DevAddr=0x{device.dev_addr:08X}: "
+                        f"offset={cmd.rx1_dr_offset_ack} dr={cmd.rx2_data_rate_ack} "
+                        f"ch={cmd.channel_ack}"
+                    )
+
+                case DevStatusAns():
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  DevStatusAns from "
+                        f"DevAddr=0x{device.dev_addr:08X}: "
+                        f"battery={cmd.battery} margin={cmd.margin} dB"
+                    )
+
+                case NewChannelAns():
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  NewChannelAns from "
+                        f"DevAddr=0x{device.dev_addr:08X}: "
+                        f"dr_range={cmd.data_rate_range_ok} freq={cmd.channel_freq_ok}"
+                    )
+
+                case RXTimingSetupAns():
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  NS  RXTimingSetupAns from "
+                        f"DevAddr=0x{device.dev_addr:08X}"
+                    )
+
+
+    def _drain_mac_commands(self, dev_addr: int) -> bytes:
+        """Encode and drain pending MAC commands for a device (for FOpts)."""
+        commands = self._pending_mac_commands.get(dev_addr, [])
+        if not commands:
+            return b""
+        encoded = encode_mac_commands(commands)
+        commands.clear()
+        if len(encoded) > 15:
+            logger.warning(
+                f"{sim.current_time():.2f}s  NS  MAC commands exceed FOpts limit "
+                f"({len(encoded)} bytes), truncating to 15"
+            )
+            encoded = encoded[:15]
+        return encoded
