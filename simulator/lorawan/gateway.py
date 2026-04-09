@@ -28,12 +28,12 @@ class LoRaWanGateway:
 
     def __init__(
         self,
-        radio: LoraRadio,
         network_server: NetworkServer,
+        radio: LoraRadio|None = None,
         data_rate: int = 5,
         tx_power: int = 14,
     ):
-        self.radio = radio
+        self.radio = radio if radio else LoraRadio()
         self.network_server = network_server
         self.data_rate = data_rate
         self.tx_power = tx_power
