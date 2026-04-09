@@ -15,12 +15,12 @@ class LoraPacket:
             tx_power: int,
             tx_location: Tuple[float, float],
             config: LoraConfig,
-            snr: float = None,
-            rssi: float = None,
-            symbol_t: float = None,
-            header_t: float = None,
-            preamble_t: float = None,
-            payload_t: float = None,
+            snr: float | None = None,
+            rssi: float | None = None,
+            symbol_t: float | None = None,
+            header_t: float | None = None,
+            preamble_t: float | None = None,
+            payload_t: float | None = None,
             packet_id: Optional[int] = None,
         ):
         assert isinstance(config, LoraConfig), "config must be a LoraConfig object"
@@ -38,15 +38,15 @@ class LoraPacket:
         self.payload = payload
         self.tx_power = tx_power
         self.tx_location = tx_location
-        self.rx_location = None
+        self.rx_location: tuple[float, float] | None = None
         self.__snr = snr
         self.__rssi = rssi
         self.tx_start = sim.current_time()
 
-        self.symbol_t = symbol_t
-        self.preamble_airtime = preamble_t
-        self.header_airtime = header_t
-        self.payload_airtime = payload_t
+        self.symbol_t: float = symbol_t  # type: ignore[assignment]
+        self.preamble_airtime: float = preamble_t  # type: ignore[assignment]
+        self.header_airtime: float = header_t  # type: ignore[assignment]
+        self.payload_airtime: float = payload_t  # type: ignore[assignment]
         if self.symbol_t is None:
             self.symbol_t = symbol_airtime(
                 bandwidth=self.config.bandwidth,
@@ -111,8 +111,8 @@ class LoraPacket:
         phy = LoraPhyLayer()
         dis = distance(self.tx_location, self.rx_location)
         self.__rssi = self.tx_power - phy.path_loss_estimator(
-            distance=dis,
-            frequency=self.config.bandwidth.to_hz()
+            dis,
+            self.config.bandwidth.to_hz()
         )
         return self.__rssi
 
