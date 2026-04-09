@@ -112,7 +112,7 @@ class LoraPacket:
         dis = distance(self.tx_location, self.rx_location)
         self.__rssi = self.tx_power - phy.path_loss_estimator(
             dis,
-            self.config.frequency
+            self.config.bandwidth.to_hz()
         )
         return self.__rssi
 
