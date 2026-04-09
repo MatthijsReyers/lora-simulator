@@ -3,7 +3,7 @@ from typing import Callable, Optional
 
 from pandas import DataFrame
 from simulator.environment import simulation_env as sim
-from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
+from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
 from copy import deepcopy
@@ -36,8 +36,8 @@ class LoraPhyLayer():
 
     def __init__(
             self, 
-            path_loss: Callable[[float, float], float] = None, 
-            noise_floor: float = None,    
+            path_loss: Callable[[float, float], float] | None = None, 
+            noise_floor: float | None = None,    
         ):
         if not hasattr(self, 'initialized'):
             self.initialized = True

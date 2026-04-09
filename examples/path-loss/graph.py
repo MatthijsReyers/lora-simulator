@@ -5,7 +5,7 @@ import sys
 sys.path.append('.')
 
 from simulator.lora.enums.bandwidth import Bandwidth
-from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
+from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 
 data = pd.read_csv("path_loss_data.csv")
 

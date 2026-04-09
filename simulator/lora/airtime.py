@@ -12,6 +12,8 @@ def symbol_airtime(bandwidth: Bandwidth|int, spreading_factor: SpreadingFactor|i
         bandwidth = Bandwidth.from_khz(bandwidth)
     if type(spreading_factor) is int:
         spreading_factor = SpreadingFactor(spreading_factor)
+    assert isinstance(spreading_factor, SpreadingFactor)
+    assert isinstance(bandwidth, Bandwidth)
     return (2 ** spreading_factor.value) / (bandwidth.to_hz())
 
 
@@ -56,6 +58,8 @@ def header_airtime(
         spreading_factor = SpreadingFactor(spreading_factor)
     if type(code_rate) is int:
         code_rate = CodeRate.from_denominator(code_rate)
+    assert isinstance(spreading_factor, SpreadingFactor)
+    assert isinstance(code_rate, CodeRate)
 
     t_sym = symbol_airtime(bandwidth, spreading_factor)
 
@@ -89,6 +93,8 @@ def data_airtime(
         spreading_factor = SpreadingFactor(spreading_factor)
     if type(code_rate) is int:
         code_rate = CodeRate.from_denominator(code_rate)
+    assert isinstance(spreading_factor, SpreadingFactor)
+    assert isinstance(code_rate, CodeRate)
 
     assert payload_len > 0, "Payload length must be positive"
     assert type(payload_len) is int, "Payload length must be an integer"

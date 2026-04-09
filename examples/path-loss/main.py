@@ -5,7 +5,7 @@ import pandas as pd
 
 sys.path.append('.')
 
-from simulator.lora.enums.path_loss.log_distance_path_loss import log_distance_path_loss
+from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 from simulator.lora.radio import LoraRadio
 from simulator.environment import simulation_env as sim
 from simulator.lora.enums.bandwidth import Bandwidth

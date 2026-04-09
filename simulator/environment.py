@@ -48,7 +48,7 @@ class SimulationEnvironment:
     __timer_locks: int
 
     __wakeup_events: WakeUpQueue
-    __tasks: List[Coroutine[Any, Any, Any]]
+    __tasks: List[asyncio.Task[Any]]
 
     # Length of a single simulation tick in seconds
     __tick_size: float
@@ -151,10 +151,10 @@ class SimulationEnvironment:
         self.__simulation_length = round(simulation_length / self.__tick_size)
 
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(asyncio.wait([
-            *[t for t in self.__tasks],
+        loop.run_until_complete(asyncio.wait({  # type: ignore[arg-type]
+            *self.__tasks,
             loop.create_task(self.__run_simulation())
-        ]))
+        }))
         loop.close()
 
 
@@ -359,7 +359,7 @@ class SimulationEnvironment:
             # Wait for the timer to hit the wakeup time
             await event.wait()
         except asyncio.CancelledError as e:
-            # self.logger.warning(f'{self.current_time():.2f} sleep({duration}) cancelled')
+            # self.logger.warning(f'{self.current_time():.2f} sleep_until({timestamp}) cancelled')
 
             # If the sleep is cancelled we need to remove the wakeup event from the wakeup queue
             removed_instances = await self.__wakeup_events.remove(event)
@@ -370,7 +370,7 @@ class SimulationEnvironment:
                 # was already processed and removed from the wakeup queue? In that case we do not
                 # need to re-acquire the timer lock since that already happened when the event was
                 # set.
-                self.logger.warning(f'{self.current_time():.2f} BUG: sleep({duration}) cancelled" \
+                self.logger.warning(f'{self.current_time():.2f} BUG: sleep_until({timestamp}) cancelled" \
                                     " but event already processed')
             raise e
     

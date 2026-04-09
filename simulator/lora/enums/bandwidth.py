@@ -11,21 +11,25 @@ class Bandwidth(IntEnum):
 
     def to_hz(self) -> int:
         match self:
-            case Bandwidth.KHz125 | 0:
+            case Bandwidth.KHz125:
                 return 125_000
-            case Bandwidth.KHz250 | 1:
+            case Bandwidth.KHz250:
                 return 250_000
-            case Bandwidth.KHz500 | 2:
+            case Bandwidth.KHz500:
                 return 500_000
+            case _:
+                raise ValueError(f"Unsupported bandwidth: {self}")
 
     def to_khz(self) -> int:
         match self:
-            case Bandwidth.KHz125 | 0:
+            case Bandwidth.KHz125:
                 return 125
-            case Bandwidth.KHz250 | 1:
+            case Bandwidth.KHz250:
                 return 250
-            case Bandwidth.KHz500 | 2:
+            case Bandwidth.KHz500:
                 return 500
+            case _:
+                raise ValueError(f"Unsupported bandwidth: {self}")
 
     @staticmethod
     def from_hz(hz: int) -> 'Bandwidth':
@@ -36,7 +40,8 @@ class Bandwidth(IntEnum):
                 return Bandwidth.KHz250
             case 500_000:
                 return Bandwidth.KHz500
-        raise ValueError(f"Bandwidth of {hz}hz is not supported by LoRa.")
+            case _:
+                raise ValueError(f"Bandwidth of {hz}hz is not supported by LoRa.")
     
     @staticmethod
     def from_khz(khz: int) -> 'Bandwidth':
@@ -47,5 +52,6 @@ class Bandwidth(IntEnum):
                 return Bandwidth.KHz250
             case 500:
                 return Bandwidth.KHz500
-        raise ValueError(f"Bandwidth of {khz}khz is not supported by LoRa.")
+            case _:
+                raise ValueError(f"Bandwidth of {khz}khz is not supported by LoRa.")
     
