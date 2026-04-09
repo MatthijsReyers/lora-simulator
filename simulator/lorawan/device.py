@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 import random
 from dataclasses import dataclass, field
@@ -42,6 +43,20 @@ class DeviceSession:
     fcnt_down: int = 0
 
 
+@dataclass
+class MulticastGroup:
+    """LoRaWAN multicast group session (downlink only).
+
+    A multicast group uses a shared DevAddr and session keys. All devices in the
+    group can decrypt downlinks addressed to this DevAddr. Multicast groups do not
+    send uplinks — they are used for FUOTA and other broadcast scenarios.
+    """
+    group_addr: int
+    nwk_s_key: bytes
+    app_s_key: bytes
+    fcnt_down: int = 0
+
+
 class LoRaWanDevice:
     """
         LoRaWAN end-device implementation.
@@ -79,6 +94,9 @@ class LoRaWanDevice:
         self._pending_mac_answers: list[MACCommand] = []
         self._otaa_credentials = otaa_credentials
         self._dev_nonce: int = 0
+        self._multicast_groups: dict[int, MulticastGroup] = {}  # group_addr -> group
+        self._class_c_running = False
+        self._class_c_stop = asyncio.Event()
         self._configure_radio()
 
     def register_application(self, app: Application) -> None:
@@ -86,6 +104,35 @@ class LoRaWanDevice:
         port = app.port()
         assert 1 <= port <= 223, f"FPort must be 1-223, got {port}"
         self._applications[port] = app
+
+    def join_multicast_group(self, group: MulticastGroup) -> None:
+        """Join a multicast group to receive group downlinks."""
+        self._multicast_groups[group.group_addr] = group
+        logger.debug(
+            f"{sim.current_time():.2f}s  DEVICE  joined multicast group "
+            f"0x{group.group_addr:08X}"
+        )
+
+    def leave_multicast_group(self, group_addr: int) -> None:
+        """Leave a multicast group."""
+        self._multicast_groups.pop(group_addr, None)
+
+    async def switch_mode(self, mode: OperatingMode) -> None:
+        """Switch operating mode at runtime (e.g., Class A -> Class C for FUOTA).
+
+        When switching to Class C, starts the continuous RX background task.
+        When switching away from Class C, stops it.
+        """
+        old_mode = self.operating_mode
+        self.operating_mode = mode
+        logger.debug(
+            f"{sim.current_time():.2f}s  DEVICE  mode {old_mode.value} -> {mode.value}"
+        )
+
+        if mode == OperatingMode.CLASS_C and old_mode != OperatingMode.CLASS_C:
+            await self._start_class_c_rx()
+        elif mode != OperatingMode.CLASS_C and old_mode == OperatingMode.CLASS_C:
+            self._stop_class_c_rx()
 
     def _configure_radio(self) -> None:
         """Configure the radio for the current data rate."""
@@ -269,11 +316,10 @@ class LoRaWanDevice:
         return False
 
     async def _class_c_rx_windows(self) -> bool:
-        """
-            Class C: RX1 window, then continuous RX2 until next uplink.
+        """Class C: RX1 window after uplink, then resume continuous RX2.
 
-            For now, just do RX1 + a brief RX2 check (continuous RX2 is managed
-            externally by keeping the radio in RX mode between uplinks).
+        The background Class C RX task handles unsolicited downlinks between
+        uplinks. This method only handles the RX1 window after a TX.
         """
         # RX1 window (same as Class A)
         await sim.sleep(RECEIVE_DELAY1)
@@ -285,14 +331,43 @@ class LoRaWanDevice:
         except TimeoutError:
             pass
 
-        # For Class C, the device returns to continuous RX2 after RX1 closes.
-        # The caller is responsible for keeping the radio in RX mode between uplinks.
+        # Resume continuous RX2 — the background _class_c_rx_loop picks up from here
         await self.radio.receive(continuous=True)
         return False
 
+    async def _start_class_c_rx(self) -> None:
+        """Start the Class C continuous RX background task."""
+        if self._class_c_running:
+            return
+        self._class_c_stop.clear()
+        self._class_c_running = True
+        await sim.start_child_task(self._class_c_rx_loop())
+        self._class_c_task = True  # type: ignore[assignment]
+
+    def _stop_class_c_rx(self) -> None:
+        """Stop the Class C continuous RX background task."""
+        if not self._class_c_running:
+            return
+        self._class_c_stop.set()
+        self._class_c_running = False
+
+    async def _class_c_rx_loop(self) -> None:
+        """Background task: continuously listen for downlinks (Class C).
+
+        Runs until the simulation ends or the device switches away from Class C.
+        Processes any received downlink immediately (both unicast and multicast).
+        """
+        await self.radio.receive(continuous=True)
+        while sim.is_running() and not self._class_c_stop.is_set():
+            try:
+                result = await self.radio.receive_data_within(1.0)
+                assert isinstance(result, LoraPacket)
+                await self._process_downlink(result.payload)
+            except TimeoutError:
+                pass
+
     async def _process_downlink(self, raw: bytes) -> None:
-        """Decode and process a received downlink frame."""
-        assert self.session is not None
+        """Decode and process a received downlink frame (unicast or multicast)."""
         try:
             phy = PHYPayload.decode_data(raw)
         except (AssertionError, Exception) as e:
@@ -301,12 +376,27 @@ class LoRaWanDevice:
 
         assert phy.mac_payload is not None
         mac = phy.mac_payload
+        dev_addr = mac.fhdr.dev_addr
+
+        # Resolve keys: unicast session or multicast group
+        mc_group = self._multicast_groups.get(dev_addr)
+        if mc_group is not None:
+            nwk_s_key = mc_group.nwk_s_key
+            app_s_key = mc_group.app_s_key
+            is_multicast = True
+        elif self.session is not None and dev_addr == self.session.dev_addr:
+            nwk_s_key = self.session.nwk_s_key
+            app_s_key = self.session.app_s_key
+            is_multicast = False
+        else:
+            # Not addressed to us
+            return
 
         # Verify MIC
         mhdr_and_payload = raw[:-4]
         expected_mic = compute_data_mic(
-            self.session.nwk_s_key,
-            dev_addr=mac.fhdr.dev_addr,
+            nwk_s_key,
+            dev_addr=dev_addr,
             fcnt=mac.fhdr.fcnt,
             uplink=False,
             mhdr_and_payload=mhdr_and_payload,
@@ -319,29 +409,42 @@ class LoRaWanDevice:
             return
 
         # Update downlink frame counter
-        if mac.fhdr.fcnt >= self.session.fcnt_down:
-            self.session.fcnt_down = mac.fhdr.fcnt + 1
+        if is_multicast:
+            assert mc_group is not None
+            if mac.fhdr.fcnt >= mc_group.fcnt_down:
+                mc_group.fcnt_down = mac.fhdr.fcnt + 1
+        else:
+            assert self.session is not None
+            if mac.fhdr.fcnt >= self.session.fcnt_down:
+                self.session.fcnt_down = mac.fhdr.fcnt + 1
 
-        # Process MAC commands from FOpts
-        if mac.fhdr.fopts:
-            self._handle_mac_commands(parse_downlink_commands(mac.fhdr.fopts))
+        # Multicast frames do not carry MAC commands
+        if not is_multicast:
+            # Process MAC commands from FOpts
+            if mac.fhdr.fopts:
+                self._handle_mac_commands(parse_downlink_commands(mac.fhdr.fopts))
 
-        # Process MAC commands from FPort 0 (encrypted with NwkSKey)
-        if mac.fport == 0 and len(mac.frm_payload) > 0:
-            decrypted = encrypt_frm_payload(
-                self.session.nwk_s_key,
-                dev_addr=mac.fhdr.dev_addr,
-                fcnt=mac.fhdr.fcnt,
-                uplink=False,
-                payload=mac.frm_payload,
-            )
-            self._handle_mac_commands(parse_downlink_commands(decrypted))
+            # Process MAC commands from FPort 0 (encrypted with NwkSKey)
+            if mac.fport == 0 and len(mac.frm_payload) > 0:
+                decrypted = encrypt_frm_payload(
+                    nwk_s_key,
+                    dev_addr=dev_addr,
+                    fcnt=mac.fhdr.fcnt,
+                    uplink=False,
+                    payload=mac.frm_payload,
+                )
+                self._handle_mac_commands(parse_downlink_commands(decrypted))
+                logger.debug(
+                    f"{sim.current_time():.2f}s  DEVICE RX  "
+                    f"FCnt={mac.fhdr.fcnt}  FPort={mac.fport}"
+                )
+                return
 
         # Decrypt and route to application
-        elif mac.fport is not None and mac.fport > 0 and len(mac.frm_payload) > 0:
+        if mac.fport is not None and mac.fport > 0 and len(mac.frm_payload) > 0:
             plaintext = encrypt_frm_payload(
-                self.session.app_s_key,
-                dev_addr=mac.fhdr.dev_addr,
+                app_s_key,
+                dev_addr=dev_addr,
                 fcnt=mac.fhdr.fcnt,
                 uplink=False,
                 payload=mac.frm_payload,
@@ -356,6 +459,7 @@ class LoRaWanDevice:
 
         logger.debug(
             f"{sim.current_time():.2f}s  DEVICE RX  "
+            f"{'MC ' if is_multicast else ''}"
             f"FCnt={mac.fhdr.fcnt}  FPort={mac.fport}"
         )
 

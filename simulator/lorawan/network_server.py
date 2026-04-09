@@ -56,6 +56,15 @@ class PendingDownlink:
     confirmed: bool = False
 
 
+@dataclass
+class MulticastGroupRecord:
+    """Network server's record for a multicast group."""
+    group_addr: int
+    nwk_s_key: bytes
+    app_s_key: bytes
+    fcnt_down: int = 0
+
+
 class NetworkServer:
     """Simplified LoRaWAN network server for simulation.
 
@@ -69,6 +78,7 @@ class NetworkServer:
     _applications: dict[int, Application]
     _downlink_queue: dict[int, deque[PendingDownlink]]
     _pending_mac_commands: dict[int, list[MACCommand]]
+    _multicast_groups: dict[int, MulticastGroupRecord]
 
 
     def __init__(self, net_id: int = 0x000001) -> None:
@@ -77,6 +87,7 @@ class NetworkServer:
         self._downlink_queue = {} # dev_addr -> queue
         self._pending_mac_commands = {} # dev_addr -> list of MAC commands
         self._otaa_devices: dict[bytes, OTAADeviceRecord] = {}  # dev_eui -> record
+        self._multicast_groups = {}  # group_addr -> MulticastGroupRecord
         self._net_id = net_id
         self._app_nonce_counter = 0
         self._dev_addr_counter = 0x01000001  # Starting DevAddr for OTAA devices
@@ -122,6 +133,68 @@ class NetworkServer:
         """Queue a MAC command to be sent to the device in the next downlink."""
         assert dev_addr in self._devices, f"Unknown device 0x{dev_addr:08X}"
         self._pending_mac_commands[dev_addr].append(command)
+
+
+    def create_multicast_group(
+        self, group_addr: int, nwk_s_key: bytes, app_s_key: bytes,
+    ) -> MulticastGroupRecord:
+        """Create a multicast group for downlink-only broadcast.
+
+        Returns the MulticastGroupRecord (also stored internally).
+        """
+        record = MulticastGroupRecord(
+            group_addr=group_addr, nwk_s_key=nwk_s_key, app_s_key=app_s_key,
+        )
+        self._multicast_groups[group_addr] = record
+        return record
+
+    def build_multicast_downlink(
+        self, group_addr: int, fport: int, payload: bytes,
+    ) -> bytes:
+        """Build an encrypted multicast downlink frame.
+
+        The caller (typically via the gateway) is responsible for transmitting
+        the returned bytes over the radio.
+        """
+        group = self._multicast_groups[group_addr]
+        assert group.fcnt_down <= MAX_FCNT, "Multicast frame counter overflow"
+
+        encrypted = encrypt_frm_payload(
+            group.app_s_key,
+            dev_addr=group.group_addr,
+            fcnt=group.fcnt_down,
+            uplink=False,
+            payload=payload,
+        )
+
+        fhdr = FHDR(
+            dev_addr=group.group_addr,
+            fctrl=FCtrl(),
+            fcnt=group.fcnt_down,
+        )
+        mac_payload = MACPayload(fhdr=fhdr, fport=fport, frm_payload=encrypted)
+        mhdr = MHDR(mtype=MType.UNCONFIRMED_DATA_DN)
+
+        mhdr_and_payload = bytes([mhdr.encode()]) + mac_payload.encode(uplink=False)
+        mic = compute_data_mic(
+            group.nwk_s_key,
+            dev_addr=group.group_addr,
+            fcnt=group.fcnt_down,
+            uplink=False,
+            mhdr_and_payload=mhdr_and_payload,
+        )
+
+        phy = PHYPayload(mhdr=mhdr, mac_payload=mac_payload, mic=mic)
+        raw = phy.encode()
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  NS  multicast downlink  "
+            f"GroupAddr=0x{group.group_addr:08X}  FCnt={group.fcnt_down}  "
+            f"FPort={fport}  {len(raw)} bytes"
+        )
+
+        group.fcnt_down += 1
+        return raw
 
 
     async def handle_uplink(self, raw: bytes) -> bytes | None:
