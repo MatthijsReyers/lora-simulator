@@ -20,6 +20,8 @@ class RadioNode(NativeNode):
     def __init__(
             self, 
             source_file: str, 
+            extra_source_files: list[str] | None = None,
+            include_dirs: list[str] | None = None,
             radio_power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
             position: Tuple[float, float] = (0.0, 0.0),
             ffi_backend = None,
@@ -31,6 +33,8 @@ class RadioNode(NativeNode):
         you want to test more hardware specific C code.
         
         :param source_file: C/C++ source file to compile and run for this node
+        :param extra_source_files: Additional C/C++ source files to include in compilation
+        :param include_dirs: Additional include directories for header file resolution
         :param radio_power_profile: Power profile for the radio
         :param position: X,Y position for the radio in meters, used to estimate path loss
         :param ffi_backend: FFI backend to use, default is None
@@ -38,6 +42,8 @@ class RadioNode(NativeNode):
         """
         super().__init__(
             source_file=source_file,
+            extra_source_files=extra_source_files,
+            include_dirs=include_dirs,
             ffi_backend=ffi_backend,
             boot_delay=boot_delay,
         )

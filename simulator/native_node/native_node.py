@@ -28,6 +28,8 @@ class NativeNode(FFI):
     def __init__(
             self, 
             source_file: str, 
+            extra_source_files: List[str] | None = None,
+            include_dirs: List[str] | None = None,
             ffi_backend = None,
             boot_delay: float = 0.0,
         ):
@@ -37,6 +39,8 @@ class NativeNode(FFI):
         you want to test more hardware specific C code.
         
         :param source_file: C/C++ source file to compile and run for this node
+        :param extra_source_files: Additional C/C++ source files to include in compilation
+        :param include_dirs: Additional include directories for header file resolution
         :param ffi_backend: FFI backend to use, default is None
         :param boot_delay: Delay in simulation time seconds to wait before starting the node
         """
@@ -48,6 +52,8 @@ class NativeNode(FFI):
         self.source_files =[
             path.dirname(path.realpath(__file__))+'/native_node.c'
         ]
+        if extra_source_files:
+            self.source_files.extend(extra_source_files)
         if source_file:
             self.source_files.append(source_file)
 
@@ -56,9 +62,17 @@ class NativeNode(FFI):
             with open(sf, 'r') as f:
                 source_code += f.read() + '\n'
 
+        is_cpp = source_file and source_file.endswith(('.cpp', '.cc', '.cxx'))
+        compile_args = ['-std=c++17' if is_cpp else '-std=c11', '-O2']
+        verify_kwargs: dict = {'extra_compile_args': compile_args}
+        if is_cpp:
+            verify_kwargs['source_extension'] = '.cpp'
+        if include_dirs:
+            verify_kwargs['include_dirs'] = include_dirs
+
         self.lib = self.verify(
             source_code,
-            extra_compile_args=['-std=c11', '-O2'],
+            **verify_kwargs,
         )
         sim.create_task(self.__run())
 
