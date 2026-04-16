@@ -32,7 +32,8 @@ from simulator.lorawan.mac_commands import (
     DevStatusAns, RXParamSetupAns, RXTimingSetupAns,
     DutyCycleAns, NewChannelAns,
 )
-from simulator.lorawan.region import MAX_FCNT
+from simulator.lorawan.beacon import compute_ping_slot_times
+from simulator.lorawan.region import MAX_FCNT, BEACON_RESERVED, PING_SLOT_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ class DeviceRecord:
     app_s_key: bytes
     fcnt_up: int = 0 # Expected next uplink frame counter
     fcnt_down: int = 0 # Next downlink frame counter
+    class_b_enabled: bool = False
+    class_b_ping_nb: int = 16
 
 
 @dataclass
@@ -195,6 +198,55 @@ class NetworkServer:
 
         group.fcnt_down += 1
         return raw
+
+    # ---- Class B ----
+
+    def enable_class_b(self, dev_addr: int, ping_nb: int = 16) -> None:
+        """Mark a device as Class B so the gateway can schedule ping slot downlinks."""
+        device = self._devices[dev_addr]
+        device.class_b_enabled = True
+        device.class_b_ping_nb = ping_nb
+
+    def disable_class_b(self, dev_addr: int) -> None:
+        """Mark a device as no longer in Class B mode."""
+        device = self._devices[dev_addr]
+        device.class_b_enabled = False
+
+    async def get_class_b_downlink_schedule(
+        self, beacon_time: int,
+    ) -> list[tuple[int, bytes, float]]:
+        """Compute pending Class B downlinks with their first ping slot time.
+
+        Called by the gateway after broadcasting a beacon.  For each Class B
+        device that has a pending downlink, the method builds the encrypted
+        frame, computes the first available ping slot, and returns the
+        schedule sorted by time.
+
+        Returns:
+            List of ``(dev_addr, raw_downlink_bytes, slot_time)`` tuples,
+            sorted by ascending *slot_time*.
+        """
+        schedule: list[tuple[int, bytes, float]] = []
+
+        for dev_addr, device in self._devices.items():
+            if not device.class_b_enabled:
+                continue
+
+            raw = await self._build_downlink(device)
+            if raw is None:
+                continue
+
+            slot_times = compute_ping_slot_times(
+                beacon_time=beacon_time,
+                dev_addr=dev_addr,
+                ping_nb=device.class_b_ping_nb,
+            )
+
+            if slot_times:
+                schedule.append((dev_addr, raw, slot_times[0]))
+
+        schedule.sort(key=lambda x: x[2])
+        return schedule
 
 
     async def handle_uplink(self, raw: bytes) -> bytes | None:

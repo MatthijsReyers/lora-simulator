@@ -52,3 +52,12 @@ JOIN_ACCEPT_DELAY2 = 6  # seconds
 
 # Maximum frame counter value (32-bit)
 MAX_FCNT = 0xFFFFFFFF
+
+# ------ Class B timing (EU868) ------
+# Reference: LoRaWAN L2 1.0.4 §12, RP002-1.0.4 §2.8
+BEACON_INTERVAL = 128          # seconds between beacon broadcasts
+BEACON_RESERVED = 2.120        # seconds reserved for beacon transmission
+BEACON_GUARD = 3.0             # guard time before next beacon window
+PING_SLOT_LEN = 0.030          # 30 ms per ping slot
+CLASS_B_DEFAULT_PING_NB = 16   # default number of ping slots per beacon period
+MAX_BEACON_LESS_PERIOD = 7200  # 2 hours: max time without beacon before sync loss
