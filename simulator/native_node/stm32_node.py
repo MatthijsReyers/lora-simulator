@@ -29,7 +29,7 @@ class STM32Node(RadioNode):
         super().setup_callbacks()
 
         @self.export('int(void*)')
-        def HAL_SUBGHZ_Init(_ptr) -> int:
+        def HAL_SUBGHZ_Init(_ptr: int) -> int:
             self.radio_initialized = True
             return HAL_StatusTypeDef.HAL_OK
         

@@ -1,4 +1,4 @@
-from zmq import IntEnum
+from enum import IntEnum
 
 class HAL_StatusTypeDef(IntEnum):
     HAL_OK = 0
