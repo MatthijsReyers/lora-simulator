@@ -5,3 +5,5 @@ thesis
 .github/copilot-instructions.md
 
 .vscode/
+
+*.egg-info
