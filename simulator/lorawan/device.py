@@ -24,9 +24,12 @@ from simulator.lorawan.mac_commands import (
     RXTimingSetupReq, RXTimingSetupAns, LinkCheckAns,
     NewChannelReq, NewChannelAns,
 )
+from simulator.lorawan.beacon import decode_beacon, compute_ping_slot_times
 from simulator.lorawan.region import (
     EU868_DATA_RATES, RECEIVE_DELAY1, RECEIVE_DELAY2, MAX_FCNT,
     JOIN_ACCEPT_DELAY1, JOIN_ACCEPT_DELAY2,
+    BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
+    PING_SLOT_LEN, CLASS_B_DEFAULT_PING_NB, MAX_BEACON_LESS_PERIOD,
 )
 
 
@@ -79,6 +82,7 @@ class LoRaWanDevice:
         tx_power: int = 14,
         operating_mode: OperatingMode = OperatingMode.CLASS_A,
         otaa_credentials: OTAACredentials | None = None,
+        ping_nb: int = CLASS_B_DEFAULT_PING_NB,
     ):
         assert session is not None or otaa_credentials is not None, (
             "Provide either a session (ABP) or otaa_credentials (OTAA)"
@@ -97,6 +101,12 @@ class LoRaWanDevice:
         self._multicast_groups: dict[int, MulticastGroup] = {}  # group_addr -> group
         self._class_c_running = False
         self._class_c_stop = asyncio.Event()
+        # Class B state
+        self._class_b_running = False
+        self._class_b_stop = asyncio.Event()
+        self._beacon_time: int | None = None
+        self._beacon_locked = False
+        self.ping_nb: int = ping_nb
         self._configure_radio()
 
     def register_application(self, app: Application) -> None:
@@ -118,10 +128,10 @@ class LoRaWanDevice:
         self._multicast_groups.pop(group_addr, None)
 
     async def switch_mode(self, mode: OperatingMode) -> None:
-        """Switch operating mode at runtime (e.g., Class A -> Class C for FUOTA).
+        """Switch operating mode at runtime.
 
-        When switching to Class C, starts the continuous RX background task.
-        When switching away from Class C, stops it.
+        Handles starting/stopping the background tasks associated with
+        Class B (beacon + ping slots) and Class C (continuous RX).
         """
         old_mode = self.operating_mode
         self.operating_mode = mode
@@ -129,10 +139,17 @@ class LoRaWanDevice:
             f"{sim.current_time():.2f}s  DEVICE  mode {old_mode.value} -> {mode.value}"
         )
 
+        # Stop old-mode background tasks
+        if old_mode == OperatingMode.CLASS_B and mode != OperatingMode.CLASS_B:
+            self._stop_class_b()
+        if old_mode == OperatingMode.CLASS_C and mode != OperatingMode.CLASS_C:
+            self._stop_class_c_rx()
+
+        # Start new-mode background tasks
+        if mode == OperatingMode.CLASS_B and old_mode != OperatingMode.CLASS_B:
+            await self._start_class_b()
         if mode == OperatingMode.CLASS_C and old_mode != OperatingMode.CLASS_C:
             await self._start_class_c_rx()
-        elif mode != OperatingMode.CLASS_C and old_mode == OperatingMode.CLASS_C:
-            self._stop_class_c_rx()
 
     def _configure_radio(self) -> None:
         """Configure the radio for the current data rate."""
@@ -246,7 +263,7 @@ class LoRaWanDevice:
         fopts = self._drain_mac_answers()
         fhdr = FHDR(
             dev_addr=self.session.dev_addr,
-            fctrl=FCtrl(),
+            fctrl=FCtrl(class_b=self.operating_mode == OperatingMode.CLASS_B),
             fcnt=self.session.fcnt_up,
             fopts=fopts,
         )
@@ -287,6 +304,8 @@ class LoRaWanDevice:
         """
         if self.operating_mode == OperatingMode.CLASS_A:
             return await self._class_a_rx_windows()
+        elif self.operating_mode == OperatingMode.CLASS_B:
+            return await self._class_a_rx_windows()  # Class B uses same post-uplink windows
         elif self.operating_mode == OperatingMode.CLASS_C:
             return await self._class_c_rx_windows()
         return False
@@ -552,3 +571,127 @@ class LoRaWanDevice:
             )
             encoded = encoded[:15]
         return encoded
+
+    # ---- Class B: beacon synchronization & ping slots ----
+
+    async def _start_class_b(self) -> None:
+        """Start the Class B beacon listening background task."""
+        if self._class_b_running:
+            return
+        self._class_b_stop.clear()
+        self._class_b_running = True
+        await sim.start_child_task(self._class_b_beacon_loop())
+
+    def _stop_class_b(self) -> None:
+        """Stop the Class B background task."""
+        if not self._class_b_running:
+            return
+        self._class_b_stop.set()
+        self._class_b_running = False
+        self._beacon_locked = False
+
+    async def _class_b_beacon_loop(self) -> None:
+        """Background task: listen for beacons and open ping slots (Class B).
+
+        Each iteration covers one beacon period:
+        1. Sleep until the expected beacon time (if known).
+        2. Open RX to receive the beacon broadcast.
+        3. Decode the beacon timestamp and compute ping slot times.
+        4. Open short RX windows at each ping slot.
+        5. Repeat for the next beacon.
+
+        If beacons are missed for ``MAX_BEACON_LESS_PERIOD`` seconds, the device
+        reverts to Class A (beacon sync lost).
+        """
+        missed_beacons = 0
+        await self.radio.receive(continuous=True)
+
+        while sim.is_running() and not self._class_b_stop.is_set():
+            # If we have timing info, sleep until just before the expected
+            # beacon so we don't time out too early after ping slots.
+            if self._beacon_time is not None:
+                expected = float(
+                    self._beacon_time
+                    + (missed_beacons + 1) * BEACON_INTERVAL
+                )
+                wake_at = expected - 1.0
+                if wake_at > sim.current_time():
+                    await sim.sleep_until(wake_at)
+
+            try:
+                await self.radio.receive(continuous=True)
+                result = await self.radio.receive_data_within(
+                    BEACON_RESERVED + 2.0
+                )
+                assert isinstance(result, LoraPacket)
+                beacon_time = decode_beacon(result.payload)
+                if beacon_time is None:
+                    continue  # Not a beacon frame; keep listening
+
+                self._beacon_time = beacon_time
+                if not self._beacon_locked:
+                    self._beacon_locked = True
+                    logger.info(
+                        f"{sim.current_time():.2f}s  DEVICE  beacon acquired "
+                        f"time={beacon_time}"
+                    )
+                else:
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  DEVICE  beacon received "
+                        f"time={beacon_time}"
+                    )
+                missed_beacons = 0
+
+                # Open ping slots for this beacon period
+                await self._class_b_ping_slots(beacon_time)
+
+            except TimeoutError:
+                missed_beacons += 1
+                if missed_beacons * BEACON_INTERVAL >= MAX_BEACON_LESS_PERIOD:
+                    logger.warning(
+                        f"{sim.current_time():.2f}s  DEVICE  beacon sync lost, "
+                        f"reverting to Class A"
+                    )
+                    self.operating_mode = OperatingMode.CLASS_A
+                    self._class_b_running = False
+                    self._beacon_locked = False
+                    return
+
+                # Try ping slots with estimated timing if we had a previous lock
+                if self._beacon_time is not None:
+                    estimated = self._beacon_time + missed_beacons * BEACON_INTERVAL
+                    await self._class_b_ping_slots(int(estimated))
+
+    async def _class_b_ping_slots(self, beacon_time: int) -> None:
+        """Open RX at each scheduled ping slot within a beacon period."""
+        assert self.session is not None
+
+        slot_times = compute_ping_slot_times(
+            beacon_time=beacon_time,
+            dev_addr=self.session.dev_addr,
+            ping_nb=self.ping_nb,
+        )
+
+        guard_time = beacon_time + BEACON_INTERVAL - BEACON_GUARD
+
+        for slot_time in slot_times:
+            if self._class_b_stop.is_set():
+                break
+            if slot_time >= guard_time:
+                break
+            if slot_time <= sim.current_time():
+                continue  # Already past this slot
+
+            await sim.sleep_until(slot_time)
+
+            try:
+                result = await self.radio.receive_data_within(PING_SLOT_LEN)
+                assert isinstance(result, LoraPacket)
+                # Ignore beacon frames that leak into ping slot windows
+                if decode_beacon(result.payload) is not None:
+                    continue
+                await self._process_downlink(result.payload)
+            except (TimeoutError, RuntimeError):
+                # TimeoutError: no data in this slot
+                # RuntimeError: radio busy (e.g., concurrent uplink TX)
+                pass
