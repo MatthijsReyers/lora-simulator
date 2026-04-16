@@ -1,5 +1,9 @@
 #include <pthread.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Flag that indicates if the sleep condition variable below has emitted yet, we need this because
 // of the unavoidable race condition where the Python thread may emit on the condition varible 
 // just before the C-code thread starts listening on it in the HAL_Delay function.
@@ -50,3 +54,7 @@ int main(void);
 extern void run_sensor() {
     main();
 }
+
+#ifdef __cplusplus
+}
+#endif
