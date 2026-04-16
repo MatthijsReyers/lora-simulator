@@ -7,3 +7,5 @@ measurements/**/*.jls
 thesis
 
 .vscode/
+
+*.egg-info
