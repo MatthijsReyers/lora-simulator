@@ -9,6 +9,9 @@ logger = "*"
 cffi = "*"
 setuptools = "*"
 cryptography = "*"
+pandas = "*"
+matplotlib = "*"
+scipy = "*"
 
 [dev-packages]
 pytest = "*"

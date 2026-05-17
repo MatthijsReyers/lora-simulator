@@ -62,6 +62,7 @@ class LoraRadio(ABC):
         ):
         self.__packets_in_transit = {}
         self.__rx_queue = Queue()
+        self.__idle_waiters: list[asyncio.Event] = []
         self.position = position
         self.__radio_state = RadioState.OFF
         self.__rx_config = LoraConfig()
@@ -203,6 +204,25 @@ class LoraRadio(ABC):
             )
         ]
         return len(packets) > 0
+
+
+    async def wait_for_channel_idle(self) -> None:
+        """
+            Block until the channel is idle (no matching packets in transit).
+
+            This is an event-driven wait — it does NOT poll. When the last
+            in-transit packet finishes, all waiters are woken on the same
+            simulation tick. This is useful for modelling idealized CSMA
+            protocols with zero propagation delay (a ≈ 0).
+        """
+        while self.carrier_sense_instant():
+            event = asyncio.Event()
+            self.__idle_waiters.append(event)
+            await sim.schedule_event_wait(event, sim.last_tick())
+            # Clean up in case we were woken by the simulation-end timeout
+            # rather than by the idle notification in _on_receive_end.
+            if event in self.__idle_waiters:
+                self.__idle_waiters.remove(event)
 
 
     async def receive_data_nowait(
@@ -562,6 +582,12 @@ class LoraRadio(ABC):
 
         else:
             self.logger.debug(f"radio={self._radio_id} packet lost due to {metadata}")
+
+        # Notify any coroutines waiting for the channel to become idle.
+        if self.__idle_waiters and not self.carrier_sense_instant():
+            for waiter in self.__idle_waiters:
+                await sim.schedule_event_no_await(waiter, sim.next_tick())
+            self.__idle_waiters.clear()
 
 
     def __can_receive(self, packet: LoraPacket) -> bool:
