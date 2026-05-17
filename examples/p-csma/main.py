@@ -52,10 +52,11 @@ PACKET_TIME = estimate_airtime(
     code_rate=CR,
 )
 
-# Slot time: one simulation tick.  With the default tick of 1 µs and a packet
-# time of ~46 ms this gives a normalised propagation delay of a ≈ 2.2e-5 which
-# is effectively zero — matching the textbook Kleinrock-Tobagi idealisation.
-SLOT_TIME = 0.000001  # 1 µs (= simulator tick size)
+# Slot time: must be at least 2 simulation ticks so that a deferred node
+# waking after 1 slot always checks carrier AFTER a committed node's
+# vulnerability-window tick has elapsed and transmission has started.
+# With 2 µs and packet time ~46 ms: a ≈ 4.3e-5, effectively zero.
+SLOT_TIME = 0.000002  # 2 µs (= 2 simulator ticks)
 
 # Total simulation duration (in seconds)
 SIM_DURATION = 200
@@ -95,7 +96,7 @@ class Node:
 
     async def _pcsma_transmit(self):
         """
-        p-persistent CSMA with event-driven channel sensing.
+        p-persistent CSMA with event-driven channel sensing (a ≈ 0).
 
         Phase 1 — busy-wait:  block until the channel transitions to idle
         using wait_for_channel_idle() (O(1) — no polling).
@@ -103,9 +104,14 @@ class Node:
         Phase 2 — idle contention:  draw the number of deferred slots from
         a geometric distribution.  Each "slot" is one simulation tick (≈ 0).
 
-        Phase 3 — vulnerability window:  advance one tick before transmitting
-        so that other committed nodes can also start in the same tick
-        (→ collision if multiple).
+        After committing (defer_slots == 0), the node waits one minimal
+        tick before transmitting.  This ensures that all nodes committing
+        in the same slot wake at the same tick and transmit together,
+        producing the correct collision behaviour.
+
+        SLOT_TIME is set to 2 ticks so that a node deferred by 1 slot
+        always wakes strictly *after* committed nodes have transmitted,
+        preventing non-deterministic asyncio ordering artefacts.
         """
         global tx_attempts
         
@@ -127,6 +133,8 @@ class Node:
                     continue  # go back to busy-wait
             
             # Phase 3: committed — vulnerability window (one tick).
+            # All committed nodes sleep the same 1 tick, wake together,
+            # and transmit simultaneously (→ collision if multiple).
             await sim.advance_tick()
             
             # Transmit (committed — do NOT re-check channel).
