@@ -7,8 +7,13 @@ In p-CSMA:
 2. If the channel is idle, it transmits with probability p (defers with probability 1-p).
 3. If the channel is busy, it waits until the channel becomes idle and repeats step 2.
 4. If transmission is deferred, it waits one slot time and repeats the process.
+
+This implementation uses an event-driven wait_for_channel_idle() method so that
+nodes block until the channel is free instead of polling.  The effective propagation
+delay a ≈ 0 (one simulation tick ≈ 1 µs vs packet time ≈ 46 ms), matching the
+idealised Kleinrock-Tobagi (1975) model.
 """
-import sys, random
+import sys, math, random
 import pandas as pd
 
 sys.path.append('.')
@@ -16,6 +21,7 @@ sys.path.append('.')
 from simulator.lora.phy_layer import LoraPhyLayer
 from simulator.lora.radio import LoraRadio
 from simulator.environment import simulation_env as sim
+from simulator.exceptions import SimulatorException
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
@@ -46,13 +52,20 @@ PACKET_TIME = estimate_airtime(
     code_rate=CR,
 )
 
-# Slot time for p-CSMA (time to wait when deferring)
-SLOT_TIME = PACKET_TIME * 0.1
+# Slot time: one simulation tick.  With the default tick of 1 µs and a packet
+# time of ~46 ms this gives a normalised propagation delay of a ≈ 2.2e-5 which
+# is effectively zero — matching the textbook Kleinrock-Tobagi idealisation.
+SLOT_TIME = 0.000001  # 1 µs (= simulator tick size)
 
 # Total simulation duration (in seconds)
 SIM_DURATION = 200
 
 RESULTS_CSV = f"examples/p-csma/results.csv"
+
+# When RESULTS_SINGLE is set, append only to that file (for parallel runs)
+RESULTS_SINGLE = None
+if len(sys.argv) > 3:
+    RESULTS_SINGLE = sys.argv[3]
 
 TX_RATE = G / (NUM_NODES * PACKET_TIME)
 
@@ -77,31 +90,50 @@ class Node:
                 
                 # p-CSMA protocol: sense channel before transmitting
                 await self._pcsma_transmit()
-        except TimeoutError:
+        except (TimeoutError, SimulatorException):
             return
 
     async def _pcsma_transmit(self):
-        """Implements p-persistent CSMA transmission logic."""
+        """
+        p-persistent CSMA with event-driven channel sensing.
+
+        Phase 1 — busy-wait:  block until the channel transitions to idle
+        using wait_for_channel_idle() (O(1) — no polling).
+
+        Phase 2 — idle contention:  draw the number of deferred slots from
+        a geometric distribution.  Each "slot" is one simulation tick (≈ 0).
+
+        Phase 3 — vulnerability window:  advance one tick before transmitting
+        so that other committed nodes can also start in the same tick
+        (→ collision if multiple).
+        """
         global tx_attempts
         
         while True:
-            # Sense the channel
-            channel_busy = self.radio.carrier_sense_instant()
+            # Phase 1: wait for channel to be idle (event-driven).
+            await self.radio.wait_for_channel_idle()
             
-            if not channel_busy:
-                # Channel is idle - transmit with probability p
-                if random.random() < P:
-                    tx_attempts += 1
-                    payload = random.randbytes(PACKET_SIZE)
-                    await self.radio.transmit_data_blocking(payload)
-                    return
-                else:
-                    # Defer for one slot time
-                    await sim.sleep(SLOT_TIME)
+            # Phase 2: channel is idle — p-persistent contention.
+            if P >= 1.0:
+                defer_slots = 0
             else:
-                # Channel is busy - wait until it becomes idle
-                # Poll the channel periodically
-                await sim.sleep(SLOT_TIME)
+                u = random.random() or 1e-10  # avoid log(0)
+                defer_slots = int(math.log(u) / math.log(1.0 - P))
+            
+            if defer_slots > 0:
+                await sim.sleep(SLOT_TIME * defer_slots)
+                # Re-check: another node may have transmitted during deferral
+                if self.radio.carrier_sense_instant():
+                    continue  # go back to busy-wait
+            
+            # Phase 3: committed — vulnerability window (one tick).
+            await sim.advance_tick()
+            
+            # Transmit (committed — do NOT re-check channel).
+            tx_attempts += 1
+            payload = random.randbytes(PACKET_SIZE)
+            await self.radio.transmit_data_blocking(payload)
+            return
 
 
 class Receiver:
@@ -117,7 +149,7 @@ class Receiver:
                 packet = await self.radio.receive_data_wait()
                 global successful_rx
                 successful_rx += 1
-        except TimeoutError:
+        except (TimeoutError, SimulatorException):
             return
 
 
@@ -140,23 +172,19 @@ if __name__ == "__main__":
     print(f"Offered load G: {G_measured:.4f}")
     print(f"Throughput S: {S:.4f}")
 
+    row = {
+        "p": P,
+        "sent": tx_attempts,
+        "received": successful_rx,
+        "G_measured": G_measured,
+        "G": G,
+        "S": S,
+    }
+
+    out_file = RESULTS_SINGLE or RESULTS_CSV
     try:
-        df = pd.read_csv(RESULTS_CSV, index_col=False)
-        df = pd.concat([df, pd.DataFrame([{
-            "p": P,
-            "sent": tx_attempts,
-            "received": successful_rx,
-            "G_measured": G_measured,
-            "G": G,
-            "S": S,
-        }])], ignore_index=True)
+        df = pd.read_csv(out_file, index_col=False)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     except FileNotFoundError:
-        df = pd.DataFrame({
-            "p": [P],
-            "sent": [tx_attempts],
-            "received": [successful_rx],
-            "G_measured": [G_measured],
-            "G": [G],
-            "S": [S],
-        })
-    df.to_csv(RESULTS_CSV, index=False)
+        df = pd.DataFrame([row])
+    df.to_csv(out_file, index=False)
