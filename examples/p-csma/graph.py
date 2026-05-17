@@ -10,64 +10,57 @@ df = pd.read_csv(RESULTS_CSV)
 
 
 # ---------------------------------------------------------------------------
-# Numerical p-persistent CSMA throughput (Poisson contention model)
+# Monte-Carlo p-persistent CSMA throughput (a = 0, with carryover)
 # ---------------------------------------------------------------------------
-def p_csma_throughput(G_array, p, a, max_slots=5000):
+def p_csma_throughput_mc(G_array, p, num_cycles=20_000, seed=42):
     """
-    Compute the throughput of p-persistent CSMA numerically.
+    Estimate the steady-state throughput of p-persistent CSMA at a = 0
+    using a fast cycle-level Monte Carlo with correct carryover tracking.
 
-    Model: after each busy period (duration 1+a), a backlog of B_0 = G*(1+a)
-    stations enters the contention window.  New stations arrive at rate
-    beta = G*a per mini-slot.  In each idle slot j, the backlog evolves as:
-
-        B_1 = B_0 + beta
-        B_{j+1} = B_j * (1-p) + beta
-
-    and the Poisson attempt rate is lambda_j = B_j * p.
-
-    A "cycle" = contention window (idle slots) + one busy period (1+a).
-    Throughput  S = P(success per cycle) / E[cycle time].
+    Each cycle:
+      1. B = carryover + Poisson(G) new arrivals.
+      2. If B = 0: channel idle until next lone arrival → success.
+      3. If B >= 1: contention (zero-time slots until someone transmits).
+         - K = 1: success.   K >= 2: collision.
+         Carryover = B - K.
     """
-    S = np.empty_like(G_array, dtype=float)
+    rng = np.random.default_rng(seed)
+    S = np.empty(len(G_array), dtype=float)
 
     for idx, G in enumerate(G_array):
-        beta = G * a                # new arrivals per mini-slot
-        B0 = G * (1.0 + a)         # initial backlog from previous busy period
-        B1 = B0 + beta              # total ready at start of slot 1
+        if G < 1e-10:
+            S[idx] = 0.0
+            continue
 
-        if p >= 1.0:
-            # 1-persistent: all backlog transmits in slot 1.
-            # Thereafter only new arrivals (beta) per slot.
-            def lam(j):
-                return B1 if j == 1 else beta
-        else:
-            steady = beta / p       # steady-state backlog B_∞
-            diff = B1 - steady      # transient component
-            def lam(j):
-                # B_j = steady + diff * (1-p)^{j-1}
-                # attempt rate = B_j * p
-                B_j = steady + diff * (1.0 - p) ** (j - 1)
-                return max(B_j * p, 0.0)
+        successes = 0
+        total_time = 0.0
+        carry = 0
 
-        p_success = 0.0
-        e_idle_slots = 0.0
-        log_cum_idle = 0.0
+        for _ in range(num_cycles):
+            b = carry + rng.poisson(G)
 
-        for j in range(1, max_slots + 1):
-            lam_j = lam(j)
+            if b == 0:
+                total_time += rng.exponential(1.0 / G) + 1.0
+                successes += 1
+                carry = 0
+                continue
 
-            cum_idle = np.exp(log_cum_idle)
-            if cum_idle < 1e-18:
-                break
+            if b == 1:
+                tx = 1
+            elif p >= 1.0:
+                tx = b
+            else:
+                tx = 0
+                while tx == 0:
+                    tx = rng.binomial(b, p)
 
-            p_success += cum_idle * lam_j * np.exp(-lam_j)
-            p_first_tx_j = cum_idle * (1.0 - np.exp(-lam_j))
-            e_idle_slots += (j - 1) * p_first_tx_j
+            if tx == 1:
+                successes += 1
 
-            log_cum_idle -= lam_j
+            carry = b - tx
+            total_time += 1.0
 
-        e_cycle = e_idle_slots * a + (1.0 + a)
-        S[idx] = p_success / e_cycle if e_cycle > 0 else 0.0
+        S[idx] = successes / total_time if total_time > 0 else 0.0
 
     return S
 
@@ -89,13 +82,12 @@ ax.set_ylabel("Throughput (S)")
 
 ax.set_title("p-CSMA throughput")
 
-# Normalized propagation delay — the simulation uses SLOT_TIME = 1 µs with
-# PACKET_TIME ≈ 46 ms, giving a ≈ 2.2e-5.  For the theoretical curves we use
-# a value very close to zero so they match the idealised Kleinrock-Tobagi model.
-a = 0.00001
+# Normalised propagation delay for the K-T closed-form curves.
+# The simulation uses SLOT_TIME = 2 µs, PACKET_TIME ≈ 46 ms → a ≈ 4.3e-5.
+a = 0.00004
 
 # Dense G values for smooth theoretical curves
-G_dense = np.linspace(0.01, END, 300)
+G_dense = np.linspace(0.01, END, 100)
 
 # ---------- Reference curves (ALOHA) ----------
 
@@ -117,11 +109,13 @@ S_1p = numer_1p / denom_1p
 # Non-persistent CSMA — Kleinrock-Tobagi (1975) closed-form
 S_np = G_dense * np.exp(-a * G_dense) / (G_dense * (1 + 2 * a) + np.exp(-a * G_dense))
 
-# p-persistent CSMA — numerical contention model
-S_p001 = p_csma_throughput(G_dense, p=0.01, a=a)
-S_p01 = p_csma_throughput(G_dense, p=0.1, a=a)
-S_p03 = p_csma_throughput(G_dense, p=0.3, a=a)
-S_p05 = p_csma_throughput(G_dense, p=0.5, a=a)
+# p-persistent CSMA — Monte-Carlo cycle model (a = 0, with carryover)
+print("Computing p-persistent theoretical curves (Monte Carlo) …")
+S_p001 = p_csma_throughput_mc(G_dense, p=0.01)
+S_p01  = p_csma_throughput_mc(G_dense, p=0.1)
+S_p03  = p_csma_throughput_mc(G_dense, p=0.3)
+S_p05  = p_csma_throughput_mc(G_dense, p=0.5)
+print("Done.")
 
 # Color palette shared between theoretical curves and simulation dots
 p_vals = [0.1, 0.3, 0.5, 1.0]
