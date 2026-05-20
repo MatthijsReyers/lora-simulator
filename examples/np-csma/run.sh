@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-RESULTS="examples/p-csma/results.csv"
-TMPDIR="examples/p-csma/.tmp_results"
+RESULTS="examples/np-csma/results.csv"
+TMPDIR="examples/np-csma/.tmp_results"
 
 # Clean previous results
 rm -f "$RESULTS"
@@ -13,19 +13,17 @@ mkdir -p "$TMPDIR"
 JOBS=${JOBS:-$(( $(nproc) - 1 ))}
 echo "Running with $JOBS parallel jobs"
 
-# Launch all (G, p) combinations in parallel
-for p in 0.1 0.3 0.5 1.0; do
-    for g in $(seq 0.2 0.2 7.0); do
+# Launch all G values in parallel
+for g in $(seq 0.2 0.2 7.0); do
 
-        # Wait if we already have JOBS running
-        while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
-            sleep 1
-        done
-
-        outfile="$TMPDIR/g${g}_p${p}.csv"
-        echo "Starting G=$g p=$p"
-        python examples/p-csma/main.py "$g" "$p" "$outfile" &
+    # Wait if we already have JOBS running
+    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do
+        sleep 1
     done
+
+    outfile="$TMPDIR/g${g}.csv"
+    echo "Starting G=$g"
+    python examples/np-csma/main.py "$g" "$outfile" &
 done
 
 # Wait for all background jobs to finish
