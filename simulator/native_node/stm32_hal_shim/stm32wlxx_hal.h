@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #include "stm32wlxx_hal_def.h"
+#include "stm32wlxx_hal_conf.h"
 
 /* ---- HAL Init / DeInit -------------------------------------------------- */
 
@@ -23,6 +24,43 @@ HAL_StatusTypeDef HAL_DeInit(void);
 void     HAL_Delay(uint32_t Delay);
 uint32_t HAL_GetTick(void);
 void     HAL_IncTick(void);
+
+/* ---- Device UID (96-bit unique device identifier) ----------------------- */
+
+static inline uint32_t HAL_GetUIDw0(void) { return 0xDEADBEEF; }
+static inline uint32_t HAL_GetUIDw1(void) { return 0xCAFEBABE; }
+static inline uint32_t HAL_GetUIDw2(void) { return 0x12345678; }
+
+/* ---- Flash stubs -------------------------------------------------------- */
+
+typedef struct {
+    uint32_t OPTR;
+} _SIM_FLASH_TypeDef;
+
+static _SIM_FLASH_TypeDef _sim_flash_regs __attribute__((unused)) = { 0 };
+#define FLASH (&_sim_flash_regs)
+
+#define FLASH_OPTR_IWDG_STOP   0x00020000U
+#define FLASH_OPTR_IWDG_STDBY  0x00040000U
+
+typedef struct {
+    uint32_t OptionType;
+    uint32_t UserType;
+    uint32_t UserConfig;
+} FLASH_OBProgramInitTypeDef;
+
+#define OPTIONBYTE_USER        0x00000002U
+#define OB_USER_IWDG_STOP     0x00020000U
+#define OB_USER_IWDG_STDBY    0x00040000U
+#define OB_IWDG_STOP_FREEZE   0x00000000U
+#define OB_IWDG_STDBY_FREEZE  0x00000000U
+
+static inline HAL_StatusTypeDef HAL_FLASH_Unlock(void) { return HAL_OK; }
+static inline HAL_StatusTypeDef HAL_FLASH_OB_Unlock(void) { return HAL_OK; }
+static inline HAL_StatusTypeDef HAL_FLASHEx_OBProgram(FLASH_OBProgramInitTypeDef *pOBInit) {
+    UNUSED(pOBInit); return HAL_OK;
+}
+static inline HAL_StatusTypeDef HAL_FLASH_OB_Launch(void) { return HAL_OK; }
 
 /* ---- NVIC stubs --------------------------------------------------------- */
 

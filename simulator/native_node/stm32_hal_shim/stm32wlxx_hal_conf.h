@@ -19,6 +19,8 @@ extern "C" {
 #define HAL_I2C_MODULE_ENABLED
 #define HAL_UART_MODULE_ENABLED
 #define HAL_SUBGHZ_MODULE_ENABLED
+#define HAL_IWDG_MODULE_ENABLED
+#define HAL_RTC_MODULE_ENABLED
 
 /* ---- Oscillator values -------------------------------------------------- */
 
@@ -54,6 +56,14 @@ extern "C" {
 
 #ifdef HAL_UART_MODULE_ENABLED
 #include "stm32wlxx_hal_uart.h"
+#endif
+
+#ifdef HAL_IWDG_MODULE_ENABLED
+#include "stm32wlxx_hal_iwdg.h"
+#endif
+
+#ifdef HAL_RTC_MODULE_ENABLED
+#include "stm32wlxx_hal_rtc.h"
 #endif
 
 #ifdef __cplusplus
