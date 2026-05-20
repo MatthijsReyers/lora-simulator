@@ -16,8 +16,8 @@ class LoraPhyLayer():
     __instance = None
     __subscribers: list[LoraRadio] = []
 
-    # A log of all transmitted packets, these are stored as a dictionary because that is the most
-    # performant way to construct a DataFrame later on.
+    # A log of all transmitted packets, these are stored as a dictionary of lists because that is
+    # much more performant then appending to a DataFrame.
     __packets_log: dict
     
     packets_log: Optional[DataFrame] = None
