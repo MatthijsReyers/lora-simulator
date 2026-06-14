@@ -14,6 +14,14 @@ extern "C" {
 #include "stm32wlxx_hal_def.h"
 #include "stm32wlxx_hal_conf.h"
 
+typedef enum
+{
+  HAL_TICK_FREQ_10HZ         = 100U,
+  HAL_TICK_FREQ_100HZ        = 10U,
+  HAL_TICK_FREQ_1KHZ         = 1U,
+  HAL_TICK_FREQ_DEFAULT      = HAL_TICK_FREQ_1KHZ
+} HAL_TickFreqTypeDef;
+
 /* ---- HAL Init / DeInit -------------------------------------------------- */
 
 HAL_StatusTypeDef HAL_Init(void);
@@ -67,12 +75,12 @@ static inline HAL_StatusTypeDef HAL_FLASH_OB_Launch(void) { return HAL_OK; }
 #define __NVIC_PRIO_BITS 4U
 
 static inline void HAL_NVIC_SetPriority(int IRQn, uint32_t PreemptPriority, uint32_t SubPriority) {
-    UNUSED(IRQn); UNUSED(PreemptPriority); UNUSED(SubPriority);
+    uint32_t prioritygroup = 0U;  /* reset default: all bits are preempt priority */
+    uint32_t priority = NVIC_EncodePriority(prioritygroup, PreemptPriority, SubPriority);
+    __NVIC_SetPriority((IRQn_Type)IRQn, priority);
 }
-static inline void HAL_NVIC_EnableIRQ(int IRQn)  { UNUSED(IRQn); }
-static inline void HAL_NVIC_DisableIRQ(int IRQn) { UNUSED(IRQn); }
-static inline void __disable_irq(void) {}
-static inline void __enable_irq(void)  {}
+static inline void HAL_NVIC_EnableIRQ(int IRQn)  { __NVIC_EnableIRQ((IRQn_Type)IRQn); }
+static inline void HAL_NVIC_DisableIRQ(int IRQn) { __NVIC_DisableIRQ((IRQn_Type)IRQn); }
 
 /* ---- GPIO stubs --------------------------------------------------------- */
 
@@ -138,25 +146,6 @@ static inline void HAL_GPIO_TogglePin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
     UNUSED(GPIOx); UNUSED(GPIO_Pin);
 }
 
-/* ---- RCC stubs (enough for SystemClock_Config) -------------------------- */
-
-typedef struct {
-    uint32_t OscillatorType;
-    uint32_t MSIState;
-    uint32_t MSICalibrationValue;
-    uint32_t MSIClockRange;
-    struct { uint32_t PLLState; } PLL;
-} RCC_OscInitTypeDef;
-
-typedef struct {
-    uint32_t ClockType;
-    uint32_t SYSCLKSource;
-    uint32_t AHBCLKDivider;
-    uint32_t APB1CLKDivider;
-    uint32_t APB2CLKDivider;
-    uint32_t AHBCLK3Divider;
-} RCC_ClkInitTypeDef;
-
 #define RCC_OSCILLATORTYPE_MSI   0x00000004U
 #define RCC_MSI_ON               0x00000001U
 #define RCC_MSICALIBRATION_DEFAULT 0U
@@ -178,6 +167,9 @@ typedef struct {
 #define __HAL_PWR_VOLTAGESCALING_CONFIG(x) do { UNUSED(x); } while(0)
 #define PWR_REGULATOR_VOLTAGE_SCALE1 0x00000001U
 
+static inline void HAL_PWR_EnableBkUpAccess(void)  {}
+static inline void HAL_PWR_DisableBkUpAccess(void) {}
+
 static inline HAL_StatusTypeDef HAL_RCC_OscConfig(RCC_OscInitTypeDef *osc) {
     UNUSED(osc); return HAL_OK;
 }
@@ -185,12 +177,12 @@ static inline HAL_StatusTypeDef HAL_RCC_ClockConfig(RCC_ClkInitTypeDef *clk, uin
     UNUSED(clk); UNUSED(FLatency); return HAL_OK;
 }
 
-static inline void __HAL_RCC_GPIOA_CLK_ENABLE(void) {}
-static inline void __HAL_RCC_GPIOB_CLK_ENABLE(void) {}
-static inline void __HAL_RCC_GPIOC_CLK_ENABLE(void) {}
-static inline void __HAL_RCC_SPI1_CLK_ENABLE(void)  {}
-static inline void __HAL_RCC_I2C1_CLK_ENABLE(void)  {}
-static inline void __HAL_RCC_USART2_CLK_ENABLE(void) {}
+static inline void __HAL_RCC_GPIOA_CLK_ENABLE(int) {}
+static inline void __HAL_RCC_GPIOB_CLK_ENABLE(int) {}
+static inline void __HAL_RCC_GPIOC_CLK_ENABLE(int) {}
+static inline void __HAL_RCC_SPI1_CLK_ENABLE(int)  {}
+static inline void __HAL_RCC_I2C1_CLK_ENABLE(int)  {}
+static inline void __HAL_RCC_USART2_CLK_ENABLE(int) {}
 
 /* ---- Peripheral GPIO port placeholders ---------------------------------- */
 
