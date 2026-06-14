@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys, asyncio, logging
+from types import ModuleType
 from typing import List
 from cffi import FFI
 from os import path
@@ -30,7 +31,7 @@ class NativeNode(FFI):
             source_file: str, 
             extra_source_files: List[str] | None = None,
             include_dirs: List[str] | None = None,
-            ffi_backend = None,
+            ffi_backend: ModuleType|None = None,
             boot_delay: float = 0.0,
         ):
         """
@@ -61,6 +62,8 @@ class NativeNode(FFI):
         for sf in self.source_files:
             with open(sf, 'r') as f:
                 source_code += f.read() + '\n'
+
+        source_code += f"\n#define SIM_NODE_INSTANCE {id(self)}\n"
 
         is_cpp = source_file and source_file.endswith(('.cpp', '.cc', '.cxx'))
         compile_args = ['-std=c++17' if is_cpp else '-std=c11', '-O2']
