@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-from abc import abstractmethod
-import sys, asyncio, logging
+import sys
+from types import ModuleType
 from typing import Tuple
-from cffi import FFI
 
 sys.path.append('.')
 
+from simulator.lora.enums.code_rate import CodeRate
+from simulator.lora.enums.spreading_factor import SpreadingFactor
+from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.radio import LoraRadio
 from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
 from simulator.environment import simulation_env as sim
@@ -24,7 +26,7 @@ class RadioNode(NativeNode):
             include_dirs: list[str] | None = None,
             radio_power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
             position: Tuple[float, float] = (0.0, 0.0),
-            ffi_backend = None,
+            ffi_backend: ModuleType|None = None,
             boot_delay: float = 0.0,
         ):
         """
@@ -61,6 +63,58 @@ class RadioNode(NativeNode):
         """
         super().setup_callbacks()
 
-        @self.export('double(void)')
-        def sim_radio_set_rx_config():
-            self.radio.set_rx_config()
+        @self.export('void(int, int, int, int, int, int, int, int, int, int)')
+        def sim_radio_set_rx_config( # pyright: ignore[reportUnusedFunction]
+            khz: int, 
+            spreading_factor: int, 
+            code_rate: int,
+            preamble_len: int,
+            max_payload_len: int,
+            symbols: int,
+            fixed_payload_len: bool,
+            crc_enabled: bool,
+            iq_inverted: bool,
+            rx_continuous: bool,
+        ):
+            self.radio.set_rx_config(
+                bandwidth=Bandwidth.from_khz(khz),
+                spreading_factor=SpreadingFactor(spreading_factor),
+                code_rate=CodeRate.from_denominator(code_rate),
+                preamble_len=preamble_len,
+                max_payload_len=max_payload_len,
+                symbols=symbols,
+                fixed_payload_len=bool(fixed_payload_len),
+                crc_enabled=bool(crc_enabled),
+                iq_inverted=bool(iq_inverted),
+                rx_continuous=bool(rx_continuous),
+            )
+
+        @self.export('void(int, int, int, int, int, int, int, int, int, int)')
+        def sim_radio_set_tx_config( # pyright: ignore[reportUnusedFunction]
+            power: int,
+            khz: int, 
+            spreading_factor: int, 
+            code_rate: int,
+            preamble_len: int,
+            fixed_len: bool,
+            crc_enabled: bool,
+            freq_hop_period: int,
+            iq_inverted: bool,
+            timeout: int,
+        ):
+            self.radio.set_tx_config(
+                power=power,
+                bandwidth=Bandwidth.from_khz(khz),
+                spreading_factor=SpreadingFactor(spreading_factor),
+                code_rate=CodeRate.from_denominator(code_rate),
+                preamble_len=preamble_len,
+                fixed_len=bool(fixed_len),
+                crc_enable=bool(crc_enabled),
+                freq_hop_period=freq_hop_period,
+                iq_inverted=bool(iq_inverted),
+                timeout=timeout,
+            )
+
+        @self.export('int()')
+        def sim_radio_id() -> int: # pyright: ignore[reportUnusedFunction]
+            return self.radio._radio_id
