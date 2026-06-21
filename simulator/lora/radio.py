@@ -58,7 +58,6 @@ class LoraRadio(ABC):
             self, 
             position: tuple[float, float] = (0.0, 0.0), 
             power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
-
         ):
         self.__packets_in_transit = {}
         self.__rx_queue = Queue()
@@ -95,6 +94,23 @@ class LoraRadio(ABC):
         self.phy.subscribe(self)
 
         sim.create_task(self.__on_sim_end())
+
+
+    @property
+    def rx_config(self) -> LoraConfig:
+        return self.__rx_config.copy()
+    
+    @property
+    def rx_continuous(self) -> bool:
+        return self.__rx_continuous
+    
+    @property
+    def tx_config(self) -> LoraConfig:
+        return self.__tx_config.copy()
+
+    @property
+    def tx_power(self) -> int:
+        return self.__tx_power
 
 
     async def __on_sim_end(self):
