@@ -5,6 +5,8 @@ from typing import List
 from cffi import FFI
 from os import path
 
+from simulator.exceptions import SimulationFinishedException
+
 sys.path.append('.')
 
 from simulator.environment import simulation_env as sim
@@ -99,8 +101,14 @@ class NativeNode(FFI):
         @self.export('void(double)')
         def sim_sleep_start(duration: float):
             async def sleep_task():
-                await sim.sleep(duration)
-                self.lib.sim_sleep_end()
+                try:
+                    await sim.sleep(duration)
+                except SimulationFinishedException as _e:
+                    pass
+                except Exception as e:
+                    self.logger.error('NativeNode::sleep_task() error: ', e)
+                finally:
+                    self.lib.sim_sleep_end()
             # Note that the sleep task does NOT run in the simulator tasks since we do not want to
             # create a new sim lock.
             self.loop.create_task(sleep_task())
