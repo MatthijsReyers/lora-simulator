@@ -1,7 +1,7 @@
 from collections.abc import Coroutine
 from functools import wraps
 from typing import Any, List, Optional
-from simulator.exceptions import SimulatorException
+from simulator.exceptions import SimulationFinishedException, SimulatorException
 from simulator.wakeup_queue import WakeUpQueue
 import asyncio
 import logging
@@ -76,15 +76,15 @@ class SimulationEnvironment:
         self.logger.setLevel(logging.WARN)
 
 
-    async def __inc_timer_lock(self):
-        self.logger.debug(f'{self.current_time():.2f} __inc_timer_lock(), {self.__timer_locks + 1}')
+    async def _inc_timer_lock(self):
+        self.logger.debug(f'{self.current_time():.2f} _inc_timer_lock(), {self.__timer_locks} + 1 = {self.__timer_locks + 1}')
         await self.__timer_lock.acquire()
         self.__timer_locks += 1
         self.__timer_lock.release()
 
 
-    async def __dec_timer_lock(self):
-        self.logger.debug(f'{self.current_time():.2f} __dec_timer_lock(), {self.__timer_locks - 1}')
+    async def _dec_timer_lock(self):
+        self.logger.debug(f'{self.current_time():.2f} _dec_timer_lock(), {self.__timer_locks} - 1 = {self.__timer_locks - 1}')
         await self.__timer_lock.acquire()
         self.__timer_locks -= 1
         assert self.__timer_locks >= 0, "Timer locks cannot be negative"
@@ -125,16 +125,20 @@ class SimulationEnvironment:
                     # Prevent the simulation timer from advancing while the task is running
                     self.logger.debug(f'{self.current_time():.2f} __run_simulation: <event {id(event) % 1000}>.set(), {self.__timer_locks} + 1')
                     
+                    self.logger.debug(f'{self.current_time():.2f} inc_timer_lock: {self.__timer_locks} + 1 = {self.__timer_locks + 1}')
                     self.__timer_locks += 1
 
             self.__timer_lock.release()
 
         self.logger.info(f"Simulation reached the specified length of {self.__simulation_length * self.__tick_size}s")
         await asyncio.sleep(0.1)
+
+        cancelled_tasks = 0
         for task in self.__tasks:
             if not task.done():
-                # self.logger.warning(f"Cancelling unfinished task {task}")
+                cancelled_tasks += 1
                 task.cancel()
+        self.logger.warning(f"Cancelling {cancelled_tasks} unfinished tasks")
 
 
     async def __task_finished(self):
@@ -143,7 +147,7 @@ class SimulationEnvironment:
             the simulation timer to advance again if there are no other active tasks.
         """
         self.logger.debug(f'{self.current_time():.2f} __task_finished()')
-        await self.__dec_timer_lock()
+        await self._dec_timer_lock()
 
 
     def run(self, simulation_length: int):
@@ -216,10 +220,8 @@ class SimulationEnvironment:
 
             # Increment the timer lock since there is now one more active task which might block
             # the simulation time from advancing.
-            await self.__timer_lock.acquire()
+            await self._inc_timer_lock()
             self.logger.debug(f'{self.current_time():.2f} start_child_task locked')
-            self.__timer_locks += 1
-            self.__timer_lock.release()
             task_start_event.set()
             try:
                 await asyncio.create_task(task)
@@ -295,8 +297,13 @@ class SimulationEnvironment:
             Waits until the simulation is over, some classes use this to perform cleanup or final 
             processing at the end of the simulation.
         """
+        if not self.__simulation_length:
+            raise SimulatorException("Simulator has not started yet..")
         duration_ticks = self.__simulation_length - self.__current_tick
-        await self.sleep(duration_ticks * self.__tick_size)
+        try:
+            await self.sleep(duration_ticks * self.__tick_size + 100)
+        except SimulationFinishedException:
+            pass # This is what we want..
 
 
     @requires_running_simulation
@@ -308,6 +315,8 @@ class SimulationEnvironment:
 
         # Compute timestamp at which we need to wake up the task.
         wakeup_time = self.__current_tick + round(duration / self.__tick_size)
+        if self.__simulation_length:
+            wakeup_time = min(self.__simulation_length, wakeup_time)
         
         # Register an event to be set when the timer hits the wakeup time
         event = asyncio.Event()
@@ -317,26 +326,14 @@ class SimulationEnvironment:
         await self.__wakeup_events.add(wakeup_time, event)
 
         # Reduce the timer lock counter so the simulation timer can advance
-        await self.__dec_timer_lock()
+        await self._dec_timer_lock()
 
-        try:
-            # Wait for the timer to hit the wakeup time
-            await event.wait()
-        except asyncio.CancelledError as e:
-            # self.logger.warning(f'{self.current_time():.2f} sleep({duration}) cancelled')
+        # Wait for the timer to hit the wakeup time
+        await event.wait()
 
-            # If the sleep is cancelled we need to remove the wakeup event from the wakeup queue
-            removed_instances = await self.__wakeup_events.remove(event)
-            if removed_instances > 0:
-                await self.__inc_timer_lock()
-            else:
-                # Due to race conditions in the async-scheduler it may be possible that the event
-                # was already processed and removed from the wakeup queue? In that case we do not
-                # need to re-acquire the timer lock since that already happened when the event was
-                # set.
-                self.logger.warning(f'{self.current_time():.2f} BUG: sleep({duration}) cancelled" \
-                                    " but event already processed')
-            raise e
+        if  self.__simulation_length is not None and self.__current_tick == self.__simulation_length:
+            self.logger.debug(f'{self.current_time():.2f} sleep({duration}) cancelled')
+            raise SimulationFinishedException()
     
 
     @requires_running_simulation
@@ -349,15 +346,19 @@ class SimulationEnvironment:
         # Compute timestamp at which we need to wake up the task.
         wakeup_time = round(timestamp / self.__tick_size)
 
-        assert wakeup_time > self.__current_tick, "Cannot sleep until a time in the past"
+        if wakeup_time < self.__current_tick:
+            raise SimulatorException("Cannot sleep until a time in the past")
         
         # Register an event to be set when the timer hits the wakeup time
         event = asyncio.Event()
 
+        if self.__simulation_length:
+            wakeup_time = min(wakeup_time, self.__simulation_length)
+
         await self.__wakeup_events.add(wakeup_time, event)
 
         # Reduce the timer lock counter so the simulation timer can advance
-        await self.__dec_timer_lock()
+        await self._dec_timer_lock()
 
         try:
             # Wait for the timer to hit the wakeup time
@@ -368,7 +369,7 @@ class SimulationEnvironment:
             # If the sleep is cancelled we need to remove the wakeup event from the wakeup queue
             removed_instances = await self.__wakeup_events.remove(event)
             if removed_instances > 0:
-                await self.__inc_timer_lock()
+                await self._inc_timer_lock()
             else:
                 # Due to race conditions in the async-scheduler it may be possible that the event
                 # was already processed and removed from the wakeup queue? In that case we do not
@@ -422,7 +423,7 @@ class SimulationEnvironment:
         self.logger.debug(f'{self.current_time():.2f} wait_for_scheduled_event()')
 
         # Reduce the timer lock counter so the simulation timer can advance
-        await self.__dec_timer_lock()
+        await self._dec_timer_lock()
 
         result = await event.wait()
 

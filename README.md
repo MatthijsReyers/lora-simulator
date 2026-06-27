@@ -11,6 +11,7 @@ We recommend checking out the basic smaller examples first (listed at the top of
 | Queue | `examples/queue.py` | A basic demonstration to show how to use the Queue class provided by this simulator (note that you can *NOT* use a normal `asyncio.Queue` as the simulation might run for any amount of time while sending data between tasks).
 | HTTP Request | `example/http_req.py` | Shows how to interleave real asynchronous work (like an HTTP request to a real LoRaWAN network server) safely within the simulator.
 | LoRaWAN Clock Sync | `examples/lorawan_applications/clock_sync.py` | Demonstrates a TS003-style AppTime request/response service over FPort 202. |
+| Native Ping Pong | `examples/native_ping_pong/main.py` | Shows how to use the native C API of the simulator to run nodes with C firmware. |
 
 ## Unit testing
 

@@ -330,6 +330,7 @@ class LoraRadio(ABC):
 
         await sim.sleep(self.__RECEIVE_PROCESS_DELAY)
 
+        self.logger.debug(f"{sim.current_time():.4f} radio={self._radio_id} waiting for packet with timeout={timeout}s")
         (packet, meta) = await self.__rx_queue.get_timeout(timeout)
         if metadata: 
             return (packet, meta)
