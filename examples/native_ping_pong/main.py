@@ -7,7 +7,7 @@ from simulator.environment import simulation_env as sim
 from simulator.native_node.radio_node import RadioNode
 
 if __name__ == '__main__':
-    HEADERS_DIR = './examples/native-c-code/firmware'
+    HEADERS_DIR = './examples/native_ping_pong/firmware'
     MAIN_FILE = f'{HEADERS_DIR}/main.c'
     SOURCES = [
         f for f in glob.glob(f'{HEADERS_DIR}/*.c')
