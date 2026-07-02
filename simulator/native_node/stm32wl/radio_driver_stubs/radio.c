@@ -33,7 +33,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include <math.h>
 #include "radio.h"
-#include "wl_lr_fhss.h"
 #include "timer.h"
 #include "radio_fw.h"
 #include "radio_driver.h"
@@ -61,18 +60,7 @@ typedef struct SubgRf_s
     RadioIrqMasks_t RadioIrq;
     uint8_t AntSwitchPaSelect;
     uint32_t RxDcPreambleDetectTimeout; /* 0:RxDutyCycle is off, otherwise on with  2*rxTime + sleepTime (See STM32WL Errata: RadioSetRxDutyCycle)*/
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    struct
-    {
-        uint32_t rf_freq_in_hz;
-        int8_t   tx_rf_pwr_in_dbm;
-        bool                 is_lr_fhss_on;
-        uint16_t             hop_sequence_id;
-        wl_lr_fhss_params_t lr_fhss_params;
-        wl_lr_fhss_state_t lr_fhss_state;
-    } lr_fhss;
 
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
 } SubgRf_t;
 
 /* Private macro -------------------------------------------------------------*/
@@ -101,11 +89,7 @@ typedef struct SubgRf_s
 #endif
 
 /* Private define ------------------------------------------------------------*/
-/* */
-/*can be overridden in radio_conf.h*/
-#ifndef RADIO_LR_FHSS_IS_ON
-#define RADIO_LR_FHSS_IS_ON 0
-#endif /* !RADIO_LR_FHSS_IS_ON */
+
 /*can be overridden in radio_conf.h*/
 #ifndef XTAL_FREQ
 #define XTAL_FREQ                                   32000000UL
@@ -495,9 +479,7 @@ static void RadioOnRxTimeoutProcess( void );
  */
 static void RadioOnTxTimeoutProcess( void );
 
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-static uint32_t prbs31_val =  0xAA;
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
 
 #if (RADIO_SIGFOX_ENABLE == 1)
 /*!
@@ -552,25 +534,6 @@ static int32_t RadioSetRxGenericConfig( GenericModems_t modem, RxConfigGeneric_t
  */
 static int32_t RadioSetTxGenericConfig( GenericModems_t modem, TxConfigGeneric_t *config,
                                         int8_t power, uint32_t timeout );
-
-/*!
- * \brief Configure the radio LR-FHSS modem parameters
- *
- * \param [in] cfg_params LR-FHSS modem configuration parameters
- *
- * \returns Operation status
- */
-static radio_status_t RadioLrFhssSetCfg( const radio_lr_fhss_cfg_params_t *cfg_params );
-
-/*!
- * \brief Get the time on air in millisecond for LR-FHSS packet
- *
- * \param [in] params Pointer to LR-FHSS time on air parameters
- * \param [out] time_on_air_in_ms  time on air parameters results in ms
- *
- * \returns Time-on-air value in ms for LR-FHSS packet
- */
-static radio_status_t RadioLrFhssGetTimeOnAirInMs( const radio_lr_fhss_time_on_air_params_t *params, uint32_t  *time_on_air_in_ms );
 
 /*!
  * \brief Convert the bandwidth enum to Hz value
@@ -629,9 +592,7 @@ static uint32_t RadioGetLoRaTimeOnAirNumerator( uint32_t bandwidth,
                                                 uint16_t preambleLen, bool fixLen, uint8_t payloadLen,
                                                 bool crcOn );
 
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-static uint32_t GetNextFreqIdx( uint32_t max );
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
 
 /* Private variables ---------------------------------------------------------*/
 /*!
@@ -710,9 +671,7 @@ static void RadioInit( RadioEvents_t *events )
     SubgRf.RxTimeout = 0;
     /*See STM32WL Errata: RadioSetRxDutyCycle*/
     SubgRf.RxDcPreambleDetectTimeout = 0;
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    SubgRf.lr_fhss.is_lr_fhss_on = false;
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
     SUBGRF_Init( RadioOnDioIrq );
     /*SubgRf.publicNetwork set to false*/
     SubgRf.PublicNetwork.Current = false;
@@ -1052,10 +1011,7 @@ static void RadioSetTxConfig( RadioModems_t modem, int8_t power, uint32_t fdev,
                               bool fixLen, bool crcOn, bool freqHopOn,
                               uint8_t hopPeriod, bool iqInverted, uint32_t timeout )
 {
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    /*disable LrFhss*/
-    SubgRf.lr_fhss.is_lr_fhss_on = false;
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
     RFW_DeInit();
     switch( modem )
     {
@@ -1330,29 +1286,7 @@ static radio_status_t RadioSend( uint8_t *buffer, uint8_t size )
     {
         SUBGRF_WriteRegister( SUBGHZ_SDCFG0R, SUBGRF_ReadRegister( SUBGHZ_SDCFG0R ) | ( 1 << 2 ) );
     }
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    //ral_lr_fhss_memory_state_t lr_fhss_state = radio_board_get_lr_fhss_state_reference( );
 
-    if( SubgRf.lr_fhss.is_lr_fhss_on == true )
-    {
-        uint32_t hop_sequence_count = lr_fhss_get_hop_sequence_count( &SubgRf.lr_fhss.lr_fhss_params.lr_fhss_params );
-        SubgRf.lr_fhss.hop_sequence_id = GetNextFreqIdx( hop_sequence_count );
-        MW_LOG( TS_ON, VLEVEL_M, "LRFHSS HOPSEQ %d\r\n", SubgRf.lr_fhss.hop_sequence_id );
-        if( RADIO_STATUS_OK != wl_lr_fhss_build_frame( &SubgRf.lr_fhss.lr_fhss_params, &SubgRf.lr_fhss.lr_fhss_state,
-                                                       SubgRf.lr_fhss.hop_sequence_id, buffer, size, NULL ) )
-        {
-            return RADIO_STATUS_ERROR;
-        }
-
-        SUBGRF_SetDioIrqParams( IRQ_TX_DONE | IRQ_LR_FHSS_HOP | IRQ_RX_TX_TIMEOUT | IRQ_TX_DBG,
-                                IRQ_TX_DONE | IRQ_LR_FHSS_HOP | IRQ_RX_TX_TIMEOUT | IRQ_TX_DBG,
-                                IRQ_RADIO_NONE,
-                                IRQ_RADIO_NONE );
-
-        SUBGRF_SetTx( SubgRf.TxTimeout << 6 );
-    }
-    else
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
     {
         /* WORKAROUND END */
         switch( SubgRf.Modem )
@@ -1458,12 +1392,7 @@ static void RadioStandby( void )
 
 static void RadioRx( uint32_t timeout )
 {
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    if( SubgRf.lr_fhss.is_lr_fhss_on == true )
-    {
-        //return LORAMAC_RADIO_STATUS_ERROR;
-    }
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
     if( 1UL == RFW_Is_Init( ) )
     {
         RFW_ReceiveInit( );
@@ -1500,12 +1429,7 @@ static void RadioRx( uint32_t timeout )
 
 static void RadioRxBoosted( uint32_t timeout )
 {
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    if( SubgRf.lr_fhss.is_lr_fhss_on == true )
-    {
-        //return LORAMAC_RADIO_STATUS_ERROR;
-    }
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
     if( 1UL == RFW_Is_Init() )
     {
         RFW_ReceiveInit();
@@ -1565,12 +1489,7 @@ static void RadioStartCad( void )
 
 static void RadioSetTxContinuousWave( uint32_t freq, int8_t power, uint16_t time )
 {
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    if( SubgRf.lr_fhss.is_lr_fhss_on == true )
-    {
-        //return LORAMAC_RADIO_STATUS_ERROR;
-    }
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
     uint32_t timeout = ( uint32_t )time * 1000;
     uint8_t antswitchpow;
 
@@ -1704,13 +1623,7 @@ static void RadioIrqProcess( void )
         DBG_GPIO_RADIO_TX( RST );
 
         TimerStop( &TxTimeoutTimer );
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-        if( SubgRf.lr_fhss.is_lr_fhss_on == true )
-        {
-            wl_lr_fhss_handle_tx_done( &SubgRf.lr_fhss.lr_fhss_params,
-                                       &SubgRf.lr_fhss.lr_fhss_state );
-        }
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
         //!< Update operating mode state to a value lower than \ref MODE_STDBY_XOSC
         SUBGRF_SetStandby( STDBY_RC );
 
@@ -1860,14 +1773,7 @@ static void RadioIrqProcess( void )
             RadioEvents->RxError( );
         }
         break;
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    case IRQ_LR_FHSS_HOP:
-    {
-        ( void ) wl_lr_fhss_handle_hop( &SubgRf.lr_fhss.lr_fhss_params, &SubgRf.lr_fhss.lr_fhss_state );
-        MW_LOG( TS_ON, VLEVEL_M,  "HOP\r\n" );
-        break;
-    }
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
     default:
         break;
     }
@@ -2110,10 +2016,7 @@ static int32_t RadioSetRxGenericConfig( GenericModems_t modem, RxConfigGeneric_t
 static int32_t RadioSetTxGenericConfig( GenericModems_t modem, TxConfigGeneric_t *config, int8_t power,
                                         uint32_t timeout )
 {
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    /*disable LrFhss*/
-    SubgRf.lr_fhss.is_lr_fhss_on = false;
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
+
 #if (RADIO_GENERIC_CONFIG_ENABLE == 1)
     uint8_t syncword[8] = {0};
     RadioModems_t radio_modem;
@@ -2333,58 +2236,4 @@ static int32_t RadioSetTxGenericConfig( GenericModems_t modem, TxConfigGeneric_t
 #else /* RADIO_GENERIC_CONFIG_ENABLE == 1*/
     return -1;
 #endif /* RADIO_GENERIC_CONFIG_ENABLE == 0*/
-}
-
-/* Lora Fhss Radio interface definitions*/
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-static uint32_t GetNextFreqIdx( uint32_t max )
-{
-    int32_t newbit = ( ( ( prbs31_val >> 30 ) ^ ( prbs31_val >> 27 ) ) & 1 );
-    prbs31_val = ( ( prbs31_val << 1 ) | newbit );
-    return ( prbs31_val - 1 ) % ( max );
-}
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
-
-static radio_status_t RadioLrFhssSetCfg( const radio_lr_fhss_cfg_params_t *cfg_params )
-{
-    radio_status_t status = RADIO_STATUS_UNSUPPORTED_FEATURE;
-
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    /* record config parameters in Subg structure*/
-    SubgRf.lr_fhss.lr_fhss_params.lr_fhss_params = cfg_params->radio_lr_fhss_params.lr_fhss_params;
-    /* record tx timeout*/
-    SubgRf.lr_fhss.tx_rf_pwr_in_dbm = cfg_params->tx_rf_pwr_in_dbm;
-    /* Convert Hz to pll steps*/
-    SX_FREQ_TO_CHANNEL( SubgRf.lr_fhss.lr_fhss_params.center_freq_in_pll_steps,
-                        cfg_params->radio_lr_fhss_params.center_frequency_in_hz );
-    /**/
-    SubgRf.lr_fhss.lr_fhss_params.device_offset = cfg_params->radio_lr_fhss_params.device_offset;
-
-    SubgRf.TxTimeout = cfg_params->tx_timeout_in_ms;
-    /* set power and record RF switch config*/
-    SubgRf.AntSwitchPaSelect = SUBGRF_SetRfTxPower( SubgRf.lr_fhss.tx_rf_pwr_in_dbm );
-
-    RadioStandby();
-
-    status = ( radio_status_t ) wl_lr_fhss_init( &SubgRf.lr_fhss.lr_fhss_params );
-    if( status != RADIO_STATUS_OK )
-    {
-        return status;
-    }
-    SubgRf.lr_fhss.is_lr_fhss_on = true;
-#endif /* RADIO_LR_FHSS_IS_ON == 1 */
-    return  status;
-}
-
-static radio_status_t RadioLrFhssGetTimeOnAirInMs( const radio_lr_fhss_time_on_air_params_t *params,
-                                                    uint32_t *time_on_air_in_ms )
-{
-#if( RADIO_LR_FHSS_IS_ON == 1 )
-    *time_on_air_in_ms = lr_fhss_get_time_on_air_in_ms( &params->radio_lr_fhss_params.lr_fhss_params,
-                                                        params->pld_len_in_bytes );
-
-    return RADIO_STATUS_OK;
-#else
-    return RADIO_STATUS_UNSUPPORTED_FEATURE;
-#endif /* RADIO_LR_FHSS_IS_ON */
 }
