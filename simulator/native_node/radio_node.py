@@ -60,7 +60,7 @@ class RadioNode(NativeNode):
         """
         if extra_source_files is None:
             extra_source_files = []
-        extra_source_files = list(extra_source_files)  # Ensure it's a mutable list
+        extra_source_files = list(set(extra_source_files))  # Ensure it's a mutable list
         extra_source_files.append(
             path.dirname(path.realpath(__file__))+'/radio_node.c'
         )
