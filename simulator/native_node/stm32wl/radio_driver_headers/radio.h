@@ -45,7 +45,6 @@ extern "C"
 #include <stdbool.h>
 #include "radio_def.h"
 #include "radio_ex.h"
-#include "lr_fhss_v1_base_types.h"
 
 /* Private typedef -----------------------------------------------------------*/
 
@@ -59,34 +58,6 @@ typedef enum
     RF_TX_RUNNING, //!< The radio is in transmission state
     RF_CAD,        //!< The radio is doing channel activity detection
 } RadioState_t;
-
-
-typedef struct radio_lr_fhss_params_s
-{
-    lr_fhss_v1_params_t lr_fhss_params;
-    uint32_t            center_frequency_in_hz;
-    int8_t              device_offset;
-} radio_lr_fhss_params_t;
-
-/*!
- * Radio LR-FHSS configuration parameters
- */
-typedef struct loramac_radio_lr_fhss_cfg_params_s
-{
-    int8_t               tx_rf_pwr_in_dbm;  //!< Radio RF output power
-    radio_lr_fhss_params_t radio_lr_fhss_params;    //!< LR-FHSS parameters
-    uint32_t             tx_timeout_in_ms;  //!< Radio tx timeout
-} radio_lr_fhss_cfg_params_t;
-
-/*!
- * Radio LoRa time on air configuration parameters
- */
-typedef struct loramac_radio_lr_fhss_time_on_air_params_s
-{
-    radio_lr_fhss_params_t radio_lr_fhss_params;    //!< LR-FHSS parameters
-    uint8_t              pld_len_in_bytes;  //!< LoRa payload length in bytes
-} radio_lr_fhss_time_on_air_params_t;
-
 
 /* Function prototypes -----------------------------------------------------------*/
 
@@ -439,24 +410,6 @@ struct Radio_s
      * \return 0 when no parameters error, -1 otherwise
      */
     int32_t ( *ReceiveLongPacket )( uint8_t boosted_mode, uint32_t timeout, void (*RxLongStorePacketChunkCb) ( uint8_t* buffer, uint8_t chunk_size ) );
-    /* LrFhss extended radio functions */
-    /*!
-     * \brief Configure the radio LR-FHSS modem parameters
-     *
-     * \param [in] cfg_params LR-FHSS modem configuration parameters
-     *
-     * \returns Operation status
-     */
-    radio_status_t ( *LrFhssSetCfg)( const radio_lr_fhss_cfg_params_t *cfg_params );
-    /*!
-     * \brief Get the time on air in millisecond for LR-FHSS packet
-     *
-     * \param [in] params Pointer to LR-FHSS time on air parameters
-     * \param [out] time_on_air_in_ms  time on air parameters results in ms
-     *
-     * \returns Time-on-air value in ms for LR-FHSS packet LrFhssGetTimeOnAirInMs
-     */
-    radio_status_t ( *LrFhssGetTimeOnAirInMs)( const radio_lr_fhss_time_on_air_params_t *params, uint32_t  *time_on_air_in_ms );
 };
 
 /*!

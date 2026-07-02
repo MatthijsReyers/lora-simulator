@@ -390,7 +390,6 @@ typedef enum
     PACKET_TYPE_LORA                        = 0x01,
     PACKET_TYPE_BPSK                        = 0x02,
     PACKET_TYPE_GMSK                        = 0x03,
-    PACKET_TYPE_LR_FHSS                     = 0x03,
     PACKET_TYPE_NONE                        = 0x0F,
 }RadioPacketTypes_t;
 
@@ -631,7 +630,6 @@ typedef enum
     IRQ_CAD_CLEAR                           = 0x0080,
     IRQ_CAD_DETECTED                        = 0x0100,
     IRQ_RX_TX_TIMEOUT                       = 0x0200,
-    IRQ_LR_FHSS_HOP                         = 0x4000,
     IRQ_RADIO_ALL                           = 0xFFFF,
 }RadioIrqMasks_t;
 
