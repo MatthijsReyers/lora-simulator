@@ -30,27 +30,14 @@
   * @brief   Radio driver API definition
   ******************************************************************************
  */
-
-/* Define to prevent recursive inclusion -------------------------------------*/
-#ifndef __RADIO_H__
-#define __RADIO_H__
-
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-/* Includes ------------------------------------------------------------------*/
+#pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
 #include "radio_def.h"
 #include "radio_ex.h"
 
-/* Private typedef -----------------------------------------------------------*/
-
-/*!
- * Radio driver internal state machine states definition
- */
+/* Radio driver internal state machine states definition */
 typedef enum
 {
     RF_IDLE = 0,   //!< The radio is idle
@@ -59,11 +46,8 @@ typedef enum
     RF_CAD,        //!< The radio is doing channel activity detection
 } RadioState_t;
 
-/* Function prototypes -----------------------------------------------------------*/
 
-/*!
- * \brief Radio driver definition
- */
+/* Radio driver definition */
 struct Radio_s
 {
     /*!
@@ -419,9 +403,3 @@ struct Radio_s
  *         board implementation
  */
 extern const struct Radio_s Radio;
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif // __RADIO_H__

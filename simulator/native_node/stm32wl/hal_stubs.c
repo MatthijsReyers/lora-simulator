@@ -10,14 +10,11 @@
  */
 
 #include "stm32wlxx_hal_def.h"
+#include "stm32wlxx.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-void HAL_Delay(uint32_t Delay) {
-    sim_sleep(Delay / 1000.0);
-}
 
 uint32_t HAL_GetTick(void) {
     return (uint32_t)(sim_current_time() * 1000.0);
@@ -34,6 +31,22 @@ HAL_StatusTypeDef HAL_Init(void) {
 HAL_StatusTypeDef HAL_DeInit(void) {
     return HAL_OK;
 }
+
+void sim_nop() {}
+
+/* 256Kb buffer that we can use as the flash for any HAL functions that want to read it. */
+#define SIM_FLASH_SIZE 256000
+uint8_t flash_buf[SIM_FLASH_SIZE];
+
+
+
+/* ---- NVIC backing store for x86 simulator ----------------------------- */
+NVIC_Type sim_nvic = {0};  /* real memory for NVIC->ISER/ICER/ISPR/etc. */
+
+
+#include "core_cm4.h"
+
+SCB_Type sim_scb_stub;
 
 #ifdef __cplusplus
 }
