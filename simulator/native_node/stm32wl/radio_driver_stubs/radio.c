@@ -816,193 +816,105 @@ static uint32_t RadioRandom( void )
     return rnd;
 }
 
-static void RadioSetRxConfig( RadioModems_t modem, uint32_t bandwidth,
-                              uint32_t datarate, uint8_t coderate,
-                              uint32_t bandwidthAfc, uint16_t preambleLen,
-                              uint16_t symbTimeout, bool fixLen,
-                              uint8_t payloadLen,
-                              bool crcOn, bool freqHopOn, uint8_t hopPeriod,
-                              bool iqInverted, bool rxContinuous )
-{
-#if (RADIO_SIGFOX_ENABLE == 1)
-    uint8_t modReg;
-#endif
+static void RadioSetRxConfig( 
+    RadioModems_t modem, 
+    uint32_t bandwidth,
+    uint32_t datarate, 
+    uint8_t coderate,
+    uint32_t bandwidthAfc, 
+    uint16_t preambleLen,
+    uint16_t symbTimeout, 
+    bool fixLen,
+    uint8_t payloadLen,
+    bool crcOn, 
+    bool freqHopOn, 
+    uint8_t hopPeriod,
+    bool iqInverted,
+    bool rxContinuous 
+) {
+    if (modem != MODEM_LORA) {
+        sim_error("Lora is the only modem type supported by lora-simulator");
+    }
+
     SubgRf.RxContinuous = rxContinuous;
     RFW_DeInit();
-    if( rxContinuous == true )
-    {
+
+    if (rxContinuous == true) {
         symbTimeout = 0;
     }
-    if( fixLen == true )
-    {
+
+    if (fixLen == true) {
         MaxPayloadLength = payloadLen;
     }
-    else
-    {
+    else {
         MaxPayloadLength = 0xFF;
     }
 
-    switch( modem )
+    SUBGRF_SetStopRxTimerOnPreambleDetect( false );
+    SubgRf.ModulationParams.PacketType = PACKET_TYPE_LORA;
+    SubgRf.ModulationParams.Params.LoRa.SpreadingFactor = ( RadioLoRaSpreadingFactors_t )datarate;
+    SubgRf.ModulationParams.Params.LoRa.Bandwidth = Bandwidths[bandwidth];
+    SubgRf.ModulationParams.Params.LoRa.CodingRate = ( RadioLoRaCodingRates_t )coderate;
+
+    if( ( ( bandwidth == 0 ) && ( ( datarate == 11 ) || ( datarate == 12 ) ) ) ||
+        ( ( bandwidth == 1 ) && ( datarate == 12 ) ) )
     {
-#if (RADIO_SIGFOX_ENABLE == 1)
-        case MODEM_SIGFOX_RX:
-            SUBGRF_SetStopRxTimerOnPreambleDetect( true );
-            SubgRf.ModulationParams.PacketType = PACKET_TYPE_GFSK;
-
-            SubgRf.ModulationParams.Params.Gfsk.BitRate = datarate;
-            SubgRf.ModulationParams.Params.Gfsk.ModulationShaping = MOD_SHAPING_G_BT_05;
-            SubgRf.ModulationParams.Params.Gfsk.Fdev = 800;
-            SubgRf.ModulationParams.Params.Gfsk.Bandwidth = SUBGRF_GetFskBandwidthRegValue( bandwidth );
-
-            SubgRf.PacketParams.PacketType = PACKET_TYPE_GFSK;
-            SubgRf.PacketParams.Params.Gfsk.PreambleLength = ( preambleLen << 3 ); // convert byte into bit
-            SubgRf.PacketParams.Params.Gfsk.PreambleMinDetect = RADIO_PREAMBLE_DETECTOR_OFF;
-            SubgRf.PacketParams.Params.Gfsk.SyncWordLength = 2 << 3; // convert byte into bit
-            SubgRf.PacketParams.Params.Gfsk.AddrComp = RADIO_ADDRESSCOMP_FILT_OFF;
-            SubgRf.PacketParams.Params.Gfsk.HeaderType = RADIO_PACKET_FIXED_LENGTH;
-            SubgRf.PacketParams.Params.Gfsk.PayloadLength = MaxPayloadLength;
-            SubgRf.PacketParams.Params.Gfsk.CrcLength = RADIO_CRC_OFF;
-
-            SubgRf.PacketParams.Params.Gfsk.DcFree = RADIO_DC_FREE_OFF;
-
-            RadioSetModem( MODEM_SIGFOX_RX );
-            SUBGRF_SetModulationParams( &SubgRf.ModulationParams );
-            SUBGRF_SetPacketParams( &SubgRf.PacketParams );
-            SUBGRF_SetSyncWord( ( uint8_t[] ){0xB2, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } );
-            SUBGRF_SetWhiteningSeed( 0x01FF );
-
-            /* NO gfo reset (better sensitivity). Reg 0x8b8, bit4 = 0 */
-            modReg= RadioRead(SUBGHZ_AGCGFORSTCFGR);
-            modReg&=RADIO_BIT_MASK(4);
-            RadioWrite(SUBGHZ_AGCGFORSTCFGR, modReg);
-            /* Lower the threshold of cfo_reset */
-            RadioWrite(SUBGHZ_AGCGFORSTPOWTHR, 0x4 );
-
-            /* Bigger rssi_len (stability AGC). Reg 0x89b, bits[2 :4] = 0x1 */
-            modReg= RadioRead(SUBGHZ_AGCRSSICTL0R);
-            modReg&=( RADIO_BIT_MASK(2) & RADIO_BIT_MASK(3) & RADIO_BIT_MASK(4) );
-            RadioWrite(SUBGHZ_AGCRSSICTL0R, (modReg| (0x1<<3) ) );
-
-            /* Bigger afc_pbl_len (better frequency correction). Reg 0x6d1, bits[3 :4] = 0x3 */
-            modReg= RadioRead(SUBGHZ_GAFCR);
-            modReg&=( RADIO_BIT_MASK(3) & RADIO_BIT_MASK(4) );
-            RadioWrite(SUBGHZ_GAFCR, (modReg| (0x3<<3) ));
-
-            /* Use of new bit synchronizer (to avoid CRC errors during PER for payloads with a small amount of transitions). Reg 0x6ac, bits[4 :6] = 0x5 */
-            modReg= RadioRead(SUBGHZ_GBSYNCR);
-            modReg&=( RADIO_BIT_MASK(4) & RADIO_BIT_MASK(5) & RADIO_BIT_MASK(6) );
-            RadioWrite(SUBGHZ_GBSYNCR, (modReg| (0x5<<4) ));
-            /*timeout unused when SubgRf.RxContinuous*/
-            SubgRf.RxTimeout = ( uint32_t )(( symbTimeout * 8 * 1000 ) /datarate);
-            break;
-#endif /*RADIO_SIGFOX_ENABLE == 1*/
-        case MODEM_FSK:
-            SUBGRF_SetStopRxTimerOnPreambleDetect( false );
-            SubgRf.ModulationParams.PacketType = PACKET_TYPE_GFSK;
-
-            SubgRf.ModulationParams.Params.Gfsk.BitRate = datarate;
-            SubgRf.ModulationParams.Params.Gfsk.ModulationShaping = MOD_SHAPING_G_BT_1;
-            SubgRf.ModulationParams.Params.Gfsk.Bandwidth = SUBGRF_GetFskBandwidthRegValue( bandwidth );
-
-            SubgRf.PacketParams.PacketType = PACKET_TYPE_GFSK;
-            SubgRf.PacketParams.Params.Gfsk.PreambleLength = ( preambleLen << 3 ); // convert byte into bit
-            SubgRf.PacketParams.Params.Gfsk.PreambleMinDetect = RADIO_PREAMBLE_DETECTOR_08_BITS;
-            SubgRf.PacketParams.Params.Gfsk.SyncWordLength = 3 << 3; // convert byte into bit
-            SubgRf.PacketParams.Params.Gfsk.AddrComp = RADIO_ADDRESSCOMP_FILT_OFF;
-            SubgRf.PacketParams.Params.Gfsk.HeaderType = ( fixLen == true ) ? RADIO_PACKET_FIXED_LENGTH : RADIO_PACKET_VARIABLE_LENGTH;
-            SubgRf.PacketParams.Params.Gfsk.PayloadLength = MaxPayloadLength;
-            if( crcOn == true )
-            {
-                SubgRf.PacketParams.Params.Gfsk.CrcLength = RADIO_CRC_2_BYTES_CCIT;
-            }
-            else
-            {
-                SubgRf.PacketParams.Params.Gfsk.CrcLength = RADIO_CRC_OFF;
-            }
-            SubgRf.PacketParams.Params.Gfsk.DcFree = RADIO_DC_FREEWHITENING;
-
-            RadioStandby( );
-            RadioSetModem( MODEM_FSK );
-            SUBGRF_SetModulationParams( &SubgRf.ModulationParams );
-            SUBGRF_SetPacketParams( &SubgRf.PacketParams );
-            SUBGRF_SetSyncWord( ( uint8_t[] ){ 0xC1, 0x94, 0xC1, 0x00, 0x00, 0x00, 0x00, 0x00 } );
-            SUBGRF_SetWhiteningSeed( 0x01FF );
-
-            /*timeout unused when SubgRf.RxContinuous*/
-            SubgRf.RxTimeout = ( uint32_t )(( symbTimeout * 8 * 1000 ) /datarate);
-            break;
-
-        case MODEM_LORA:
-            SUBGRF_SetStopRxTimerOnPreambleDetect( false );
-            SubgRf.ModulationParams.PacketType = PACKET_TYPE_LORA;
-            SubgRf.ModulationParams.Params.LoRa.SpreadingFactor = ( RadioLoRaSpreadingFactors_t )datarate;
-            SubgRf.ModulationParams.Params.LoRa.Bandwidth = Bandwidths[bandwidth];
-            SubgRf.ModulationParams.Params.LoRa.CodingRate = ( RadioLoRaCodingRates_t )coderate;
-
-            if( ( ( bandwidth == 0 ) && ( ( datarate == 11 ) || ( datarate == 12 ) ) ) ||
-                ( ( bandwidth == 1 ) && ( datarate == 12 ) ) )
-            {
-                SubgRf.ModulationParams.Params.LoRa.LowDatarateOptimize = 0x01;
-            }
-            else
-            {
-                SubgRf.ModulationParams.Params.LoRa.LowDatarateOptimize = 0x00;
-            }
-
-            SubgRf.PacketParams.PacketType = PACKET_TYPE_LORA;
-
-            if( ( SubgRf.ModulationParams.Params.LoRa.SpreadingFactor == LORA_SF5 ) ||
-                ( SubgRf.ModulationParams.Params.LoRa.SpreadingFactor == LORA_SF6 ) )
-            {
-                if( preambleLen < 12 )
-                {
-                    SubgRf.PacketParams.Params.LoRa.PreambleLength = 12;
-                }
-                else
-                {
-                    SubgRf.PacketParams.Params.LoRa.PreambleLength = preambleLen;
-                }
-            }
-            else
-            {
-                SubgRf.PacketParams.Params.LoRa.PreambleLength = preambleLen;
-            }
-
-            SubgRf.PacketParams.Params.LoRa.HeaderType = ( RadioLoRaPacketLengthsMode_t )fixLen;
-
-            SubgRf.PacketParams.Params.LoRa.PayloadLength = MaxPayloadLength;
-            SubgRf.PacketParams.Params.LoRa.CrcMode = ( RadioLoRaCrcModes_t )crcOn;
-            SubgRf.PacketParams.Params.LoRa.InvertIQ = ( RadioLoRaIQModes_t )iqInverted;
-
-            RadioStandby( );
-            RadioSetModem( MODEM_LORA );
-            SUBGRF_SetModulationParams( &SubgRf.ModulationParams );
-            SUBGRF_SetPacketParams( &SubgRf.PacketParams );
-            SUBGRF_SetLoRaSymbNumTimeout( symbTimeout );
-
-            /* WORKAROUND - Set the step threshold value to 1 to avoid to miss low power signal after an interferer jam the chip in LoRa modulaltion */
-            SUBGRF_WriteRegister(SUBGHZ_AGCCFG,SUBGRF_ReadRegister(SUBGHZ_AGCCFG)&0x1);
-
-            /* WORKAROUND - Optimizing the Inverted IQ Operation, see STM32WL Erratasheet */
-            if( SubgRf.PacketParams.Params.LoRa.InvertIQ == LORA_IQ_INVERTED )
-            {
-                // RegIqPolaritySetup = @address 0x0736
-                SUBGRF_WriteRegister( SUBGHZ_LIQPOLR, SUBGRF_ReadRegister( SUBGHZ_LIQPOLR ) & ~( 1 << 2 ) );
-            }
-            else
-            {
-                // RegIqPolaritySetup @address 0x0736
-                SUBGRF_WriteRegister( SUBGHZ_LIQPOLR, SUBGRF_ReadRegister( SUBGHZ_LIQPOLR ) | ( 1 << 2 ) );
-            }
-            /* WORKAROUND END */
-
-            // Timeout Max, Timeout handled directly in SetRx function
-            SubgRf.RxTimeout = 0xFFFF;
-
-            break;
-        default:
-            break;
+        SubgRf.ModulationParams.Params.LoRa.LowDatarateOptimize = 0x01;
     }
+    else
+    {
+        SubgRf.ModulationParams.Params.LoRa.LowDatarateOptimize = 0x00;
+    }
+
+    SubgRf.PacketParams.PacketType = PACKET_TYPE_LORA;
+
+    if( ( SubgRf.ModulationParams.Params.LoRa.SpreadingFactor == LORA_SF5 ) ||
+        ( SubgRf.ModulationParams.Params.LoRa.SpreadingFactor == LORA_SF6 ) )
+    {
+        if( preambleLen < 12 )
+        {
+            SubgRf.PacketParams.Params.LoRa.PreambleLength = 12;
+        }
+        else
+        {
+            SubgRf.PacketParams.Params.LoRa.PreambleLength = preambleLen;
+        }
+    }
+    else
+    {
+        SubgRf.PacketParams.Params.LoRa.PreambleLength = preambleLen;
+    }
+
+    SubgRf.PacketParams.Params.LoRa.HeaderType = ( RadioLoRaPacketLengthsMode_t )fixLen;
+
+    SubgRf.PacketParams.Params.LoRa.PayloadLength = MaxPayloadLength;
+    SubgRf.PacketParams.Params.LoRa.CrcMode = ( RadioLoRaCrcModes_t )crcOn;
+    SubgRf.PacketParams.Params.LoRa.InvertIQ = ( RadioLoRaIQModes_t )iqInverted;
+
+    RadioStandby( );
+    RadioSetModem( MODEM_LORA );
+    SUBGRF_SetModulationParams( &SubgRf.ModulationParams );
+    SUBGRF_SetPacketParams( &SubgRf.PacketParams );
+    SUBGRF_SetLoRaSymbNumTimeout( symbTimeout );
+
+    /* WORKAROUND - Set the step threshold value to 1 to avoid to miss low power signal after an interferer jam the chip in LoRa modulaltion */
+    SUBGRF_WriteRegister(SUBGHZ_AGCCFG,SUBGRF_ReadRegister(SUBGHZ_AGCCFG)&0x1);
+
+    /* WORKAROUND - Optimizing the Inverted IQ Operation, see STM32WL Erratasheet */
+    if( SubgRf.PacketParams.Params.LoRa.InvertIQ == LORA_IQ_INVERTED )
+    {
+        // RegIqPolaritySetup = @address 0x0736
+        SUBGRF_WriteRegister( SUBGHZ_LIQPOLR, SUBGRF_ReadRegister( SUBGHZ_LIQPOLR ) & ~( 1 << 2 ) );
+    }
+    else
+    {
+        // RegIqPolaritySetup @address 0x0736
+        SUBGRF_WriteRegister( SUBGHZ_LIQPOLR, SUBGRF_ReadRegister( SUBGHZ_LIQPOLR ) | ( 1 << 2 ) );
+    }
+    /* WORKAROUND END */
+
+    // Timeout Max, Timeout handled directly in SetRx function
+    SubgRf.RxTimeout = 0xFFFF;
 }
 
 static void RadioSetTxConfig( RadioModems_t modem, int8_t power, uint32_t fdev,
@@ -1016,36 +928,7 @@ static void RadioSetTxConfig( RadioModems_t modem, int8_t power, uint32_t fdev,
     switch( modem )
     {
         case MODEM_FSK:
-            SubgRf.ModulationParams.PacketType = PACKET_TYPE_GFSK;
-            SubgRf.ModulationParams.Params.Gfsk.BitRate = datarate;
-
-            SubgRf.ModulationParams.Params.Gfsk.ModulationShaping = MOD_SHAPING_G_BT_1;
-            SubgRf.ModulationParams.Params.Gfsk.Bandwidth = SUBGRF_GetFskBandwidthRegValue( bandwidth );
-            SubgRf.ModulationParams.Params.Gfsk.Fdev = fdev;
-
-            SubgRf.PacketParams.PacketType = PACKET_TYPE_GFSK;
-            SubgRf.PacketParams.Params.Gfsk.PreambleLength = ( preambleLen << 3 ); // convert byte into bit
-            SubgRf.PacketParams.Params.Gfsk.PreambleMinDetect = RADIO_PREAMBLE_DETECTOR_08_BITS;
-            SubgRf.PacketParams.Params.Gfsk.SyncWordLength = 3 << 3 ; // convert byte into bit
-            SubgRf.PacketParams.Params.Gfsk.AddrComp = RADIO_ADDRESSCOMP_FILT_OFF;
-            SubgRf.PacketParams.Params.Gfsk.HeaderType = ( fixLen == true ) ? RADIO_PACKET_FIXED_LENGTH : RADIO_PACKET_VARIABLE_LENGTH;
-
-            if( crcOn == true )
-            {
-                SubgRf.PacketParams.Params.Gfsk.CrcLength = RADIO_CRC_2_BYTES_CCIT;
-            }
-            else
-            {
-                SubgRf.PacketParams.Params.Gfsk.CrcLength = RADIO_CRC_OFF;
-            }
-            SubgRf.PacketParams.Params.Gfsk.DcFree = RADIO_DC_FREEWHITENING;
-
-            RadioStandby( );
-            RadioSetModem(  MODEM_FSK  );
-            SUBGRF_SetModulationParams( &SubgRf.ModulationParams );
-            SUBGRF_SetPacketParams( &SubgRf.PacketParams );
-            SUBGRF_SetSyncWord( ( uint8_t[] ){ 0xC1, 0x94, 0xC1, 0x00, 0x00, 0x00, 0x00, 0x00 } );
-            SUBGRF_SetWhiteningSeed( 0x01FF );
+            sim_error("FSK is not supported by lora-simulator");
             break;
 
         case MODEM_LORA:
@@ -1094,11 +977,7 @@ static void RadioSetTxConfig( RadioModems_t modem, int8_t power, uint32_t fdev,
             break;
 #if (RADIO_SIGFOX_ENABLE == 1)
         case MODEM_SIGFOX_TX:
-            RadioSetModem(MODEM_SIGFOX_TX);
-            SubgRf.ModulationParams.PacketType = PACKET_TYPE_BPSK;
-            SubgRf.ModulationParams.Params.Bpsk.BitRate           = datarate;
-            SubgRf.ModulationParams.Params.Bpsk.ModulationShaping = MOD_SHAPING_DBPSK;
-            SUBGRF_SetModulationParams( &SubgRf.ModulationParams );
+            sim_error("FSK is not supported by lora-simulator");
             break;
 #endif /*RADIO_SIGFOX_ENABLE == 1*/
         default:
