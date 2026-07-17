@@ -11,6 +11,11 @@ pthread_cond_t sim_sleep_finished_cond = PTHREAD_COND_INITIALIZER;
 // Accompanying lock for condition variable.
 pthread_mutex_t sim_sleep_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+void sim_error(const char *msg) {
+    fprintf(stderr, "\033[31;1;4mERROR: %s\033[0m\n", msg);
+    exit(1);
+}
+
 /**
  * Sleep for the given duration (in seconds), this is equivalent to calling sim.sleep() in Python.
  */
