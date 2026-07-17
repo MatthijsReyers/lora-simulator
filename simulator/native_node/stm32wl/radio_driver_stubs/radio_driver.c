@@ -919,19 +919,7 @@ void SUBGRF_GetPacketStatus( PacketStatus_t *pktStatus )
 
 RadioError_t SUBGRF_GetDeviceErrors( void )
 {
-    uint8_t err[] = { 0, 0 };
-    RadioError_t error = { .Value = 0 };
-
-    SUBGRF_ReadCommand( RADIO_GET_ERROR, ( uint8_t * )err, 2 );
-    error.Fields.PaRamp     = ( err[0] & ( 1 << 0 ) ) >> 0;
-    error.Fields.PllLock    = ( err[1] & ( 1 << 6 ) ) >> 6;
-    error.Fields.XoscStart  = ( err[1] & ( 1 << 5 ) ) >> 5;
-    error.Fields.ImgCalib   = ( err[1] & ( 1 << 4 ) ) >> 4;
-    error.Fields.AdcCalib   = ( err[1] & ( 1 << 3 ) ) >> 3;
-    error.Fields.PllCalib   = ( err[1] & ( 1 << 2 ) ) >> 2;
-    error.Fields.Rc13mCalib = ( err[1] & ( 1 << 1 ) ) >> 1;
-    error.Fields.Rc64kCalib = ( err[1] & ( 1 << 0 ) ) >> 0;
-    return error;
+    return 0;
 }
 
 void SUBGRF_ClearDeviceErrors( void )
@@ -943,7 +931,6 @@ void SUBGRF_ClearDeviceErrors( void )
 void SUBGRF_ClearIrqStatus( uint16_t irq )
 {
     uint8_t buf[2];
-
     buf[0] = ( uint8_t )( ( ( uint16_t )irq >> 8 ) & 0x00FF );
     buf[1] = ( uint8_t )( ( uint16_t )irq & 0x00FF );
     SUBGRF_WriteCommand( RADIO_CLR_IRQSTATUS, buf, 2 );
@@ -951,72 +938,54 @@ void SUBGRF_ClearIrqStatus( uint16_t irq )
 
 void SUBGRF_WriteRegister( uint16_t addr, uint8_t data )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_WriteRegisters( &hsubghz, addr, (uint8_t*)&data, 1 );
-    CRITICAL_SECTION_END();
 }
 
 uint8_t SUBGRF_ReadRegister( uint16_t addr )
 {
     uint8_t data;
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_ReadRegisters( &hsubghz, addr, &data, 1 );
-    CRITICAL_SECTION_END();
     return data;
 }
 
 void SUBGRF_WriteRegisters( uint16_t address, uint8_t *buffer, uint16_t size )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_WriteRegisters( &hsubghz, address, buffer, size );
-    CRITICAL_SECTION_END();
 }
 
 void SUBGRF_ReadRegisters( uint16_t address, uint8_t *buffer, uint16_t size )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_ReadRegisters( &hsubghz, address, buffer, size );
-    CRITICAL_SECTION_END();
 }
 
 void SUBGRF_WriteBuffer( uint8_t offset, uint8_t *buffer, uint8_t size )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_WriteBuffer( &hsubghz, offset, buffer, size );
-    CRITICAL_SECTION_END();
 }
 
 void SUBGRF_ReadBuffer( uint8_t offset, uint8_t *buffer, uint8_t size )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_ReadBuffer( &hsubghz, offset, buffer, size );
-    CRITICAL_SECTION_END();
 }
 
 void SUBGRF_WriteCommand( SUBGHZ_RadioSetCmd_t Command, uint8_t *pBuffer,
                                         uint16_t Size )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_ExecSetCmd( &hsubghz, Command, pBuffer, Size );
-    CRITICAL_SECTION_END();
 }
 
 void SUBGRF_ReadCommand( SUBGHZ_RadioGetCmd_t Command, uint8_t *pBuffer,
                                         uint16_t Size )
 {
-    CRITICAL_SECTION_BEGIN();
     HAL_SUBGHZ_ExecGetCmd( &hsubghz, Command, pBuffer, Size );
-    CRITICAL_SECTION_END();
 }
 
 void SUBGRF_SetSwitch( uint8_t paSelect, RFState_t rxtx )
 {
     RBI_Switch_TypeDef state = RBI_SWITCH_RX;
 
-    if (rxtx == RFSWITCH_TX)
-    {
-        if (paSelect == RFO_LP)
-        {
+    if (rxtx == RFSWITCH_TX) {
+        if (paSelect == RFO_LP) {
             state = RBI_SWITCH_RFO_LP;
             Radio_SMPS_Set(SMPS_DRIVE_SETTING_MAX);
         }
@@ -1025,8 +994,7 @@ void SUBGRF_SetSwitch( uint8_t paSelect, RFState_t rxtx )
             state = RBI_SWITCH_RFO_HP;
         }
     }
-    else
-    {
+    else {
         if (rxtx == RFSWITCH_RX)
         {
             state = RBI_SWITCH_RX;
@@ -1137,64 +1105,16 @@ void HAL_SUBGHZ_HeaderValidCallback(SUBGHZ_HandleTypeDef *hsubghz)
 
 static void Radio_SMPS_Set(uint8_t level)
 {
-  if ( 1U == RBI_IsDCDC() )
-  {
-    uint8_t modReg;
-    modReg= SUBGRF_ReadRegister(SUBGHZ_SMPSC2R);
-    modReg&= (~SMPS_DRV_MASK);
-    SUBGRF_WriteRegister(SUBGHZ_SMPSC2R, modReg | level);
-  }
+    // NOP
 }
 
 uint8_t SUBGRF_GetFskBandwidthRegValue( uint32_t bandwidth )
 {
-    uint8_t i;
-
-    if( bandwidth == 0 )
-    {
-        return( 0x1F );
-    }
-
-    for( i = 0; i < ( sizeof( FskBandwidths ) / sizeof( FskBandwidth_t ) ); i++ )
-    {
-        if ( bandwidth < FskBandwidths[i].bandwidth )
-        {
-            return FskBandwidths[i].RegValue;
-        }
-    }
-    // ERROR: Value not found
-    while( 1 );
+    sim_error("SUBGRF_GetFskBandwidthRegValue(): lora-simulator does not support FSK");
 }
+
 void SUBGRF_GetCFO( uint32_t bitRate, int32_t *cfo)
 {
-  uint8_t BwMant[] = {4, 8, 10, 12};
-  /* read demod bandwidth: mant bit4:3, exp bits 2:0 */
-  uint8_t reg = (SUBGRF_ReadRegister( SUBGHZ_BWSELR ));
-  uint8_t bandwidth_mant = BwMant[( reg >> 3 ) & 0x3];
-  uint8_t bandwidth_exp = reg & 0x7;
-  uint32_t cf_fs = XTAL_FREQ / ( bandwidth_mant * ( 1 << ( bandwidth_exp + 1 )));
-  uint32_t cf_osr = cf_fs / bitRate;
-  uint8_t interp = 1;
-  /* calculate demod interpolation factor */
-  if (cf_osr * interp < 8)
-  {
-    interp = 2;
-  }
-  if (cf_osr * interp < 4)
-  {
-    interp = 4;
-  }
-  /* calculate demod sampling frequency */
-  uint32_t fs = cf_fs* interp;
-  /* get the cfo registers */
-  int32_t cfo_bin = ( SUBGRF_ReadRegister( SUBGHZ_GCFORH ) & 0xF ) << 8;
-  cfo_bin |= SUBGRF_ReadRegister( SUBGHZ_GCFORL );
-  /* negate if 12 bits sign bit is 1 */
-  if (( cfo_bin & 0x800 ) == 0x800 )
-  {
-    cfo_bin |= 0xFFFFF000;
-  }
-  /* calculate cfo in Hz */
-  /* shift by 5 first to not saturate, cfo_bin on 12bits */
-  *cfo = ((int32_t)( cfo_bin * ( fs >> 5 ))) >> ( 12 - 5 );
+    sim_error("SUBGRF_GetCFO(): lora-simulator does not support FSK");
 }
+
