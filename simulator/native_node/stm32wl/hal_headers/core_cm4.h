@@ -1364,6 +1364,8 @@ typedef struct
 
 /*@} end of group CMSIS_core_bitfield */
 
+// Make
+extern uint32_t sim_stm32_core_hardware[0x0F0000UL];
 
 /**
   \ingroup    CMSIS_core_register
@@ -1373,11 +1375,11 @@ typedef struct
  */
 
 /* Memory mapping of Core Hardware */
-#define SCS_BASE            (0xE000E000UL)                            /*!< System Control Space Base Address */
-#define ITM_BASE            (0xE0000000UL)                            /*!< ITM Base Address */
-#define DWT_BASE            (0xE0001000UL)                            /*!< DWT Base Address */
-#define TPI_BASE            (0xE0040000UL)                            /*!< TPI Base Address */
-#define CoreDebug_BASE      (0xE000EDF0UL)                            /*!< Core Debug Base Address */
+#define SCS_BASE            (&sim_stm32_core_hardware + 0x00E000UL)                            /*!< System Control Space Base Address */
+#define ITM_BASE            (&sim_stm32_core_hardware + 0x000000UL)                            /*!< ITM Base Address */
+#define DWT_BASE            (&sim_stm32_core_hardware + 0x001000UL)                            /*!< DWT Base Address */
+#define TPI_BASE            (&sim_stm32_core_hardware + 0x040000UL)                            /*!< TPI Base Address */
+#define CoreDebug_BASE      (&sim_stm32_core_hardware + 0x00EDF0UL)                            /*!< Core Debug Base Address */
 #define SysTick_BASE        (SCS_BASE +  0x0010UL)                    /*!< SysTick Base Address */
 #define NVIC_BASE           (SCS_BASE +  0x0100UL)                    /*!< NVIC Base Address */
 #define SCB_BASE            (SCS_BASE +  0x0D00UL)                    /*!< System Control Block Base Address */
