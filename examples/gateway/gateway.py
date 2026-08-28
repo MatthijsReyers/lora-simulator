@@ -1,6 +1,6 @@
 from examples.gateway.packets import *
 from simulator.environment import simulation_env as sim
-from simulator.lora.radio import LoraRadio
+from simulator.lora.gateway_radio import LoraGatewayRadio
 
 class Gateway:
     def __init__(self):
@@ -8,11 +8,11 @@ class Gateway:
         self.node_ids = {}
         self.node_id_counter = 1
 
-        self.radio = LoraRadio()
+        self.radio = LoraGatewayRadio()
         sim.create_task(self.run())
 
     async def run(self):
-        self.radio.set_rx_config(spreading_factor=7, bandwidth=125)
+        self.radio.set_rx_chain_config(chain=0, spreading_factor=7, bandwidth=125)
         self.radio.set_tx_config(power=14, spreading_factor=7, bandwidth=125)
         while sim.is_running():
             try:

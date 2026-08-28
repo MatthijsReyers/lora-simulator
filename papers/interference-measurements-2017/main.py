@@ -5,7 +5,7 @@ sys.path.append('.') # To allow importing the simulator package while running fr
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.lora.phy_layer import LoraPhyLayer
 from simulator.environment import simulation_env as sim
 
@@ -13,7 +13,7 @@ MEASUREMENTS = 1200
 
 class Node:
     def __init__(self, tx_offset, tx_pwr, bandwidth, sf, cr, preamble_len):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.tx_offset = tx_offset
         self.radio.set_rx_config(
             bandwidth=bandwidth,
@@ -39,7 +39,7 @@ class Node:
 
 class Receiver:
     def __init__(self, bandwidth, sf, cr, preamble_len):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.radio.set_rx_config(
             bandwidth=bandwidth,
             spreading_factor=sf,

@@ -22,7 +22,7 @@ import pandas as pd
 sys.path.append('.')
 
 from simulator.lora.phy_layer import LoraPhyLayer
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.environment import simulation_env as sim
 from simulator.exceptions import SimulatorException
 from simulator.lora.enums.bandwidth import Bandwidth
@@ -71,7 +71,7 @@ successful_rx = 0
 class Node:
     def __init__(self, node_id: int):
         self.node_id = node_id
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         sim.create_task(self.run())
 
     async def run(self):
@@ -121,7 +121,7 @@ class Node:
 
 class Receiver:
     def __init__(self, nodes: list[Node]):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.nodes = nodes
         sim.create_task(self.run())
 

@@ -6,7 +6,7 @@ import pandas as pd
 sys.path.append('.')
 
 from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.environment import simulation_env as sim
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
@@ -27,7 +27,7 @@ data = {
 
 class Node:
     def __init__(self, pos):
-        self.radio = LoraRadio(position=pos)
+        self.radio = LoraClientRadio(position=pos)
         sim.create_task(self.run())
     async def run(self):
         self.radio.set_tx_config(power=8, spreading_factor=SP, bandwidth=BW, code_rate=CR)
@@ -38,7 +38,7 @@ class Node:
 
 class Receiver:
     def __init__(self):
-        self.radio = LoraRadio(position=(0,0))
+        self.radio = LoraClientRadio(position=(0,0))
         sim.create_task(self.run())
     async def run(self):
         self.radio.set_rx_config(spreading_factor=SP, bandwidth=BW, code_rate=CR)

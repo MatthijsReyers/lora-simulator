@@ -1,13 +1,13 @@
 import asyncio, random
 import sys, logging
 sys.path.append('.') # To allow importing the simulator package while running from root folder.
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.environment import simulation_env as sim
 
 class NodePing:
     """ This nodes wakes up after a random delay to send a "Ping" messages and wait for a Pong """
     def __init__(self, node_id: int):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.node_id = node_id
         sim.create_task(self.run())
 
@@ -29,7 +29,7 @@ class NodePing:
 class NodePong:
     """ This nodes continuously listens for "Ping" messages and responds with "Pong" """
     def __init__(self):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         sim.create_task(self.run())
 
     async def run(self):

@@ -14,7 +14,7 @@ import logging
 sys.path.append(".")
 
 from simulator.lora.phy_layer import LoraPhyLayer
-from simulator.lora.radio import LoraRadio
+from simulator.lora.gateway_radio import LoraGatewayRadio
 from simulator.environment import simulation_env as sim
 from simulator.lorawan.join import OTAACredentials
 from simulator.lorawan.gateway import LoRaWanGateway
@@ -49,7 +49,7 @@ if __name__ == "__main__":
     ns.register_application(temp_app)
 
     # ── Gateway setup ───────────────────────────────────────────────────
-    gw_radio = LoraRadio()
+    gw_radio = LoraGatewayRadio()
     gw_radio.logger.setLevel(logging.WARNING)
     gateway = LoRaWanGateway(radio=gw_radio, network_server=ns)
 

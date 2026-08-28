@@ -55,6 +55,7 @@ class LoraPhyLayer():
                 "location.x": [],
                 "location.y": [],
                 "tx_power": [],
+                "frequency": [],
                 "code_rate": [],
                 "spreading_factor": [],
                 "bandwidth": [],
@@ -142,6 +143,7 @@ class LoraPhyLayer():
         self.__packets_log["location.x"].append(radio.position[0])
         self.__packets_log["location.y"].append(radio.position[1])
         self.__packets_log["tx_power"].append(packet.tx_power)
+        self.__packets_log["frequency"].append(packet.config.frequency)
         self.__packets_log["payload"].append(packet.payload)
         self.__packets_log["code_rate"].append(packet.config.code_rate)
         self.__packets_log["spreading_factor"].append(packet.config.spreading_factor)
