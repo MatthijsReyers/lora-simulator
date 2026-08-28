@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from simulator.environment import simulation_env as sim
-from simulator.lora.radio import LoraRadio
+from simulator.lora.gateway_radio import LoraGatewayRadio
 from simulator.lora.packet import LoraPacket
 from simulator.lorawan.beacon import encode_beacon, compute_ping_slot_times
 from simulator.lorawan.network_server import NetworkServer
@@ -37,12 +37,12 @@ class LoRaWanGateway:
     def __init__(
         self,
         network_server: NetworkServer,
-        radio: LoraRadio|None = None,
+        radio: LoraGatewayRadio|None = None,
         data_rate: int = 5,
         tx_power: int = 14,
         class_b_enabled: bool = False,
     ):
-        self.radio = radio if radio else LoraRadio()
+        self.radio = radio if radio else LoraGatewayRadio()
         self.network_server = network_server
         self.data_rate = data_rate
         self.tx_power = tx_power
@@ -55,7 +55,8 @@ class LoRaWanGateway:
 
     def _configure_radio(self) -> None:
         dr = EU868_DATA_RATES[self.data_rate]
-        self.radio.set_rx_config(
+        self.radio.set_rx_chain_config(
+            chain=0,
             spreading_factor=dr.spreading_factor.value,
             bandwidth=dr.bandwidth.to_khz(),
         )

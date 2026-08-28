@@ -78,7 +78,7 @@ class LoraPacket:
             )
 
     def __repr__(self):
-        return (f"LoRaPacket(id={self.id}, payload={self.payload}, spreading_factor={self.config.spreading_factor}, bandwidth={self.config.bandwidth}, code_rate={self.config.code_rate})")
+        return (f"LoRaPacket(id={self.id}, payload={self.payload}, frequency={self.config.frequency}, spreading_factor={self.config.spreading_factor}, bandwidth={self.config.bandwidth}, code_rate={self.config.code_rate})")
     
     def __deepcopy__(self, _memo) -> 'LoraPacket':
         return LoraPacket(
@@ -112,7 +112,7 @@ class LoraPacket:
         dis = distance(self.tx_location, self.rx_location)
         self.__rssi = self.tx_power - phy.path_loss_estimator(
             dis,
-            self.config.bandwidth.to_hz()
+            self.config.frequency
         )
         return self.__rssi
 
