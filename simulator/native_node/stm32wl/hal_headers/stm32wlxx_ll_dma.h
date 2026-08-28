@@ -643,7 +643,7 @@ __STATIC_INLINE uint32_t LL_DMA_GetMode(const DMA_TypeDef *DMAx, uint32_t Channe
 
 __STATIC_INLINE void LL_DMA_SetPeriphIncMode(const DMA_TypeDef *DMAx, uint32_t Channel, uint32_t PeriphOrM2MSrcIncMode)
 {
-  return 0; // Simulator: do whatever...
+  return; // Simulator: do whatever...
 }
 
 __STATIC_INLINE uint32_t LL_DMA_GetPeriphIncMode(const DMA_TypeDef *DMAx, uint32_t Channel)
@@ -653,7 +653,7 @@ __STATIC_INLINE uint32_t LL_DMA_GetPeriphIncMode(const DMA_TypeDef *DMAx, uint32
 
 __STATIC_INLINE void LL_DMA_SetMemoryIncMode(const DMA_TypeDef *DMAx, uint32_t Channel, uint32_t MemoryOrM2MDstIncMode)
 {
-  return 0; // Simulator: do whatever...
+  return; // Simulator: do whatever...
 }
 
 __STATIC_INLINE uint32_t LL_DMA_GetMemoryIncMode(const DMA_TypeDef *DMAx, uint32_t Channel)
@@ -663,7 +663,7 @@ __STATIC_INLINE uint32_t LL_DMA_GetMemoryIncMode(const DMA_TypeDef *DMAx, uint32
 
 __STATIC_INLINE void LL_DMA_SetPeriphSize(const DMA_TypeDef *DMAx, uint32_t Channel, uint32_t PeriphOrM2MSrcDataSize)
 {
-  return 0; // Simulator: do whatever...
+  return; // Simulator: do whatever...
 }
 
 __STATIC_INLINE uint32_t LL_DMA_GetPeriphSize(const DMA_TypeDef *DMAx, uint32_t Channel)
@@ -673,7 +673,7 @@ __STATIC_INLINE uint32_t LL_DMA_GetPeriphSize(const DMA_TypeDef *DMAx, uint32_t 
 
 __STATIC_INLINE void LL_DMA_SetMemorySize(const DMA_TypeDef *DMAx, uint32_t Channel, uint32_t MemoryOrM2MDstDataSize)
 {
-  return 0; // Simulator: do whatever...
+  return; // Simulator: do whatever...
 }
 
 __STATIC_INLINE uint32_t LL_DMA_GetMemorySize(const DMA_TypeDef *DMAx, uint32_t Channel)
@@ -683,7 +683,7 @@ __STATIC_INLINE uint32_t LL_DMA_GetMemorySize(const DMA_TypeDef *DMAx, uint32_t 
 
 __STATIC_INLINE void LL_DMA_SetChannelPriorityLevel(const DMA_TypeDef *DMAx, uint32_t Channel, uint32_t Priority)
 {
-  return 0; // Simulator: do whatever...
+  return; // Simulator: do whatever...
 }
 
 __STATIC_INLINE uint32_t LL_DMA_GetChannelPriorityLevel(const DMA_TypeDef *DMAx, uint32_t Channel)
