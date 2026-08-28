@@ -1,6 +1,6 @@
 import random, logging
 from simulator.exceptions import SimulatorException
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.environment import simulation_env as sim
 from packets import *
 
@@ -11,7 +11,7 @@ class Node:
     def __init__(self):
         self.node_id = None
         self.hardware_id = random.randint(0, 10000)
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         sim.create_task(self.run())
 
     async def run(self):

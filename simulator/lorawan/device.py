@@ -5,7 +5,7 @@ import random
 from dataclasses import dataclass, field
 
 from simulator.environment import simulation_env as sim
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.lora.packet import LoraPacket
 from simulator.lorawan.application import Application
 from simulator.lorawan.enums.frame_types import MType
@@ -87,7 +87,7 @@ class LoRaWanDevice:
         assert session is not None or otaa_credentials is not None, (
             "Provide either a session (ABP) or otaa_credentials (OTAA)"
         )
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.session = session
         self.data_rate = data_rate
         self.tx_power = tx_power

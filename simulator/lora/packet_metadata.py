@@ -5,6 +5,7 @@ class PacketMetadata:
     """ Radio specific metadata about a packet. """
 
     packet: LoraPacket
+    chain_id: int
     collision: bool
     missed_start: bool
     demodulate_failure: None|bool
@@ -18,8 +19,10 @@ class PacketMetadata:
         collision: bool, 
         missed_start: bool,
         demodulate_failure: Optional[bool] = None,
+        chain_id: int = 0,
     ):
         self.packet = packet
+        self.chain_id = chain_id
         self.collision = collision
         self.missed_start = missed_start
         self.demodulate_failure = demodulate_failure
@@ -42,7 +45,10 @@ class PacketMetadata:
         if self.received_preamble:
             status.append("received_preamble")
         status_str = ", ".join(status) if status else "successful"
-        return f"PacketMetadata(status={status_str}, packet=Packet(id={self.packet.id}))"
+        return (
+            f"PacketMetadata(status={status_str}, chain={self.chain_id}, "
+            f"packet=Packet(id={self.packet.id}))"
+        )
     
     def received_successfully(self) -> bool:
         return not (self.collision or self.missed_start or self.missed_end or self.interrupted)

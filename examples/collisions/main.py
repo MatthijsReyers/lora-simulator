@@ -3,7 +3,7 @@ import logging
 import asyncio, random, sys
 sys.path.append('.') # To allow importing the simulator package while running from root folder.
 from simulator.lora.phy_layer import LoraPhyLayer
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.environment import simulation_env as sim
 
 SF = 7
@@ -12,7 +12,7 @@ CR = 5
 
 class Receiver:
     def __init__(self):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.radio.set_rx_config(spreading_factor=SF, bandwidth=BW, code_rate=CR)
         sim.create_task(self.run())
     async def run(self):
@@ -25,7 +25,7 @@ class Receiver:
 
 class Node:
     def __init__(self, power: int, interval: float = 0.5):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.radio.set_tx_config(power=power, spreading_factor=SF, bandwidth=BW, code_rate=CR)
         self.interval = interval
         sim.create_task(self.run())
