@@ -5,7 +5,7 @@ sys.path.append('.')
 
 from simulator.lora.packet import LoraPacket
 from simulator.lora.phy_layer import LoraPhyLayer
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.environment import simulation_env as sim
 import random, asyncio, logging
 
@@ -14,7 +14,7 @@ logger.setLevel(logging.DEBUG)
 
 class Node:
     def __init__(self, code_rate: int):
-        self.radio = LoraRadio()
+        self.radio = LoraClientRadio()
         self.code_rate = code_rate
         sim.create_task(self.recv())
         sim.create_task(self.send())

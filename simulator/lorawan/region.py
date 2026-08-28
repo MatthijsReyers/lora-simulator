@@ -33,6 +33,14 @@ EU868_DATA_RATES: dict[int, DataRate] = {
     5: DataRate(SpreadingFactor.SF7,  Bandwidth.KHz125, max_payload=222),
 }
 
+# The three default uplink channels every EU868 device and gateway must support, a gateway
+# typically listens to all of these (and usually a few more) simultaneously.
+EU868_DEFAULT_UPLINK_CHANNELS = [
+    868_100_000,   # 868.1 MHz
+    868_300_000,   # 868.3 MHz
+    868_500_000,   # 868.5 MHz
+]
+
 # Default RX2 parameters for EU868
 RX2_DEFAULT_DR = 0                    # DR0 (SF12/125kHz)
 RX2_DEFAULT_FREQUENCY = 869_525_000   # 869.525 MHz

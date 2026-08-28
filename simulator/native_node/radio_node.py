@@ -16,7 +16,7 @@ sys.path.append('.')
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.enums.bandwidth import Bandwidth
-from simulator.lora.radio import LoraRadio
+from simulator.lora.client_radio import LoraClientRadio
 from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
 from simulator.environment import simulation_env as sim
 from simulator.native_node.native_node import NativeNode
@@ -32,7 +32,7 @@ class RadioNode(NativeNode):
     """
         A network node with a radio running native C code via CFFI.
     """
-    radio: LoraRadio
+    radio: LoraClientRadio
     logger: Logger
 
     def __init__(
@@ -71,7 +71,7 @@ class RadioNode(NativeNode):
             ffi_backend=ffi_backend,
             boot_delay=boot_delay,
         )
-        self.radio = LoraRadio(
+        self.radio = LoraClientRadio(
             position=position,
             power_profile=radio_power_profile
         )
@@ -162,6 +162,11 @@ class RadioNode(NativeNode):
                 iq_inverted=bool(iq_inverted),
                 timeout=timeout,
             )
+
+        @self.export('void(uint32_t)')
+        def sim_radio_set_channel(frequency: int): # pyright: ignore[reportUnusedFunction]
+            self.logger.debug(f"RadioNode::sim_radio_set_channel(frequency={frequency})")
+            self.radio.set_channel(int(frequency))
 
         @self.export('int()')
         def sim_radio_id() -> int: # pyright: ignore[reportUnusedFunction]
