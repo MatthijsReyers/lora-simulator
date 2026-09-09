@@ -1,1 +1,5 @@
 __pycache__/
+
+# Raw Joulescope captures are too large for GitHub, commit the reduced
+# .power.npz created by measurements/extract_power_profile.py --pack instead.
+measurements/**/*.jls
