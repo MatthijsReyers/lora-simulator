@@ -22,7 +22,8 @@ def log_distance_path_loss(
     """
 
     def free_space_path_loss(frequency: float, distance: float) -> float:
-        return ((FOUR_PI * distance * frequency) / SPEED_OF_LIGHT) ** 2 
+        """ Free space path loss in dB. """
+        return 20 * math.log10((FOUR_PI * distance * frequency) / SPEED_OF_LIGHT)
 
     def estimator(distance: float, frequency: float) -> float:
         # Taking log(0) is undefined and there is no meaningful path loss at zero distance anyway..
