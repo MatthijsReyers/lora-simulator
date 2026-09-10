@@ -68,6 +68,10 @@ class LoraRadio(ABC):
     logger: logging.Logger
     power_consumer: PowerConsumer
 
+    # Every packet that reaches this radio is recorded in `packets_log`, in large simulations this
+    # can take gigabytes of memory so it can be switched off per radio.
+    log_packets: bool = True
+
     __state_log: List[Tuple[float, RadioState]]
     __packets_log: Dict[str, Any]
 
@@ -108,6 +112,7 @@ class LoraRadio(ABC):
             "missed_start": [],
             "missed_end": [],
             "interrupted": [],
+            "demodulate_failure": [],
         }
 
         # Prevents circular import
@@ -617,7 +622,8 @@ class LoraRadio(ABC):
             metadata.missed_end = (not self.__can_receive(metadata.packet, rx_chain))
 
             # Log packet metadata for later analysis
-            self.__log_packet_metadata(metadata)
+            if self.log_packets:
+                self.__log_packet_metadata(metadata)
 
             # Did we successfully receive the whole packet?
             if metadata.received_successfully() and not delivered:
@@ -817,3 +823,4 @@ class LoraRadio(ABC):
         self.__packets_log["missed_start"].append(metadata.missed_start)
         self.__packets_log["missed_end"].append(metadata.missed_end)
         self.__packets_log["interrupted"].append(metadata.interrupted)
+        self.__packets_log["demodulate_failure"].append(metadata.demodulate_failure)

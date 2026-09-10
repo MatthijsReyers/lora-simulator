@@ -51,4 +51,7 @@ class PacketMetadata:
         )
     
     def received_successfully(self) -> bool:
-        return not (self.collision or self.missed_start or self.missed_end or self.interrupted)
+        return not (
+            self.collision or self.missed_start or self.missed_end or self.interrupted or
+            self.demodulate_failure
+        )

@@ -9,3 +9,5 @@ thesis
 .vscode/
 
 *.egg-info
+
+papers/fuota-unicast-broadcast-2024/data/
