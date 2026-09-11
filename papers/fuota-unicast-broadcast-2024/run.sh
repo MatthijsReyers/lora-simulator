@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs the simulation batteries of section 5 of the paper for the only unicast method.
-# Run from the repository root. The paper averages 40 repetitions per point, set REPEATS to
-# change the number of seeds per configuration (default 5).
+# Runs the simulation batteries of section 5 of the paper for one update method (METHOD, one of
+# unicast_only, broadcast_unicast or broadcast_only). Run from the repository root. The paper
+# averages 40 repetitions per point, set REPEATS to change the number of seeds per configuration
+# (default 5).
 #
-#   REPEATS=3 ./papers/fuota-unicast-broadcast-2024/run.sh
+#   REPEATS=3 METHOD=broadcast_unicast ./papers/fuota-unicast-broadcast-2024/run.sh
 #
 set -euo pipefail
 
@@ -48,3 +49,14 @@ for nodes in 10 30 50 70 90 110 130 150; do
         done
     done
 done
+
+if [[ "$METHOD" != "unicast_only" ]]; then
+    echo "== Effect of the number of broadcast rounds (Figure 19) =="
+    for rounds in $(seq 1 15); do
+        for nodes in 10 20; do
+            for seed in $(seq 1 "$REPEATS"); do
+                run --nodes "$nodes" --radius 2000 --broadcast-rounds "$rounds" --seed "$seed"
+            done
+        done
+    done
+fi

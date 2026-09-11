@@ -16,14 +16,23 @@ import pandas as pd
 from simulator.environment import simulation_env as sim
 from simulator.lora.phy_layer import LoraPhyLayer
 
-from frames import GATEWAY_ADDRESS, MiWiFrame, decode_gateway_message, decode_node_message
+from frames import (
+    BROADCAST_ADDRESS, GATEWAY_ADDRESS, MiWiFrame, decode_gateway_message, decode_node_message,
+)
 from scenario import Scenario, make_duty_cycles
+from broadcast_only.gateway import BroadcastOnlyGateway
+from broadcast_only.node import BroadcastOnlyNode
+from broadcast_unicast.gateway import BroadcastUnicastGateway
+from broadcast_unicast.node import BroadcastNode
 from unicast_only.gateway import UnicastGateway
 from unicast_only.node import UnicastNode
 
 
+# Gateway and node class per method, and whether the method has broadcast rounds.
 METHODS = {
-    "unicast_only": (UnicastGateway, UnicastNode),
+    "unicast_only": (UnicastGateway, UnicastNode, False),
+    "broadcast_unicast": (BroadcastUnicastGateway, BroadcastNode, True),
+    "broadcast_only": (BroadcastOnlyGateway, BroadcastOnlyNode, True),
 }
 
 # Long enough that no realistic update runs into the end of the simulation. Advancing to the end
@@ -36,7 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", choices=METHODS.keys(), default="unicast_only")
     parser.add_argument("--nodes", type=int, default=10, help="number of nodes to update")
     parser.add_argument("--radius", type=float, default=400.0, help="scenario radius in meters")
-    parser.add_argument("--firmware-kb", type=float, default=100.0, help="firmware size in kB")
+    parser.add_argument(
+        "--firmware-kb", type=float, default=100.0, help="firmware size in kB (1000 bytes)",
+    )
+    parser.add_argument(
+        "--broadcast-rounds", type=int, default=1,
+        help="B, initial broadcast rounds of the broadcast methods",
+    )
     parser.add_argument("--frame-len", type=int, default=215, help="frame length in bytes")
     parser.add_argument(
         "--paper-frames", action="store_true",
@@ -60,7 +75,11 @@ def parse_args() -> argparse.Namespace:
 
 def run_name(args: argparse.Namespace) -> str:
     frames = "p" if args.paper_frames else "f"
-    return f"{args.method}_n{args.nodes}_r{int(args.radius)}_{frames}{args.frame_len}_s{args.seed}"
+    rounds = f"_b{args.broadcast_rounds}" if METHODS[args.method][2] else ""
+    return (
+        f"{args.method}_n{args.nodes}_r{int(args.radius)}_{frames}{args.frame_len}{rounds}"
+        f"_s{args.seed}"
+    )
 
 
 def frame_log(gateway, nodes, scenario: Scenario) -> pd.DataFrame:
@@ -83,27 +102,35 @@ def frame_log(gateway, nodes, scenario: Scenario) -> pd.DataFrame:
         else:
             message = decode_node_message(frame.payload)
         fragment = getattr(message, "number", getattr(message, "expected", None))
-        received = receivers[frame.destination]
-        if packet.id in received.index:
-            rx = received.loc[packet.id]
-            rssi = rx.rssi
-            delivered = not (
-                rx.collision or rx.missed_start or rx.missed_end or rx.interrupted or
-                rx.demodulate_failure
-            )
+        # A broadcast frame reaches every node, so it gets one row per node like Figure 10 of
+        # the paper (which shows every broadcast frame once per receiving node).
+        if frame.destination == BROADCAST_ADDRESS:
+            destinations = [node.address for node in nodes]
         else:
-            rssi, delivered = float("nan"), False
-        rows.append({
-            "time": packet.start_time,
-            "source": frame.source,
-            "destination": frame.destination,
-            "message": type(message).__name__,
-            "fragment": fragment,
-            "length": len(packet.payload),
-            "airtime": packet.airtime,
-            "rssi": rssi,
-            "delivered": delivered,
-        })
+            destinations = [frame.destination]
+        for destination in destinations:
+            received = receivers[destination]
+            if packet.id in received.index:
+                rx = received.loc[packet.id]
+                rssi = rx.rssi
+                delivered = not (
+                    rx.collision or rx.missed_start or rx.missed_end or rx.interrupted or
+                    rx.demodulate_failure
+                )
+            else:
+                rssi, delivered = float("nan"), False
+            rows.append({
+                "time": packet.start_time,
+                "source": frame.source,
+                "destination": destination,
+                "broadcast": frame.destination == BROADCAST_ADDRESS,
+                "message": type(message).__name__,
+                "fragment": fragment,
+                "length": len(packet.payload),
+                "airtime": packet.airtime,
+                "rssi": rssi,
+                "delivered": delivered,
+            })
     return pd.DataFrame(rows)
 
 
@@ -114,7 +141,7 @@ def main() -> None:
     scenario = Scenario(
         nodes=args.nodes,
         radius=args.radius,
-        firmware_size=int(args.firmware_kb * 1024),
+        firmware_size=int(args.firmware_kb * 1000),
         frame_len=args.frame_len,
         header_on_air=not args.paper_frames,
         duty_cycle=args.duty_cycle / 100,
@@ -126,7 +153,7 @@ def main() -> None:
     random.seed(scenario.seed)  # The channel model draws from the global generator.
 
     scenario.setup_phy()
-    gateway_type, node_type = METHODS[args.method]
+    gateway_type, node_type, has_rounds = METHODS[args.method]
     duty_cycles = make_duty_cycles(scenario, scenario.nodes + 1)
 
     positions = scenario.node_positions(rng)
@@ -144,12 +171,15 @@ def main() -> None:
         firmware=scenario.make_firmware(rng),
         scenario=scenario,
         duty_cycle=duty_cycles[0],
+        **({"rounds": args.broadcast_rounds} if has_rounds else {}),
     )
 
     print(
         f"{args.method}: {scenario.nodes} nodes within {scenario.radius:.0f}m, "
         f"{scenario.fragments} fragments of {scenario.chunk_size} bytes "
-        f"({scenario.airtime(scenario.frame_len) * 1000:.1f}ms on air), seed {scenario.seed}"
+        f"({scenario.airtime(scenario.frame_len) * 1000:.1f}ms on air), "
+        f"{f'{args.broadcast_rounds} broadcast round(s), ' if has_rounds else ''}"
+        f"seed {scenario.seed}"
     )
     wall_start = time.time()
     sim.run(simulation_length=SIMULATION_LENGTH)
@@ -162,6 +192,7 @@ def main() -> None:
             "start": r.start,
             "binary_start": r.binary_start,
             "binary_end": r.binary_end,
+            "pending_start": r.pending_start,
             "end": r.end,
             "binary_time": r.binary_time,
             "total_time": r.total_time,
@@ -169,14 +200,20 @@ def main() -> None:
             "retransmissions": r.retransmissions,
             "restarts": r.restarts,
             "updated": r.updated,
+            "missing_after_broadcast": r.missing_after_broadcast,
+            "repair_rounds": r.repair_rounds,
         }
         for r in gateway.results.values()
     ])
     binary_total = results["binary_end"].max() - gateway.start_time
     total = gateway.finish_time - gateway.start_time
+    broadcast_time = (
+        gateway.broadcast_end - gateway.broadcast_start if has_rounds else float("nan")
+    )
     print(results.to_string(index=False, float_format=lambda f: f"{f:.1f}"))
     print(
-        f"binary exchange finished after {binary_total:.0f}s ({binary_total / 3600:.1f}h), "
+        f"binary exchange finished after {binary_total:.0f}s ({binary_total / 3600:.1f}h)"
+        f"{f' of which {broadcast_time:.0f}s broadcast stage' if has_rounds else ''}, "
         f"whole update after {total:.0f}s ({total / 3600:.1f}h), "
         f"{results['retransmissions'].sum()} retransmissions, "
         f"{results['updated'].sum()}/{scenario.nodes} nodes updated, "
@@ -201,9 +238,12 @@ def main() -> None:
         "shared_duty_cycle": scenario.shared_duty_cycle,
         "exponent": scenario.path_loss_exponent,
         "seed": scenario.seed,
+        "broadcast_rounds": args.broadcast_rounds if has_rounds else 0,
         "binary_total_time": binary_total,
+        "broadcast_time": broadcast_time,
         "total_time": total,
         "retransmissions": results["retransmissions"].sum(),
+        "missing_after_broadcast": results["missing_after_broadcast"].sum(),
         "updated": results["updated"].sum(),
         "wall_time": wall_time,
     }])

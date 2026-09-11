@@ -22,7 +22,9 @@ class Scenario:
     """ Simulation parameters, the defaults are those of Table 1 of the paper. """
     nodes: int = 10
     radius: float = 400.0               # meters, nodes are placed at uniform distances in [0, radius]
-    firmware_size: int = 100 * 1024     # bytes
+    # The paper's "100 kB" firmware is 100,000 bytes: its broadcast and unicast stage durations
+    # both work out to 521 fragments of 192 bytes (see the README).
+    firmware_size: int = 100_000        # bytes
     frame_len: int = 215                # bytes, including the 23 byte MiWi header
     # Whether the 23 byte MiWi header is actually transmitted. The simulations of the paper only
     # put the 192 byte payload (plus a few bytes of ns-3 header) on the air, see the README.
