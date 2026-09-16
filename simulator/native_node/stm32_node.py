@@ -1,5 +1,5 @@
 from typing import Tuple, override
-from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
+from simulator.lora.radio_power_profile import RadioPowerProfile, NucleoWL55PowerProfile
 from .radio_node import RadioNode
 from .stm32_enums import HAL_StatusTypeDef
 
@@ -10,7 +10,7 @@ class STM32Node(RadioNode):
     def __init__(
             self, 
             source_file: str, 
-            radio_power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
+            radio_power_profile: RadioPowerProfile = NucleoWL55PowerProfile(),
             position: Tuple[float, float] = (0.0, 0.0),
             ffi_backend = None,
             boot_delay: float = 0.0,

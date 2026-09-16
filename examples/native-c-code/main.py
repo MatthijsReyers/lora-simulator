@@ -16,7 +16,7 @@ from pathlib import Path
 import cffi
 
 from simulator.lora.radio import LoraRadio
-from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
+from simulator.lora.radio_power_profile import RadioPowerProfile, NucleoWL55PowerProfile
 from simulator.environment import simulation_env as sim
 
 
@@ -153,13 +153,13 @@ class EmbeddedNode:
         Initialize an EmbeddedNode.
         
         Args:
-            radio_power_profile: Power profile for the radio (defaults to Stm32wl55PowerProfile)
+            radio_power_profile: Power profile for the radio (defaults to NucleoWL55PowerProfile)
             c_source_file: Path to the C source file to compile and run
             c_source_code: C source code as a string (alternative to c_source_file)
             position: Position of the node in the simulation (x, y)
         """
         if radio_power_profile is None:
-            radio_power_profile = Stm32wl55PowerProfile()
+            radio_power_profile = NucleoWL55PowerProfile()
         
         self.radio = LoraRadio(position=position, power_profile=radio_power_profile)
         

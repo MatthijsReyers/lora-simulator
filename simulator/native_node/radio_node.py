@@ -7,7 +7,7 @@ from cffi import FFI
 sys.path.append('.')
 
 from simulator.lora.radio import LoraRadio
-from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
+from simulator.lora.radio_power_profile import RadioPowerProfile, NucleoWL55PowerProfile
 from simulator.environment import simulation_env as sim
 from simulator.native_node.native_node import NativeNode
 
@@ -20,7 +20,7 @@ class RadioNode(NativeNode):
     def __init__(
             self, 
             source_file: str, 
-            radio_power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
+            radio_power_profile: RadioPowerProfile = NucleoWL55PowerProfile(),
             position: Tuple[float, float] = (0.0, 0.0),
             ffi_backend = None,
             boot_delay: float = 0.0,

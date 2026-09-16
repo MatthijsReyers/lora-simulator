@@ -1,105 +1,14 @@
-from abc import ABC, abstractmethod
-from typing import Dict
-import numpy as np
-import random, math
-
-from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.radio_config import LoraConfig
+from simulator.lora.radio_power_profile import RadioPowerProfile
+import random
 
-class RadioPowerProfile(ABC):
-    """
-        Abstract base class for defining radio power profiles in a LoRa simulation. Different
-        radios can have different power consumption characteristics for various operations which
-        can be modeled by implementing this interface.
-
-        Alternatively, you can extend on of the provided profiles if your radio is similar to an
-        existing one.
-    """
-    def disabled_power(self) -> float:
-        """
-            The power consumption in watts when the radio is disabled/turned off. This is the only
-            non-abstract method in this class and set to 0 by default.
-
-            :return: The power consumption in watts.
-        """
-        return 0.0
-
-    @abstractmethod
-    def standby_startup_time(self) -> float:
-        """
-            Get the time in seconds it takes for the radio to power up and be ready to enter
-            standby mode.
-
-            :return: The standby startup time in seconds.
-        """
-        pass
-
-    @abstractmethod
-    def standby_power(self) -> float:
-        """
-            Get the power consumption in watts when the radio is in standby mode.
-
-            :return: The power consumption in watts.
-        """
-        pass
-
-    @abstractmethod
-    def tx_startup_time(self, power: float|int, config: LoraConfig) -> float:
-        """
-            Get the time in seconds it takes for the radio to power up and be ready to transmit.
-            
-            Practically this value is measured as the difference between how long we expect the
-            radio to be running according to the `estimate_air_time` function and how long the
-            radio is actually consuming full TX power.
-
-            This delay accounts for the time taken to power up the radio hardware or for power to
-            stabilize. In our experience this time can vary ever so slightly based on the bandwidth
-            used, thought this is so minimal you could reasonably ignore it if you wanted to and
-            just provide a constant value instead.
-
-            :return: The transmit startup time in seconds.
-        """
-        pass
-
-    @abstractmethod
-    def tx_power(self, power: float|int, config: LoraConfig) -> float:
-        """
-            Get the power consumption in watts when transmitting at the specified power level in
-            dBm.
-
-            :param power_dbm: The transmit power level in dBm.
-            :param config: The radio configuration being used for transmission.
-            :return: The power consumption in watts.
-        """
-        pass
-
-    @abstractmethod
-    def rx_power(self, config: LoraConfig) -> float:
-        """
-            Get the power consumption in watts when receiving at the specified radio configuration.
-
-            :param config: The radio configuration being used for receiving.
-            :return: The power consumption in watts.
-        """
-        pass
-
-
-class Stm32wl55PowerProfile(RadioPowerProfile):
+class NucleoWL55PowerProfile(RadioPowerProfile):
     """
         Power profile for the STM32WL55 Nucleo development boards built-in radio. These values are
         based on empirical measurements of the board's 3.3V power consumption (JP1 / VDD_MCU rail)
         performed with two Joulescope JS220s at 500 kHz. See the capture in
         measurements/nucleo_wl55jc1_power_profile/ and measurements/extract_power_profile.py to
-        reproduce the extraction.
-
-        This profile models ONLY the radio part of the MCU: the busy-waiting MCU baseline of
-        26.68 mW (measured before the radio subsystem was ever initialized) has been subtracted
-        from all values. The MCU core and its sleep modes must be modeled separately.
-
-        Note that the sleep/disabled power is NOT zero: once the radio subsystem has been
-        initialized, a persistent ~17.3 mW overhead (SUBGHZ SPI and related MCU-side
-        infrastructure) remains even with the radio in sleep mode. That overhead is attributed to
-        this profile because a datasheet-based MCU model would not account for it.
+        reproduce the extraction. This profile models ONLY the radio part of the MCU.
     """
     _SLEEP_POWER_USAGE = 0.017295191064476967
     _STANDBY_POWER_USAGE = 0.018751682713627815

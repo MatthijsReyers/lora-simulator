@@ -13,7 +13,7 @@ from simulator.lora.packet import LoraPacket
 from simulator.environment import simulation_env as sim
 from simulator.lora.packet_metadata import PacketMetadata
 from simulator.lora.radio_config import LoraConfig
-from simulator.lora.radio_power_profile import RadioPowerProfile, Stm32wl55PowerProfile
+from simulator.lora.radio_power_profile import RadioPowerProfile, NucleoWL55PowerProfile
 from simulator.power_consumer import PowerConsumer
 from simulator.queue import Queue
 
@@ -55,7 +55,7 @@ class LoraRadio(ABC):
     def __init__(
             self, 
             position: tuple[float, float] = (0.0, 0.0), 
-            power_profile: RadioPowerProfile = Stm32wl55PowerProfile(),
+            power_profile: RadioPowerProfile = NucleoWL55PowerProfile(),
 
         ):
         self.__packets_in_transit = {}
