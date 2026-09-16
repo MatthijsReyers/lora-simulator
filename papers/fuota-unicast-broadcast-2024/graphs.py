@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Thesis graphs for the reproduction: RSSI timelines like Figures 8 to 13 of the paper, the per
-node update time and frame loss of the only unicast method against the analytical model of
-section 4, the total update times of the three methods next to the values reported in the
-paper, and the spread of the 2 km results over seeds.
+Thesis graphs for the reproduction: RSSI timelines like Figures 8 to 13 of the paper (one image
+per direction), the per node update time and frame loss of the only unicast method against the
+analytical model of section 4, the total update times of the three methods next to the values
+reported in the paper, and the spread of the 2 km results over seeds.
+
+Everything is written to `graphs/` with the white space trimmed off, the document the figures
+end up in adds the spacing and the captions.
 
 Run from the repository root after `main.py` produced the 10 node runs (seed 0 with
 `--frame-log` for the timelines, seeds 1 and up for the averages).
@@ -27,6 +30,9 @@ from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 
 PAPER_DIR = './papers/fuota-unicast-broadcast-2024'
 DATA_DIR = os.path.join(PAPER_DIR, 'data')
+# The rendered figures are kept apart from the sources so they can be copied into the thesis in
+# one go.
+GRAPH_DIR = os.path.join(PAPER_DIR, 'graphs')
 
 METHODS = {
     'unicast_only': 'Only unicast',
@@ -89,18 +95,24 @@ def seeded(radius: int, paper_frames: bool, method: str) -> tuple[float, float, 
 
 
 def style(ax):
-    ax.grid(color=GRID, linewidth=0.6, zorder=0)
+    # pass
+    ax.grid(linewidth=0.6, zorder=0)
+    # ax.grid(color=GRID, linewidth=0.6, zorder=0)
     ax.set_axisbelow(True)
     for spine in ('top', 'right'):
         ax.spines[spine].set_visible(False)
-    for spine in ('left', 'bottom'):
-        ax.spines[spine].set_color(MUTED)
-    ax.tick_params(colors=MUTED, labelcolor='#52514e')
+    # for spine in ('left', 'bottom'):
+    #     ax.spines[spine].set_color(MUTED)
+    # ax.tick_params(colors=MUTED, labelcolor='#52514e')
 
 
 def save(fig, filename: str):
-    out_path = os.path.join(PAPER_DIR, filename)
-    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    os.makedirs(GRAPH_DIR, exist_ok=True)
+    out_path = os.path.join(GRAPH_DIR, filename)
+    # Trim the figure to its contents, the document the graphs end up in adds the white space
+    # around them (and the caption). 300 dpi so the scatter stays sharp in print, the figures
+    # are drawn near their printed size so this is the resolution that actually ends up there.
+    fig.savefig(out_path, dpi=300, bbox_inches='tight', pad_inches=0.02)
     plt.close(fig)
     print(f'Saved: {out_path}')
 
@@ -129,66 +141,93 @@ def analytical_update_time(distance: float, scenario: Scenario) -> float:
 
 # ── Figures 8 to 13: RSSI timelines ─────────────────────────────────────────
 
-def rssi_timeline(method: str, radius: int, filename: str):
+# The four panels of a run go in a 2x2 grid, so a timeline is printed at about half of the
+# 6.2 inch text width. Drawing it only slightly wider than that and enlarging the type keeps the
+# labels legible once the document scales the image down, which a full width figure does not.
+TIMELINE_SIZE = (4.3, 2.7)
+# The document scales a panel to about 0.7 of this width, so these land near 7 pt on the page,
+# a little under the footnotesize of the captions.
+TIMELINE_RC = {
+    'font.size': 9.5,
+    'axes.labelsize': 9.5,
+    'xtick.labelsize': 8.5,
+    'ytick.labelsize': 8.5,
+}
+# Annotations inside the axes (slot labels, the sensitivity line) sit a step below that again.
+TIMELINE_LABEL_SIZE = 7.5
+
+
+def rssi_timeline(method: str, radius: int, downlink: bool, filename: str):
+    """
+        One direction of one run: the downlink (gateway to nodes, the firmware fragments) or the
+        uplink (nodes to gateway, the acknowledgements). The two directions are separate figures
+        so they can be placed independently; the title is left to the caption of the document.
+    """
     name = run_name(radius, paper_frames=True, method=method)
     frames = load(name, 'frames')
     nodes = load(name, 'nodes')
     broadcast = method != 'unicast_only'
+    df = frames[frames.source == 0] if downlink else frames[frames.source != 0]
 
-    fig, axes = plt.subplots(2, 1, figsize=(9, 6.5), sharex=True)
-    directions = [
-        (axes[0], frames[frames.source == 0], 'Frames from gateway to nodes (firmware fragments)'),
-        (axes[1], frames[frames.source != 0], 'Frames from nodes to gateway (acknowledgements)'),
-    ]
+    with plt.rc_context(TIMELINE_RC):
+        fig, ax = plt.subplots(figsize=TIMELINE_SIZE)
     label_y = -68
     total = nodes.end.max()
-    for (ax, df, title) in directions:
-        style(ax)
-        # The nodes are served one after the other, so time already separates them: shade
-        # every other node's slot and label it instead of colouring ten series. Narrow slots
-        # (nodes that missed only a few chunks) get a shorter label or none at all.
-        if broadcast:
-            end = nodes.pending_start.min()
-            ax.axvspan(nodes.binary_start.min() / 3600, end / 3600, color=SHADE, zorder=0, lw=0)
-            ax.text(
-                (nodes.binary_start.min() + end) / 7200, label_y, 'broadcast\nround',
-                ha='center', va='top', fontsize=7, color='#52514e',
-            )
-        for (i, node) in enumerate(nodes.itertuples()):
-            if i % 2 == (0 if broadcast else 1):
-                ax.axvspan(node.pending_start / 3600, node.end / 3600, color=SHADE, zorder=0, lw=0)
-            width = (node.end - node.pending_start) / total
-            if width > 0.06:
-                label = f'{node.node}\n{node.distance:.0f} m'
-            elif width > 0.02:
-                label = f'{node.node}'
-            else:
-                continue
-            ax.text(
-                (node.pending_start + node.end) / 7200, label_y, label,
-                ha='center', va='top', fontsize=7, color='#52514e',
-            )
-        ax.scatter(
-            df.time / 3600, df.rssi, s=3, color=BLUE_DARK, alpha=0.55, linewidths=0, zorder=3,
-        )
-        ax.axhline(-125, color=RED_DARK, linewidth=1.5, zorder=4)
+    style(ax)
+    # The nodes are served one after the other, so time already separates them: shade every
+    # other node's slot and label it instead of colouring ten series. Narrow slots (nodes that
+    # missed only a few chunks) get a shorter label or none at all.
+    if broadcast:
+        # The broadcast round keeps the white background: it is the largest region of the plot,
+        # and shading it would run into the band of the first node, which starts white too.
+        end = nodes.pending_start.min()
         ax.text(
-            0.995, -125 + 1.5, 'sensitivity -125 dBm', ha='right', va='bottom', fontsize=8,
-            color=RED_DARK, transform=ax.get_yaxis_transform(), zorder=5,
-            bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.5),
+            (nodes.binary_start.min() + end) / 7200, label_y, 'broadcast\nround',
+            ha='center', va='top', fontsize=TIMELINE_LABEL_SIZE, color='#52514e',
         )
-        ax.set_title(title, fontsize=10, loc='left')
-        ax.set_ylabel('RSSI (dBm)')
-        low = frames.rssi.min() if len(df) else -160
-        ax.set_ylim(min(-160, math.floor(low / 10) * 10), -65)
-    axes[1].set_xlabel('Simulation time (h)')
-    axes[1].set_xlim(0, nodes.end.max() / 3600)
-    fig.suptitle(
-        f'{METHODS[method]} update of 10 nodes within {radius} m '
-        '(node number and distance per slot)',
-        fontsize=11, x=0.02, ha='left',
+    for (i, node) in enumerate(nodes.itertuples()):
+        # The slots alternate starting from white, except after a broadcast round: that region
+        # is white itself, so there the first node is shaded to set it apart from it.
+        if i % 2 == (0 if broadcast else 1):
+            ax.axvspan(node.pending_start / 3600, node.end / 3600, color=SHADE, zorder=0, lw=0)
+        width = (node.end - node.pending_start) / total
+        # A distance only fits in a slot wider than an eighth of the timeline, anything narrower
+        # gets the bare node number so the labels of adjacent slots cannot collide. The slots
+        # that clear the threshold are the wide ones, which are exactly the distant nodes.
+        if width > 0.125:
+            label = f'{node.node}\n{node.distance:.0f} m'
+        elif width > 0.02:
+            label = f'{node.node}'
+        else:
+            continue
+        # A label centred on the first or last slot would hang over the edge of the axes, so
+        # those two are anchored against the side of their own slot instead.
+        centre = (node.pending_start + node.end) / 2
+        if centre / total < 0.08:
+            (x, align) = (node.pending_start, 'left')
+        elif centre / total > 0.92:
+            (x, align) = (node.end, 'right')
+        else:
+            (x, align) = (centre, 'center')
+        ax.text(
+            x / 3600, label_y, label, ha=align, va='top', fontsize=TIMELINE_LABEL_SIZE,
+            color='#52514e',
+        )
+    ax.scatter(
+        df.time / 3600, df.rssi, s=3, color=BLUE_DARK, alpha=0.55, linewidths=0, zorder=3,
     )
-    fig.tight_layout()
+    ax.axhline(-125, color=RED_DARK, linewidth=1.5, zorder=4)
+    ax.text(
+        0.995, -125 + 1.5, 'sensitivity -125 dBm', ha='right', va='bottom', fontsize=TIMELINE_LABEL_SIZE,
+        color=RED_DARK, transform=ax.get_yaxis_transform(), zorder=5,
+        bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.5),
+    )
+    ax.set_ylabel('RSSI (dBm)')
+    low = frames.rssi.min() if len(df) else -160
+    ax.set_ylim(min(-160, math.floor(low / 10) * 10), -65)
+    ax.set_xlabel('Simulation time (h)')
+    ax.set_xlim(0, nodes.end.max() / 3600)
+    fig.tight_layout(pad=0.2)
     save(fig, filename)
 
 
@@ -332,12 +371,14 @@ def seed_spread(filename: str):
 
 
 if __name__ == '__main__':
-    rssi_timeline('unicast_only', 400, 'unicast_rssi_400m.png')
-    rssi_timeline('unicast_only', 2000, 'unicast_rssi_2km.png')
-    rssi_timeline('broadcast_unicast', 400, 'broadcast_unicast_rssi_400m.png')
-    rssi_timeline('broadcast_unicast', 2000, 'broadcast_unicast_rssi_2km.png')
-    rssi_timeline('broadcast_only', 400, 'broadcast_only_rssi_400m.png')
-    rssi_timeline('broadcast_only', 2000, 'broadcast_only_rssi_2km.png')
+    for (method, prefix) in [
+        ('unicast_only', 'unicast'),
+        ('broadcast_unicast', 'broadcast_unicast'),
+        ('broadcast_only', 'broadcast_only'),
+    ]:
+        for (radius, label) in [(400, '400m'), (2000, '2km')]:
+            rssi_timeline(method, radius, True, f'{prefix}_rssi_{label}_downlink.png')
+            rssi_timeline(method, radius, False, f'{prefix}_rssi_{label}_uplink.png')
     per_node_vs_distance('unicast_per_node_vs_distance.png')
     paper_comparison('methods_paper_comparison.png')
     seed_spread('methods_seed_spread_2km.png')

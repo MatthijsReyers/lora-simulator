@@ -22,7 +22,7 @@ shared frame definitions, scenario and base classes.
 | `broadcast_only/` | Section 3.3: as above, but the missing chunks are broadcast too and the node is asked for its bitmap until nothing is missing. |
 | `main.py` | Runs one update of a whole project with one method and writes CSV results. |
 | `run.sh` | The simulation batteries of section 5 for one method (`METHOD=...`). |
-| `graphs.py` | Renders the figures from the 10 node runs: RSSI timelines (Figures 8-13), per node time and loss against the analytical model, totals of the three methods next to the paper, spread over seeds. |
+| `graphs.py` | Renders the figures from the 10 node runs into `graphs/`: RSSI timelines (Figures 8-13, one image per direction), per node time and loss against the analytical model, totals of the three methods next to the paper, spread over seeds. |
 
 ## Running
 
