@@ -162,9 +162,8 @@ async def _device_loop(
     ``send_uplink`` blocks for the whole RX1/RX2 pair: a relative delay lets the three
     devices drift into each other and collide at the gateway.
 
-    Mode switching and transmitting happen in this one task, so the device never tries to
-    receive continuously and transmit at the same time. After leaving Class C it waits out
-    the continuous-RX loop's one-second poll and skips a slot before transmitting again.
+    Mode switching and transmitting happen in this one task, so the mode the device is in
+    always matches what the schedule says it should be.
 
     The loop stops a few seconds before the simulation ends (*stop_after*): an uplink needs
     its RX1 and RX2 windows afterwards, and a radio that is still switching state when the
@@ -186,19 +185,6 @@ async def _device_loop(
             wanted = OperatingMode.CLASS_C if in_session else OperatingMode.CLASS_A
             if device.operating_mode != wanted:
                 await device.switch_mode(wanted)
-                if wanted == OperatingMode.CLASS_A:
-                    # Let the Class C receive loop notice the stop flag and let go of the
-                    # radio; transmitting resumes on the next slot.
-                    await sim.sleep(1.2)
-                    # Leaving Class C does not power the receiver down, so the radio would
-                    # keep queueing frames meant for other devices and the next RX1 window
-                    # would hand one of those to _process_downlink and close before this
-                    # device's own reply ever lands. Empty the queue and switch off, which
-                    # is what a Class A device does between windows anyway.
-                    while await device.radio.receive_data_nowait() is not None:
-                        pass
-                    await device.radio.off()
-                    continue
             if not in_session:
                 payload = app.pop_pending_uplink()
                 await device.send_uplink(FRAGMENTATION_FPORT, payload or b"")

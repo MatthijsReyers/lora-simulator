@@ -24,6 +24,17 @@ class Queue(Generic[T]):
         return len(self.__data)
 
 
+    def clear(self) -> int:
+        """
+            Discards every item currently in the queue without waking any waiting getter.
+
+            :returns: How many items were discarded.
+        """
+        count = len(self.__data)
+        self.__data.clear()
+        return count
+
+
     async def put(self, item: T):
         """
             Put an item into the queue, note that this will advance the simulation by one tick.

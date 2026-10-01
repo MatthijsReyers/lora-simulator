@@ -154,6 +154,16 @@ class LoRaWanDevice:
         Reference: LoRaWAN L2 1.0.4 Specification chapter 3 & 4.
     """
 
+    #: Longest the Class C receive loop waits for a frame before looking at its stop flag
+    #: again. Reception is *not* gated by this interval: the receiver stays in continuous RX
+    #: and the radio queues whatever it demodulates, so a frame that arrives while the loop is
+    #: between two iterations is still picked up on the next one.
+    CLASS_C_POLL_INTERVAL = 1.0
+
+    #: How long the Class C loop stays off the air after finding the radio transmitting. Only
+    #: reached when something other than :meth:`send_uplink` drives the transmitter.
+    CLASS_C_TX_BACKOFF = 0.01
+
     def __init__(
         self,
         session: DeviceSession | None = None,
@@ -189,6 +199,10 @@ class LoRaWanDevice:
         self._session_cancels: dict[int, asyncio.Event] = {}  # group_addr -> cancel flag
         self._class_c_running = False
         self._class_c_stop = asyncio.Event()
+        # Non-zero while something else (an uplink and its RX1 window) owns the radio; the
+        # continuous receive loop idles until it drops back to zero.
+        self._class_c_suspends = 0
+        self._class_c_waiters: list[asyncio.Event] = []
         # Class B state
         self._class_b_running = False
         self._class_b_stop = asyncio.Event()
@@ -297,6 +311,9 @@ class LoRaWanDevice:
 
         Handles starting/stopping the background tasks associated with
         Class B (beacon + ping slots) and Class C (continuous RX).
+
+        Leaving Class C also powers the receiver down and drops whatever it had queued, see
+        :meth:`_leave_class_c`.
         """
         old_mode = self.operating_mode
         self.operating_mode = mode
@@ -310,7 +327,7 @@ class LoRaWanDevice:
         if old_mode == OperatingMode.CLASS_B and mode != OperatingMode.CLASS_B:
             self._stop_class_b()
         if old_mode == OperatingMode.CLASS_C and mode != OperatingMode.CLASS_C:
-            self._stop_class_c_rx()
+            await self._leave_class_c()
 
         # Start new-mode background tasks
         if mode == OperatingMode.CLASS_B and old_mode != OperatingMode.CLASS_B:
@@ -474,12 +491,20 @@ class LoRaWanDevice:
             f"FPort={fport}  {len(raw)} bytes"
         )
 
-        # Transmit
-        await self.radio.transmit_data_blocking(raw)
-        self.session.fcnt_up += 1
+        # A Class C device may transmit at any moment, but its continuous receiver cannot keep
+        # listening while it does — so hand the radio over for the transmission and the RX1
+        # window that follows it, and give it back afterwards (L2 1.0.4 §19.3: a Class C
+        # device returns to continuous RX2 reception as soon as RX1 closes).
+        self._suspend_class_c_rx()
+        try:
+            # Transmit
+            await self.radio.transmit_data_blocking(raw)
+            self.session.fcnt_up += 1
 
-        # Handle receive windows based on operating mode
-        return await self._handle_rx_windows()
+            # Handle receive windows based on operating mode
+            return await self._handle_rx_windows()
+        finally:
+            await self._resume_class_c_rx()
 
     async def _handle_rx_windows(self) -> bool:
         """
@@ -504,35 +529,78 @@ class LoRaWanDevice:
             leaving it on is what used to make these devices draw continuous RX power for the
             whole simulation.
 
+            Frames that were already sitting in the radio's receive queue when the window
+            opened are discarded: they were picked up while the device was listening for
+            something else (continuous Class C reception, say) and are not what this window is
+            waiting for. Handing one of them back would close the window on a frame the caller
+            never asked for.
+
             :param open_at: Simulation timestamp at which the radio should be listening.
             :param duration: In seconds, how long to keep the window open.
             :returns: The received packet, or None when the window closed empty.
         """
         # Wake up the radio slightly before the window opens, to account for startup time and
         # clock drift.
-        wake_at = open_at - RX_WINDOW_GUARD - self.radio.power_profile.standby_startup_time()
+        wake_at = open_at - self._rx_wakeup_guard()
         if wake_at > sim.current_time():
             await sim.sleep_until(wake_at)
-        await self.radio.standby()
+        # A Class C device is already listening; dropping it into standby first would blind it
+        # for the radio's whole startup time.
+        if self.radio.get_state() != RadioState.RX:
+            await self.radio.standby()
+
+        opened_at = sim.current_time()
+        deadline = opened_at + duration + RX_WINDOW_GUARD
 
         try:
-            try:
-                result = await self.radio.receive_data_within(duration + RX_WINDOW_GUARD)
-            except TimeoutError:
-                # The window only bounds how long the device waits for a preamble to show up.
-                # Once it has locked onto one it keeps the receiver on until the frame is over,
-                # so a downlink that starts just before the window closes still gets received.
-                if not self.radio.carrier_sense_instant():
-                    return None
-                await self.radio.wait_for_channel_idle()
-                result = await self.radio.receive_data_nowait()
-                if result is None:
-                    return None
-            assert isinstance(result, LoraPacket)
-            return result
+            while True:
+                remaining = deadline - sim.current_time()
+                try:
+                    if remaining <= 0:
+                        raise TimeoutError
+                    result = await self.radio.receive_data_within(remaining, metadata=True)
+                except TimeoutError:
+                    # The window only bounds how long the device waits for a preamble to show
+                    # up. Once it has locked onto one it keeps the receiver on until the frame
+                    # is over, so a downlink that starts just before the window closes still
+                    # gets received.
+                    if not self.radio.carrier_sense_instant():
+                        return None
+                    await self.radio.wait_for_channel_idle()
+                    pending = await self.radio.receive_data_nowait(metadata=True)
+                    if pending is None:
+                        return None
+                    result = pending
+                assert isinstance(result, tuple)
+                (packet, meta) = result
+                if meta.arrival_time is not None and meta.arrival_time < opened_at:
+                    # Stale: queued before this window opened. Keep waiting for a frame that
+                    # belongs to the window itself.
+                    continue
+                return packet
         finally:
-            if self.radio.get_state() != RadioState.TX:
-                await self.radio.off()
+            await self._rest_radio()
+
+    def _rx_wakeup_guard(self) -> float:
+        """How early the receiver has to be woken for it to be listening on time."""
+        return RX_WINDOW_GUARD + self.radio.power_profile.standby_startup_time()
+
+    async def _rest_radio(self) -> None:
+        """Put the radio back into the state the device rests in between receive windows.
+
+        Class A and Class B devices power the receiver down; a Class C device goes back to
+        continuous reception, which is where LoRaWAN L2 1.0.4 §19.3 leaves it outside its RX1
+        windows. Getting this wrong in either direction is expensive: a Class A device that
+        keeps listening both burns RX power for the whole simulation and queues frames meant
+        for other devices, while a Class C device that powers down misses the multicast
+        traffic its session was opened for.
+        """
+        if self.radio.get_state() == RadioState.TX:
+            return
+        if self.operating_mode == OperatingMode.CLASS_C and not self._class_c_stop.is_set():
+            await self.radio.receive(continuous=True)
+        else:
+            await self.radio.off()
 
     async def _class_a_rx_windows(self) -> bool:
         """
@@ -547,8 +615,9 @@ class LoRaWanDevice:
         assert tx_end is not None, "Receive windows opened without a preceding transmission"
 
         # The transmitter drops into standby when the uplink finishes, from where the radio can
-        # go all the way back to sleep until RX1 opens.
-        await self.radio.off()
+        # go all the way back to sleep until RX1 opens. A device that switched to Class C while
+        # this uplink was in the air keeps listening instead.
+        await self._rest_radio()
 
         # TS005 §2.7: a running multicast session must not disturb the Class A windows, those
         # keep listening with the unicast parameters.
@@ -619,20 +688,103 @@ class LoRaWanDevice:
         self._class_c_stop.set()
         self._class_c_running = False
 
+    async def _leave_class_c(self) -> None:
+        """Stop continuous reception, power the receiver down and drop what it collected.
+
+        A radio left in RX after the device has gone back to Class A keeps demodulating and
+        queueing frames addressed to other devices, and the device's next RX window would then
+        pop one of those stale frames and close before its own reply ever arrived. So the
+        receiver is switched off — which is where a Class A device rests anyway — and the queue
+        is emptied.
+        """
+        self._stop_class_c_rx()
+        await self._wake_class_c_loop()
+        self.radio.flush_rx_queue()
+        if self.radio.get_state() != RadioState.TX:
+            await self.radio.off()
+
+    def _suspend_class_c_rx(self) -> None:
+        """Hand the radio to an uplink's transmission and RX1 window.
+
+        Suspensions nest; the continuous receiver comes back only once every one of them has
+        been matched by a :meth:`_resume_class_c_rx`.
+        """
+        self._class_c_suspends += 1
+
+    async def _resume_class_c_rx(self) -> None:
+        """Give the radio back to the Class C receive loop."""
+        assert self._class_c_suspends > 0, "Unbalanced Class C receiver suspend"
+        self._class_c_suspends -= 1
+        if self._class_c_suspends == 0:
+            await self._wake_class_c_loop()
+
+    async def _wake_class_c_loop(self) -> None:
+        """Wake the Class C receive loop out of its idle wait on the next tick.
+
+        The wake-up goes through the environment rather than setting the event directly: the
+        environment is what re-takes the timer lock for a woken task, and a task woken behind
+        its back would let simulation time run away underneath it.
+        """
+        waiters, self._class_c_waiters = self._class_c_waiters, []
+        if not sim.is_running():
+            return
+        for event in waiters:
+            await sim.schedule_event_no_await(event, sim.next_tick())
+
+    async def _wait_for_class_c_wake(self) -> None:
+        """Idle until the radio is handed back, or until the simulation ends."""
+        event = asyncio.Event()
+        self._class_c_waiters.append(event)
+        await sim.schedule_event_wait(event, sim.last_tick())
+        if event in self._class_c_waiters:
+            self._class_c_waiters.remove(event)
+
     async def _class_c_rx_loop(self) -> None:
         """Background task: continuously listen for downlinks (Class C).
 
-        Runs until the simulation ends or the device switches away from Class C.
-        Processes any received downlink immediately (both unicast and multicast).
+        Runs until the simulation ends or the device switches away from Class C. Processes any
+        received downlink immediately (both unicast and multicast).
+
+        The receiver stays in continuous RX for the whole time the loop runs, so reception does
+        not depend on where the loop happens to be: the radio queues every frame it demodulates
+        and the loop takes it from there. ``CLASS_C_POLL_INTERVAL`` therefore only bounds how
+        quickly the loop notices that it should stop, never which frames it sees.
+
+        The one thing that does take the radio away is this device transmitting. ``send_uplink``
+        announces that with :meth:`_suspend_class_c_rx`, and the loop idles — rather than
+        tripping over a radio that refuses to receive while it transmits — until the uplink and
+        its RX1 window are done.
         """
-        await self.radio.receive(continuous=True)
-        while sim.is_running() and not self._class_c_stop.is_set():
-            try:
-                result = await self.radio.receive_data_within(1.0)
+        try:
+            while sim.is_running() and not self._class_c_stop.is_set():
+                if self._class_c_suspends > 0:
+                    await self._wait_for_class_c_wake()
+                    continue
+
+                if self.radio.get_state() != RadioState.RX:
+                    await self.radio.receive(continuous=True)
+
+                try:
+                    result = await self.radio.receive_data_within(
+                        self.CLASS_C_POLL_INTERVAL
+                    )
+                except TimeoutError:
+                    continue
+                except RuntimeError:
+                    # Something other than send_uplink put the radio into TX. Stay off it
+                    # until the transmission is over instead of spinning on the error.
+                    await sim.sleep(self.CLASS_C_TX_BACKOFF)
+                    continue
+
                 assert isinstance(result, LoraPacket)
+                if self._class_c_stop.is_set() or self._class_c_suspends > 0:
+                    # The radio changed hands while this frame was being demodulated, so it
+                    # is no longer this loop's to process.
+                    continue
                 await self._process_downlink(result.payload)
-            except TimeoutError:
-                pass
+        except SimulatorException:
+            # The simulation ended while the loop was waiting for a frame.
+            return
 
     async def _process_downlink(self, raw: bytes) -> None:
         """Decode and process a received downlink frame (unicast or multicast)."""
@@ -970,8 +1122,13 @@ class LoRaWanDevice:
         """Background task driving one multicast session from start to timeout."""
         previous_mode = self.operating_mode
         previous_rx: tuple[int | None, int | None] = (self.rx_data_rate, self.rx_frequency)
+        # Switch a receiver start-up time early, so the radio is actually listening *at*
+        # SessionTime rather than a fraction of a millisecond after it. A multicast frame
+        # scheduled for the very start of the session would otherwise begin while the radio
+        # was still coming out of sleep, and the device would never hear its preamble.
+        arm_at = session.start_time - self._rx_wakeup_guard()
         try:
-            if await self._sleep_until_or_cancel(session.start_time, cancel):
+            if await self._sleep_until_or_cancel(arm_at, cancel):
                 session.running = False
                 self._forget_session(session)
                 return

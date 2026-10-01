@@ -326,6 +326,24 @@ class LoraRadio(ABC):
                 self.__idle_waiters.remove(event)
 
 
+    def flush_rx_queue(self) -> int:
+        """
+            Throws away every packet that is waiting in the radio's receive queue.
+
+            A radio that was left in receive mode keeps demodulating and queueing frames that
+            the upper layer never asked for, for instance downlinks addressed to other devices
+            picked up while a Class C device was listening continuously. Those frames are stale
+            the moment the upper layer stops listening, so it can discard them here rather than
+            have the next receive window hand one of them back.
+
+            :returns: How many queued packets were discarded.
+        """
+        count = self.__rx_queue.clear()
+        if count:
+            self.logger.debug(f"radio={self._radio_id} flush_rx_queue() dropped {count}")
+        return count
+
+
     async def receive_data_nowait(
             self, metadata: bool = False
         ) -> Optional[LoraPacket | Tuple[LoraPacket, PacketMetadata]]:
@@ -650,6 +668,7 @@ class LoraRadio(ABC):
             if metadata.received_successfully() and not delivered:
                 self.logger.debug(f"putting packet into rx queue: {metadata.packet}")
                 delivered = True
+                metadata.arrival_time = sim.current_time()
                 await self.__rx_queue.put((metadata.packet, metadata))
 
                 # Turn off the radio if it was not in continuous receive mode

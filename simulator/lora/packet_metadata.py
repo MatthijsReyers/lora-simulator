@@ -13,6 +13,12 @@ class PacketMetadata:
     interrupted: None|bool
     received_preamble: None|bool
 
+    # Simulation time at which the radio handed the finished packet to its receive queue, or
+    # None while the packet is still in transit (or was never delivered). Upper layers use it
+    # to tell a frame that landed inside a receive window from one that was already sitting in
+    # the queue when the window opened.
+    arrival_time: float|None
+
     def __init__(
         self, 
         packet: LoraPacket, 
@@ -29,6 +35,7 @@ class PacketMetadata:
         self.missed_end = None
         self.interrupted = None
         self.received_preamble = None
+        self.arrival_time = None
 
     def __repr__(self):
         status: List[str] = []

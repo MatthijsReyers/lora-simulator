@@ -268,7 +268,7 @@ class TestClassCSessionEndToEnd:
 
         # One frame inside the session window, one well after it closed.
         ns.schedule_multicast_downlink(
-            MC_ADDR, fport=DATA_FPORT, payload=IN_SESSION_PAYLOAD, at_time=15.3,
+            MC_ADDR, fport=DATA_FPORT, payload=IN_SESSION_PAYLOAD, at_time=15.0,
         )
         ns.schedule_multicast_downlink(
             MC_ADDR, fport=DATA_FPORT, payload=OUT_OF_SESSION_PAYLOAD, at_time=20.0,
@@ -371,7 +371,7 @@ class TestClassCSessionEndToEnd:
             )
 
         ns.schedule_multicast_downlink(
-            MC_ADDR, fport=DATA_FPORT, payload=IN_SESSION_PAYLOAD, at_time=15.3,
+            MC_ADDR, fport=DATA_FPORT, payload=IN_SESSION_PAYLOAD, at_time=15.0,
         )
 
         sim.create_task(orchestrator())

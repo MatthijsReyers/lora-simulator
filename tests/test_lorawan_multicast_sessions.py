@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 
 from simulator.environment import simulation_env as sim
+from simulator.lora.enums.radio_state import RadioState
 from simulator.lorawan.application import Application
 from simulator.lorawan.beacon import compute_ping_slot_times
 from simulator.lorawan.device import (
@@ -676,6 +677,174 @@ class TestGatewayMulticast:
         assert gateway.multicast_frames_sent == 3
         times = [t for (t, _, _, _) in gateway.multicast_log]
         assert times[-1] - times[0] < 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Class C: continuous reception, uplinks during a session, and leaving the mode
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestClassCContinuousReception:
+    """The Class C receiver must have no holes in it (L2 1.0.4 §19.3)."""
+
+    def test_no_frame_is_lost_on_a_one_second_grid(self):
+        """Frames on whole seconds, starting exactly at ``SessionTime``, all arrive.
+
+        The receive loop waits for frames in bounded steps, so a frame landing on one of
+        those step boundaries used to be the one that got dropped. A one-second grid aligned
+        with the session start hits every boundary there is.
+        """
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+        gateway = LoRaWanGateway(network_server=ns)
+
+        device = _new_device()
+        app = RecordingApp()
+        device.register_application(app)
+        device.join_multicast_group(MulticastGroup(MC_ADDR, MC_NWK_KEY, MC_APP_KEY))
+
+        session_time = 10.0
+        payloads = [bytes([index]) for index in range(10)]
+        for index, payload in enumerate(payloads):
+            ns.schedule_multicast_downlink(
+                MC_ADDR, fport=FPORT, payload=payload, at_time=session_time + index,
+            )
+
+        async def driver() -> None:
+            await device.start_class_c_session(
+                MC_ADDR, start_time=session_time, timeout_seconds=16.0, data_rate=5,
+            )
+
+        sim.create_task(driver())
+        sim.run(simulation_length=28)
+
+        assert gateway.multicast_frames_sent == len(payloads)
+        assert app.downlinks == payloads
+
+    def test_class_c_device_sends_uplinks_while_multicast_is_running(self):
+        """A Class C device transmits whenever it likes, without losing the receiver.
+
+        Its continuous receive loop steps aside for the uplink and the RX1 window that
+        follows it, so the transmission neither fails nor takes the loop down with it, and
+        every multicast frame sent outside those moments still arrives.
+        """
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+        server_app = RecordingApp()
+        ns.register_application(server_app)
+        gateway = LoRaWanGateway(network_server=ns)
+
+        device = _new_device()
+        app = RecordingApp()
+        device.register_application(app)
+        device.join_multicast_group(MulticastGroup(MC_ADDR, MC_NWK_KEY, MC_APP_KEY))
+
+        uplink_times = [3.0, 7.0, 11.0]
+        replies = [b"\xA0", b"\xA1", b"\xA2"]
+        for reply in replies:
+            ns.queue_downlink(DEV_ADDR, fport=FPORT, payload=reply)
+
+        # Scheduled between the uplinks and their RX1 windows (uplink + 1s), so the device
+        # is in plain continuous reception when each of them goes out.
+        multicast_times = [5.0, 9.0, 13.0]
+        multicast = [b"\xB0", b"\xB1", b"\xB2"]
+        for at_time, payload in zip(multicast_times, multicast):
+            ns.schedule_multicast_downlink(
+                MC_ADDR, fport=FPORT, payload=payload, at_time=at_time,
+            )
+
+        async def driver() -> None:
+            await device.switch_mode(OperatingMode.CLASS_C)
+            for at_time in uplink_times:
+                await sim.sleep_until(at_time)
+                await device.send_uplink(fport=FPORT, payload=b"\x5A")
+
+        sim.create_task(driver())
+        sim.run(simulation_length=20)
+
+        # Every uplink reached the network server...
+        assert [payload for (_, payload) in server_app.uplinks] == [b"\x5A"] * 3
+        assert gateway.frames_forwarded == 3
+        # ...the device stayed in Class C and kept its session counter moving...
+        assert device.operating_mode is OperatingMode.CLASS_C
+        assert device.session is not None and device.session.fcnt_up == 3
+        # ...and both the RX1 replies and the multicast frames landed.
+        assert gateway.multicast_frames_sent == 3
+        assert sorted(app.downlinks) == sorted(replies + multicast)
+
+
+class TestLeavingClassC:
+    """Switching away from Class C has to hand the radio back in a usable state."""
+
+    def test_receiver_is_powered_down_and_queue_dropped(self):
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+        gateway = LoRaWanGateway(network_server=ns)
+
+        device = _new_device()
+        app = RecordingApp()
+        device.register_application(app)
+        device.join_multicast_group(MulticastGroup(MC_ADDR, MC_NWK_KEY, MC_APP_KEY))
+
+        ns.queue_downlink(DEV_ADDR, fport=FPORT, payload=b"\xAA\xBB")
+        # One frame while the device listens, one after it has gone back to Class A.
+        ns.schedule_multicast_downlink(MC_ADDR, fport=FPORT, payload=b"\x11", at_time=2.0)
+        ns.schedule_multicast_downlink(MC_ADDR, fport=FPORT, payload=b"\x22", at_time=6.0)
+
+        states: list[RadioState] = []
+
+        async def driver() -> None:
+            await sim.sleep(1.0)
+            await device.switch_mode(OperatingMode.CLASS_C)
+            await sim.sleep(4.0)
+            await device.switch_mode(OperatingMode.CLASS_A)
+            # Leaving Class C powers the receiver down there and then, rather than leaving
+            # it collecting frames nobody is going to read.
+            states.append(device.radio.get_state())
+            assert len(device.radio.rx_chains) == 1
+            # The uplink's RX1 window must hand back this device's own reply, not something
+            # the receiver happened to pick up while it was still in Class C.
+            await sim.sleep(3.0)
+            await device.send_uplink(fport=FPORT, payload=b"\x00")
+
+        sim.create_task(driver())
+        sim.run(simulation_length=16)
+
+        assert states == [RadioState.OFF]
+        assert gateway.multicast_frames_sent == 2
+        # The in-session frame and the RX1 reply, and nothing from after the switch.
+        assert app.downlinks == [b"\x11", b"\xAA\xBB"]
+
+    def test_stale_frames_do_not_close_a_later_rx_window(self):
+        """A frame queued before a window opened is discarded, not served from it."""
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+        LoRaWanGateway(network_server=ns)
+
+        device = _new_device()
+        app = RecordingApp()
+        device.register_application(app)
+        device.join_multicast_group(MulticastGroup(MC_ADDR, MC_NWK_KEY, MC_APP_KEY))
+        ns.queue_downlink(DEV_ADDR, fport=FPORT, payload=b"\xAA\xBB")
+
+        async def driver() -> None:
+            await sim.sleep(1.0)
+            # A frame the radio holds onto without anyone reading it.
+            await device.radio.receive(continuous=True)
+            ns.schedule_multicast_downlink(MC_ADDR, fport=FPORT, payload=b"\x33")
+            await sim.sleep(2.0)
+            assert len(device.radio.rx_chains) == 1
+            await device.send_uplink(fport=FPORT, payload=b"\x00")
+
+        sim.create_task(driver())
+        sim.run(simulation_length=12)
+
+        # The stale multicast frame never reaches the application: the RX1 window skips it
+        # and waits for the reply that belongs to the window.
+        assert app.downlinks == [b"\xAA\xBB"]
 
 
 class TestDutyCycleLimiter:
