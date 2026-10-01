@@ -324,12 +324,28 @@ class LoRaWanGateway:
     # ---- Class B: beacon broadcasting & ping slot downlinks ----
 
     async def _beacon_loop(self) -> None:
-        """Broadcast beacons every ``BEACON_INTERVAL`` and send Class B downlinks."""
+        """Broadcast beacons every ``BEACON_INTERVAL`` and send Class B downlinks.
+
+        The loop is always waiting for the next beacon or ping slot when the simulation
+        runs out, and ``sleep_until`` wakes it one last time at the final tick; swallow
+        that so a normal shutdown is not reported as a task failure (same contract as
+        ``_multicast_loop``).
+        """
+        try:
+            await self._beacon_scheduler()
+        except SimulatorException:
+            return
+
+    async def _beacon_scheduler(self) -> None:
         next_beacon = 0.0
 
         while sim.is_running():
             if next_beacon > sim.current_time():
                 await sim.sleep_until(next_beacon)
+                # The environment wakes every sleeper once more at the final tick; the
+                # radio is already torn down by then, so there is nothing left to send.
+                if not sim.is_running():
+                    return
 
             beacon_time = int(next_beacon)
             beacon_data = encode_beacon(beacon_time)
@@ -365,6 +381,8 @@ class LoRaWanGateway:
                 continue
 
             await sim.sleep_until(slot_time)
+            if not sim.is_running():
+                return
 
             logger.debug(
                 f"{sim.current_time():.2f}s  GW  ping slot TX for "

@@ -1072,6 +1072,19 @@ class LoRaWanDevice:
     async def _class_b_beacon_loop(self) -> None:
         """Background task: listen for beacons and open ping slots (Class B).
 
+        Wraps :meth:`_class_b_beacon_scheduler`, which is always waiting for a beacon or a
+        ping slot when the simulation runs out. The environment wakes every sleeper one
+        last time at the final tick, so the end of the simulation surfaces as a
+        ``SimulatorException``; swallow it rather than letting it look like a failure.
+        """
+        try:
+            await self._class_b_beacon_scheduler()
+        except SimulatorException:
+            return
+
+    async def _class_b_beacon_scheduler(self) -> None:
+        """Beacon acquisition and ping slot loop, one iteration per beacon period.
+
         Each iteration covers one beacon period:
         1. Sleep until the expected beacon time (if known).
         2. Open RX to receive the beacon broadcast.
@@ -1095,6 +1108,9 @@ class LoRaWanDevice:
                 wake_at = expected - 1.0
                 if wake_at > sim.current_time():
                     await sim.sleep_until(wake_at)
+                    # Woken one last time at the final tick: the radio is already gone.
+                    if not sim.is_running():
+                        return
 
             try:
                 # A beacon window is a single shot window like any other: `receive(continuous=
@@ -1207,7 +1223,7 @@ class LoRaWanDevice:
         guard_time = beacon_time + BEACON_INTERVAL - BEACON_GUARD
 
         for slot_time, session in self.collect_ping_slots(beacon_time):
-            if self._class_b_stop.is_set():
+            if self._class_b_stop.is_set() or not sim.is_running():
                 break
             if slot_time >= guard_time:
                 break

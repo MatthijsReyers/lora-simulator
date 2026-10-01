@@ -326,17 +326,28 @@ class NetworkServer:
         An entry with no time of its own is due immediately and reports ``-inf``'s practical
         equivalent: the current simulation time.
         """
-        if not self._multicast_queue:
-            return None
-        head = self._multicast_queue[0]
-        return head.at_time if head.at_time is not None else sim.current_time()
+        for entry in self._multicast_queue:
+            group = self._multicast_groups.get(entry.group_addr)
+            if group is not None and group.class_b_enabled:
+                continue  # Handed to the Class B ping slot scheduler instead.
+            return entry.at_time if entry.at_time is not None else sim.current_time()
+        return None
 
     def pop_due_multicast_downlinks(self, now: float) -> list[ScheduledMulticastDownlink]:
-        """Remove and return every queued multicast downlink due at or before *now*."""
+        """Remove and return every queued multicast downlink due at or before *now*.
+
+        Frames of a group that runs a Class B multicast session are **not** returned: their
+        transmission time is a ping slot, so they belong to
+        ``get_class_b_downlink_schedule`` and are left in the queue for it. Without this the
+        gateway's free-running multicast scheduler would put them on the air immediately and
+        the devices, listening only in their slots, would never hear them.
+        """
         due: list[ScheduledMulticastDownlink] = []
         remaining: list[ScheduledMulticastDownlink] = []
         for entry in self._multicast_queue:
-            if entry.at_time is None or entry.at_time <= now:
+            group = self._multicast_groups.get(entry.group_addr)
+            class_b = group is not None and group.class_b_enabled
+            if not class_b and (entry.at_time is None or entry.at_time <= now):
                 due.append(entry)
             else:
                 remaining.append(entry)
