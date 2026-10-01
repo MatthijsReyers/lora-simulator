@@ -60,13 +60,32 @@ of tripping an ``assert``.
 from __future__ import annotations
 
 import logging
+import math
 import random as _random
+from collections import defaultdict, deque
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
-from simulator.lorawan.fuota.crypto import compute_data_block_mic
-from simulator.lorawan.fuota.fragmentation import MAX_NB_FRAG
+from simulator.environment import simulation_env as sim
+from simulator.exceptions import SimulatorException
+from simulator.lorawan.application import Application
+from simulator.lorawan.fuota.crypto import (
+    compute_data_block_mic,
+    derive_data_block_int_key,
+)
+from simulator.lorawan.fuota.device_app import FuotaDeviceApplication
+from simulator.lorawan.fuota.fragmentation import (
+    MAX_NB_FRAG,
+    FragmentationDecoder,
+    FragmentationEncoder,
+)
+from simulator.lorawan.network_server import NetworkServer, ScheduledMulticastDownlink
+from simulator.lorawan.region import max_frm_payload
+
+if TYPE_CHECKING:
+    from simulator.lorawan.device import LoRaWanDevice
 
 __all__ = [
     "DATA_FRAGMENT_HEADER_SIZE",
@@ -86,8 +105,13 @@ __all__ = [
     "FragSessionDeleteReq",
     "FragSessionSetupAns",
     "FragSessionSetupReq",
+    "FragSessionState",
     "FragSessionStatusAns",
     "FragSessionStatusReq",
+    "FragServerSession",
+    "FragStatusReport",
+    "FragmentationDeviceApplication",
+    "FragmentationServerApplication",
     "PackageVersionAns",
     "PackageVersionReq",
     "block_ack_delay_seconds",
@@ -1124,3 +1148,1140 @@ def encode_commands(commands: list[FragCommand]) -> bytes:
     for cmd in commands:
         buf.extend(cmd.encode())
     return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
+# Device-side application (TS004-2.0.0 §3, FPort 201)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FragSessionState:
+    """One of the (at most four) fragmentation sessions held by a device (§3.3).
+
+    Created by an accepted ``FragSessionSetupReq`` and destroyed by a
+    ``FragSessionDeleteReq`` or by a *successful* replacing setup. Holds the
+    session parameters as received, the FEC decoder, and the reception
+    bookkeeping that ``FragSessionStatusAns`` reports.
+
+    :ivar setup: The accepted ``FragSessionSetupReq`` verbatim — it carries
+        ``Padding``, ``Descriptor``, ``SessionCnt`` and the data block ``MIC``
+        that are needed once the block is complete.
+    :ivar frames_received: ``NbFragReceived``: every ``DataFragment`` fed to the
+        decoder for this session, **including coded, uncoded and repeated**
+        ones (§3.2).
+    :ivar session_cnt_committed: Whether ``SessionCntPrev[FragIndex]`` has been
+        written yet. §3.3 commits it on the *first* ``DataFragment``, not at
+        setup time.
+    :ivar data: The reconstructed, un-padded data block once complete.
+    :ivar mic_ok: Result of the ``DataBlockIntKey`` MIC check, or None when the
+        device holds no key and could not check.
+    :ivar memory_error: Defragmentation was aborted because more uncoded
+        fragments were lost than the device's ``Lmax`` allows (§A.4).
+    """
+
+    frag_index: int
+    setup: FragSessionSetupReq
+    decoder: FragmentationDecoder
+    frames_received: int = 0
+    session_cnt_committed: bool = False
+    completed: bool = False
+    data: bytes | None = None
+    mic_ok: bool | None = None
+    memory_error: bool = False
+    #: True while a ``FragDataBlockReceivedReq`` is waiting for its answer (§3.5).
+    ack_pending: bool = False
+    #: Number of ``FragDataBlockReceivedReq`` transmissions made so far.
+    ack_attempts: int = 0
+    ack_payload: bytes = b""
+
+    @property
+    def nb_frag(self) -> int:
+        """``NbFrag`` (``M``) of this session."""
+        return self.setup.nb_frag
+
+    @property
+    def frag_size(self) -> int:
+        """``FragSize`` of this session."""
+        return self.setup.frag_size
+
+    @property
+    def session_cnt(self) -> int:
+        """``SessionCnt`` of this session."""
+        return self.setup.session_cnt
+
+    @property
+    def descriptor(self) -> int:
+        """The vendor-specific 4-octet ``Descriptor`` (§3.3)."""
+        return self.setup.descriptor
+
+    @property
+    def block_ack_delay(self) -> int:
+        """``BlockAckDelay``, the 3-bit answer-spreading exponent (§3.3)."""
+        return self.setup.block_ack_delay
+
+    @property
+    def ack_reception(self) -> bool:
+        """``AckReception``: send ``FragDataBlockReceivedReq`` when done (§3.3)."""
+        return self.setup.ack_reception
+
+    @property
+    def mc_group_bit_mask(self) -> int:
+        """Multicast groups allowed to feed this session (§3.3)."""
+        return self.setup.mc_group_bit_mask
+
+    def progress(self) -> tuple[int, int]:
+        """``(independent fragments accepted, NbFrag)`` — decoding progress.
+
+        The first element is the rank of the parity matrix, not the raw frame
+        count: it is what actually has to reach ``NbFrag`` for the block to be
+        recoverable.
+        """
+        return (self.decoder.nb_received, self.nb_frag)
+
+    def missing_uncoded_count(self) -> int:
+        """``MissingFrag`` as reported in ``FragSessionStatusAns`` (§3.2).
+
+        Zero once the block is reassembled; otherwise the number of uncoded
+        fragments neither received directly nor reconstructed, saturated at
+        :data:`MAX_MISSING_FRAG`.
+        """
+        if self.completed:
+            return 0
+        return min(len(self.decoder.missing_uncoded()), MAX_MISSING_FRAG)
+
+
+class FragmentationDeviceApplication(FuotaDeviceApplication):
+    """Device side of the TS004-2.0.0 Fragmented Data Block Transport package.
+
+    Registers on :data:`FRAGMENTATION_FPORT` (201) and implements the end-device
+    half of §3: it accepts up to four fragmentation sessions, feeds incoming
+    ``DataFragment`` messages to a :class:`~simulator.lorawan.fuota.fragmentation.FragmentationDecoder`,
+    verifies the reassembled block against the ``DataBlockIntKey`` MIC from
+    ``FragSessionSetupReq``, and answers every command the server sends.
+
+    Uplink answers go through :meth:`~simulator.lorawan.fuota.device_app.FuotaDeviceApplication.queue_uplink`,
+    so with a :class:`~simulator.lorawan.device.LoRaWanDevice` attached they are
+    transmitted from a child task and without one they queue up for
+    :meth:`~simulator.lorawan.fuota.device_app.FuotaDeviceApplication.pop_pending_uplink`.
+
+    Implementation decisions where TS004 leaves room (all documented in the
+    module's test-suite as well):
+
+    - **Answer spreading.** §3.2 asks a device to spread ``FragSessionStatusAns``
+      over ``rand() * 2**(BlockAckDelay + 4)`` seconds because the request may
+      have been multicast. ``Application.on_downlink`` only receives the
+      plaintext, so the application layer cannot tell a multicast request from a
+      unicast one. The delay is therefore applied to **every**
+      ``FragSessionStatusAns``; on a unicast request it is harmless, only later.
+    - **McGroupBitMask.** For the same reason the device application cannot see
+      which address a ``DataFragment`` arrived on, so the §3.6 rule "drop a
+      multicast fragment whose group was not enabled in ``McGroupBitMask``"
+      cannot be enforced here. The mask is parsed, stored and exposed as
+      :attr:`FragSessionState.mc_group_bit_mask` for a caller that does know the
+      transport.
+    - **Wrong payload length.** A ``DataFragment`` whose payload is not exactly
+      ``FragSize`` octets is undefined in TS004; it is dropped silently and
+      counted in :attr:`fragments_dropped`.
+    - **Session does not exist + Participants.** A ``FragSessionStatusReq`` for
+      an unknown ``FragIndex`` is always answered with the 1-octet
+      "session does not exist" form, including when ``Participants = 0``: a
+      device with no session has certainly not received the block, so it belongs
+      to the "still missing fragments" set.
+
+    Reference: LoRaWAN Fragmented Data Block Transport TS004-2.0.0 §3.
+    """
+
+    def __init__(
+        self,
+        device: LoRaWanDevice | None = None,
+        *,
+        data_block_int_key: bytes | None = None,
+        gen_app_key: bytes | None = None,
+        lorawan_1_1: bool = False,
+        max_sessions: int = MAX_FRAG_SESSIONS,
+        max_nb_frag: int | None = None,
+        max_block_size: int | None = None,
+        lmax: int | None = None,
+        descriptor_filter: Callable[[int], bool] | None = None,
+        on_block_received: Callable[[int, bytes, int], None] | None = None,
+        ack_retry_interval: float | None = None,
+        max_ack_retries: int = 3,
+        rng: _random.Random | None = None,
+    ) -> None:
+        """
+        :param device: Device to send uplink answers through, or None to keep
+            them in the pending queue (how the codec-level tests drive it).
+        :param data_block_int_key: The device's ``DataBlockIntKey`` (§3.3). When
+            omitted it is derived from *gen_app_key*; with neither the device
+            cannot check the data block MIC and reports ``mic_ok = None``.
+        :param gen_app_key: ``GenAppKey`` (LoRaWAN 1.0.x) or ``AppKey``
+            (1.1+), from which ``DataBlockIntKey`` is derived.
+        :param lorawan_1_1: Selects the 1.1 derivation when *gen_app_key* is an
+            ``AppKey``. See
+            :func:`~simulator.lorawan.fuota.crypto.derive_data_block_int_key`.
+        :param max_sessions: Fragmentation sessions the device supports, 1..4.
+            A setup for a higher ``FragIndex`` is refused with
+            ``FragIndex unsupported``.
+        :param max_nb_frag: Largest ``NbFrag`` the device can defragment, or
+            None for no limit. Exceeding it is refused with ``Not enough
+            Memory``.
+        :param max_block_size: Largest ``NbFrag * FragSize`` the device can
+            store, or None for no limit. Also refused with ``Not enough
+            Memory``.
+        :param lmax: Maximum number of uncoded fragments that may be lost among
+            the first ``M`` before defragmentation is abandoned (§A.4). None
+            disables the check. Exceeding it aborts the session's decoding and
+            raises ``MemoryError`` in ``FragSessionStatusAns``.
+        :param descriptor_filter: Hook deciding whether a ``Descriptor`` is
+            acceptable. Returning False refuses the setup with ``Wrong
+            Descriptor``. The encoding of ``Descriptor`` is vendor-specific
+            (§3.3), so TS004 defines no criterion of its own.
+        :param on_block_received: Called as
+            ``(frag_index, data_block, descriptor)`` the moment a block is
+            reassembled, before the MIC result is consulted; inspect
+            :attr:`sessions` for ``mic_ok``.
+        :param ack_retry_interval: Seconds between ``FragDataBlockReceivedReq``
+            retransmissions. None (the default) draws a fresh
+            ``BlockAckDelay``-based delay each time, which is what §3.5
+            requires.
+        :param max_ack_retries: Retransmissions after the first
+            ``FragDataBlockReceivedReq``. TS004 leaves the count to the
+            application.
+        :param rng: Random source for the answer-spreading delays.
+        """
+        super().__init__(device, rng)
+
+        if not 1 <= max_sessions <= MAX_FRAG_SESSIONS:
+            raise ValueError(
+                f"max_sessions must be 1..{MAX_FRAG_SESSIONS}, got {max_sessions}"
+            )
+
+        if data_block_int_key is None and gen_app_key is not None:
+            data_block_int_key = derive_data_block_int_key(
+                key=gen_app_key, lorawan_1_1=lorawan_1_1
+            )
+        self.data_block_int_key: bytes | None = data_block_int_key
+
+        self.max_sessions = max_sessions
+        self.max_nb_frag = max_nb_frag
+        self.max_block_size = max_block_size
+        self.lmax = lmax
+        self.descriptor_filter = descriptor_filter
+        self.on_block_received = on_block_received
+        self.ack_retry_interval = ack_retry_interval
+        self.max_ack_retries = max_ack_retries
+
+        #: Active sessions by ``FragIndex``.
+        self.sessions: dict[int, FragSessionState] = {}
+        #: ``SessionCntPrev[FragIndex]``, the non-volatile anti-replay counter of
+        #: §3.3. -1 means "no session ever ran", so the first setup may use
+        #: ``SessionCnt = 0``.
+        self.last_session_cnt: dict[int, int] = {
+            i: -1 for i in range(MAX_FRAG_SESSIONS)
+        }
+        #: Reconstructed data blocks by ``FragIndex``; survives session deletion.
+        self.completed_blocks: dict[int, bytes] = {}
+
+        #: ``DataFragment`` messages fed to a decoder.
+        self.fragments_received = 0
+        #: ``DataFragment`` messages discarded: no session, session already
+        #: complete, or a payload that is not ``FragSize`` octets long.
+        self.fragments_dropped = 0
+        #: Every ``FragSessionSetupAns`` the device produced, newest last.
+        self.setup_answers: list[FragSessionSetupAns] = []
+
+    def port(self) -> int:
+        """FPort 201 (§2.1)."""
+        return FRAGMENTATION_FPORT
+
+    # -- public state ------------------------------------------------------
+
+    def is_complete(self, frag_index: int) -> bool:
+        """Whether the block of *frag_index* has been fully reassembled."""
+        session = self.sessions.get(frag_index)
+        if session is not None:
+            return session.completed
+        return frag_index in self.completed_blocks
+
+    def progress(self, frag_index: int) -> tuple[int, int]:
+        """``(independent fragments accepted, NbFrag)`` for a session.
+
+        ``(0, 0)`` when no such session exists.
+        """
+        session = self.sessions.get(frag_index)
+        return session.progress() if session is not None else (0, 0)
+
+    # -- downlink handling -------------------------------------------------
+
+    async def on_downlink(self, payload: bytes) -> None:
+        """Handle one FPort 201 downlink message (§3).
+
+        Several commands may be concatenated; a ``DataFragment`` is always the
+        only command in its message.
+        """
+        for command in parse_downlink_commands(payload):
+            match command:
+                case DataFragment():
+                    await self._handle_data_fragment(command)
+                case FragSessionSetupReq():
+                    await self._handle_setup(command)
+                case FragSessionStatusReq():
+                    await self._handle_status_request(command)
+                case FragSessionDeleteReq():
+                    await self._handle_delete(command)
+                case FragDataBlockReceivedAns():
+                    self._handle_block_received_ans(command)
+                case PackageVersionReq():
+                    await self.queue_uplink(
+                        encode_commands(
+                            [
+                                PackageVersionAns(
+                                    package_identifier=PACKAGE_IDENTIFIER,
+                                    package_version=PACKAGE_VERSION,
+                                )
+                            ]
+                        )
+                    )
+                case _:
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  TS004-DEV  ignoring "
+                        f"{type(command).__name__} on the device side"
+                    )
+
+    # -- FragSessionSetup (§3.3) -------------------------------------------
+
+    async def _handle_setup(self, req: FragSessionSetupReq) -> None:
+        answer = self._validate_setup(req)
+        self.setup_answers.append(answer)
+
+        if answer.accepted:
+            # §3.3: an accepted setup for a FragIndex that already has a session
+            # stops that session and clears its context. A refused one does not.
+            self.sessions[req.frag_index] = FragSessionState(
+                frag_index=req.frag_index,
+                setup=req,
+                decoder=FragmentationDecoder(req.nb_frag, req.frag_size),
+            )
+            logger.info(
+                f"{sim.current_time():.2f}s  TS004-DEV  session {req.frag_index} set up: "
+                f"NbFrag={req.nb_frag} FragSize={req.frag_size} "
+                f"Padding={req.padding} SessionCnt={req.session_cnt} "
+                f"Descriptor=0x{req.descriptor:08X} "
+                f"AckReception={int(req.ack_reception)} "
+                f"BlockAckDelay={req.block_ack_delay}"
+            )
+        else:
+            logger.warning(
+                f"{sim.current_time():.2f}s  TS004-DEV  session {req.frag_index} setup "
+                f"refused: StatusBitMask=0x{answer.encode_payload()[0]:02X}"
+            )
+
+        # Setup is unicast only (§3.3), so no answer spreading applies.
+        await self.queue_uplink(encode_commands([answer]))
+
+    def _validate_setup(self, req: FragSessionSetupReq) -> FragSessionSetupAns:
+        """Apply the §3.3 acceptance rules and build the ``StatusBitMask``."""
+        answer = FragSessionSetupAns(frag_index=req.frag_index)
+
+        if req.frag_algo != 0:
+            # 0 is the Annex A FEC code; 1..7 are RFU (§3.3, Table 11).
+            answer.frag_algo_unsupported = True
+
+        if req.frag_index >= self.max_sessions:
+            answer.frag_index_unsupported = True
+
+        if self.max_nb_frag is not None and req.nb_frag > self.max_nb_frag:
+            answer.not_enough_memory = True
+        if (
+            self.max_block_size is not None
+            and req.nb_frag * req.frag_size > self.max_block_size
+        ):
+            answer.not_enough_memory = True
+
+        if self.descriptor_filter is not None and not self.descriptor_filter(
+            req.descriptor
+        ):
+            answer.wrong_descriptor = True
+
+        if req.session_cnt <= self.last_session_cnt.get(req.frag_index, -1):
+            # §3.3: SessionCnt <= SessionCntPrev[FragIndex] is a replay.
+            answer.session_cnt_replay = True
+
+        return answer
+
+    # -- DataFragment (§3.6) -----------------------------------------------
+
+    async def _handle_data_fragment(self, fragment: DataFragment) -> None:
+        session = self.sessions.get(fragment.frag_index)
+
+        if session is None:
+            self.fragments_dropped += 1
+            logger.debug(
+                f"{sim.current_time():.2f}s  TS004-DEV  fragment N={fragment.index_n} "
+                f"for unknown session {fragment.frag_index}, dropped"
+            )
+            return
+
+        if session.completed or session.memory_error:
+            # §3.6: once the block is reconstructed the device SHALL drop any
+            # further message using that FragIndex until the session is deleted.
+            self.fragments_dropped += 1
+            return
+
+        if len(fragment.payload) != session.frag_size:
+            # Undefined in TS004; drop silently (see the class docstring).
+            self.fragments_dropped += 1
+            logger.warning(
+                f"{sim.current_time():.2f}s  TS004-DEV  fragment N={fragment.index_n} "
+                f"is {len(fragment.payload)} octets, expected {session.frag_size}; "
+                f"dropped"
+            )
+            return
+
+        if not session.session_cnt_committed:
+            # §3.3: SessionCntPrev is committed on the first DataFragment of the
+            # new session, not when the setup is accepted.
+            self.last_session_cnt[session.frag_index] = session.session_cnt
+            session.session_cnt_committed = True
+
+        self.fragments_received += 1
+        session.frames_received += 1
+        complete = session.decoder.receive(fragment.index_n, fragment.payload)
+
+        if not complete and self.lmax is not None:
+            lost = len(session.decoder.missing_uncoded())
+            if lost > self.lmax:
+                session.memory_error = True
+                logger.warning(
+                    f"{sim.current_time():.2f}s  TS004-DEV  session "
+                    f"{session.frag_index} aborted: {lost} uncoded fragments lost, "
+                    f"Lmax={self.lmax}"
+                )
+                return
+
+        if complete:
+            await self._complete_session(session)
+
+    async def _complete_session(self, session: FragSessionState) -> None:
+        """Reassemble, verify the MIC and raise the completion callbacks (§3.3)."""
+        data = session.decoder.reconstruct(session.setup.padding)
+        session.data = data
+        session.completed = True
+        self.completed_blocks[session.frag_index] = data
+
+        if self.data_block_int_key is not None:
+            session.mic_ok = session.setup.verify_mic(self.data_block_int_key, data)
+        else:
+            session.mic_ok = None
+
+        logger.info(
+            f"{sim.current_time():.2f}s  TS004-DEV  session {session.frag_index} "
+            f"complete: {len(data)} octets from {session.frames_received} fragment(s), "
+            f"MIC="
+            + ("unchecked" if session.mic_ok is None else ("ok" if session.mic_ok else "FAILED"))
+        )
+
+        if self.on_block_received is not None:
+            self.on_block_received(session.frag_index, data, session.descriptor)
+
+        if session.ack_reception:
+            await self._start_block_received(session)
+
+    # -- FragDataBlockReceived (§3.5) --------------------------------------
+
+    def _ack_delay(self, session: FragSessionState) -> float:
+        """Delay before (re)transmitting ``FragDataBlockReceivedReq`` (§3.5)."""
+        if self.ack_retry_interval is not None:
+            return self.ack_retry_interval
+        return block_ack_delay_seconds(session.block_ack_delay, self.rng)
+
+    async def _start_block_received(self, session: FragSessionState) -> None:
+        """Begin the ``FragDataBlockReceivedReq`` / Ans exchange (§3.5)."""
+        session.ack_payload = encode_commands(
+            [
+                FragDataBlockReceivedReq(
+                    frag_index=session.frag_index,
+                    mic_error=session.mic_ok is False,
+                )
+            ]
+        )
+        session.ack_pending = True
+
+        if self.device is not None and sim.is_running():
+            await sim.start_child_task(self._block_received_loop(session))
+            return
+
+        # No device attached: queue a single request for pop_pending_uplink().
+        await self.queue_uplink(session.ack_payload, delay=self._ack_delay(session))
+        session.ack_attempts = 1
+
+    async def _block_received_loop(self, session: FragSessionState) -> None:
+        """Send ``FragDataBlockReceivedReq`` until it is answered (§3.5).
+
+        The first delay and every retransmission interval follow the
+        ``BlockAckDelay`` rule unless :attr:`ack_retry_interval` overrides it.
+        TS004 leaves the retry count to the application: it is
+        :attr:`max_ack_retries` here.
+        """
+        try:
+            for attempt in range(self.max_ack_retries + 1):
+                delay = self._ack_delay(session)
+                if delay > 0:
+                    await sim.sleep(delay)
+                if not session.ack_pending:
+                    return
+                await self.queue_uplink(session.ack_payload)
+                session.ack_attempts = attempt + 1
+            logger.warning(
+                f"{sim.current_time():.2f}s  TS004-DEV  session {session.frag_index} "
+                f"FragDataBlockReceivedReq unanswered after "
+                f"{session.ack_attempts} transmission(s)"
+            )
+        except SimulatorException:
+            return
+
+    def _handle_block_received_ans(self, ans: FragDataBlockReceivedAns) -> None:
+        session = self.sessions.get(ans.frag_index)
+        if session is None or not session.ack_pending:
+            return
+        session.ack_pending = False
+        logger.info(
+            f"{sim.current_time():.2f}s  TS004-DEV  session {ans.frag_index} "
+            f"data block reception acknowledged by the server"
+        )
+
+    # -- FragSessionStatus (§3.2) ------------------------------------------
+
+    async def _handle_status_request(self, req: FragSessionStatusReq) -> None:
+        session = self.sessions.get(req.frag_index)
+
+        if session is None:
+            # The 1-octet form; see the class docstring for the Participants
+            # reading applied here.
+            answer = FragSessionStatusAns(
+                frag_index=req.frag_index, session_does_not_exist=True
+            )
+        else:
+            if session.completed and not req.participants:
+                # §3.2 Participants = 0: only receivers still missing fragments
+                # SHALL answer.
+                logger.debug(
+                    f"{sim.current_time():.2f}s  TS004-DEV  status request for a "
+                    f"completed session {req.frag_index} with Participants=0, "
+                    f"staying silent"
+                )
+                return
+            missing = session.missing_uncoded_count()
+            answer = FragSessionStatusAns(
+                frag_index=req.frag_index,
+                nb_frag_received=session.frames_received,
+                missing_frag=missing,
+                memory_error=session.memory_error,
+                # §3.2: MICError is meaningful only when MissingFrag == 0.
+                mic_error=missing == 0 and session.mic_ok is False,
+            )
+
+        # Always spread the answer: the application layer cannot tell whether
+        # the request arrived multicast (see the class docstring).
+        delay = block_ack_delay_seconds(
+            session.block_ack_delay if session is not None else 0, self.rng
+        )
+        await self.queue_uplink(encode_commands([answer]), delay=delay)
+
+    # -- FragSessionDelete (§3.4) ------------------------------------------
+
+    async def _handle_delete(self, req: FragSessionDeleteReq) -> None:
+        session = self.sessions.pop(req.frag_index, None)
+        if session is not None:
+            session.ack_pending = False
+            logger.info(
+                f"{sim.current_time():.2f}s  TS004-DEV  session {req.frag_index} deleted"
+            )
+        answer = FragSessionDeleteAns(
+            frag_index=req.frag_index, session_does_not_exist=session is None
+        )
+        await self.queue_uplink(encode_commands([answer]))
+
+
+# ---------------------------------------------------------------------------
+# Network-server side application (TS004-2.0.0 §3, FPort 201)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FragServerSession:
+    """A fragmentation session as the network server tracks it.
+
+    Created by :meth:`FragmentationServerApplication.create_session`, which also
+    builds the :class:`~simulator.lorawan.fuota.fragmentation.FragmentationEncoder`
+    the fragments are generated from. ``NbFrag`` and ``Padding`` come from the
+    encoder, so they always agree with the fragments actually transmitted.
+
+    :ivar redundancy_fragments: Coded fragments planned on top of ``NbFrag``.
+        ``nb_frag + redundancy_fragments`` is what :meth:`broadcast_fragments`
+        sends by default; more can always be scheduled later with a higher
+        ``start_n`` because the encoder generates parity lines on the fly.
+    :ivar setup_answers: ``FragSessionSetupAns`` received per device.
+    :ivar completed: Devices that reported ``FragDataBlockReceivedReq``.
+    :ivar highest_n_sent: Largest ``N`` scheduled so far, so a repair round
+        knows where to continue.
+    """
+
+    frag_index: int
+    encoder: FragmentationEncoder
+    data: bytes
+    dev_addrs: list[int]
+    mc_group_bit_mask: int = 0
+    descriptor: int = 0
+    session_cnt: int = 0
+    block_ack_delay: int = 0
+    ack_reception: bool = False
+    frag_algo: int = 0
+    redundancy_fragments: int = 0
+    setup_answers: dict[int, FragSessionSetupAns] = field(default_factory=dict)
+    delete_answers: dict[int, FragSessionDeleteAns] = field(default_factory=dict)
+    completed: set[int] = field(default_factory=set)
+    mic_errors: set[int] = field(default_factory=set)
+    fragments_scheduled: int = 0
+    highest_n_sent: int = 0
+
+    @property
+    def nb_frag(self) -> int:
+        """``NbFrag`` (``M``)."""
+        return self.encoder.nb_frag
+
+    @property
+    def frag_size(self) -> int:
+        """``FragSize``."""
+        return self.encoder.frag_size
+
+    @property
+    def padding(self) -> int:
+        """``Padding`` octets in the last uncoded fragment."""
+        return self.encoder.padding
+
+    @property
+    def total_fragments(self) -> int:
+        """Fragments planned in total: ``NbFrag + redundancy_fragments``."""
+        return self.nb_frag + self.redundancy_fragments
+
+    def setup_request(self) -> FragSessionSetupReq:
+        """The ``FragSessionSetupReq`` for this session, **without** its MIC.
+
+        The MIC is per device (``DataBlockIntKey`` is device specific), so
+        :meth:`FragmentationServerApplication.create_session` fills it in with
+        :meth:`FragSessionSetupReq.with_mic` once per target.
+        """
+        return FragSessionSetupReq(
+            frag_index=self.frag_index,
+            mc_group_bit_mask=self.mc_group_bit_mask,
+            nb_frag=self.nb_frag,
+            frag_size=self.frag_size,
+            ack_reception=self.ack_reception,
+            frag_algo=self.frag_algo,
+            block_ack_delay=self.block_ack_delay,
+            padding=self.padding,
+            descriptor=self.descriptor,
+            session_cnt=self.session_cnt,
+        )
+
+
+@dataclass
+class FragStatusReport:
+    """One ``FragSessionStatusAns`` as received by the server (§3.2)."""
+
+    dev_addr: int
+    frag_index: int
+    nb_frag_received: int
+    missing_frag: int
+    memory_error: bool
+    mic_error: bool
+    session_does_not_exist: bool
+    time: float
+
+    @property
+    def complete(self) -> bool:
+        """Whether the device reported the block as fully reassembled."""
+        return not self.session_does_not_exist and self.missing_frag == 0
+
+
+class FragmentationServerApplication(Application):
+    """Network-server side of the TS004-2.0.0 fragmentation package (FPort 201).
+
+    Drives a fragmentation session end to end:
+
+    1. :meth:`create_session` splits a data block, queues a per-device
+       ``FragSessionSetupReq`` carrying that device's ``DataBlockIntKey`` MIC,
+       and keeps the encoder for later.
+    2. :meth:`broadcast_fragments` schedules ``DataFragment`` messages on a
+       multicast group through
+       :meth:`~simulator.lorawan.network_server.NetworkServer.schedule_multicast_downlink`
+       — one fragment per frame, ``N`` increasing from ``start_n``.
+    3. :meth:`request_status` asks the fleet how far it got;
+       :meth:`max_missing` turns the answers into "how many more coded
+       fragments do I need to send", which feeds a repair round of
+       :meth:`broadcast_fragments` with a higher ``start_n``.
+    4. :meth:`delete_session` tears the session down.
+
+    Unicast commands are handed to the network server through
+    :meth:`get_downlink`, so they ride on the device's next uplink like any
+    other application payload, and several of them may queue up per device.
+
+    Reference: LoRaWAN Fragmented Data Block Transport TS004-2.0.0 §3.
+    """
+
+    def __init__(
+        self,
+        network_server: NetworkServer,
+        *,
+        key_provider: Callable[[int], bytes | None] | dict[int, bytes] | None = None,
+        time_provider: Callable[[], float] | None = None,
+    ) -> None:
+        """
+        :param network_server: The server whose downlink queues and multicast
+            scheduler this package drives.
+        :param key_provider: Maps a ``DevAddr`` to that device's
+            ``DataBlockIntKey`` (§3.3), either as a callable or a dict. A device
+            with no key gets a ``FragSessionSetupReq`` with a zero MIC, which the
+            device will then fail to verify — useful for negative tests.
+        :param time_provider: Source of the timestamps stamped on
+            :class:`FragStatusReport`; defaults to the simulation clock.
+        """
+        self.network_server = network_server
+        self.time_provider: Callable[[], float] = (
+            time_provider if time_provider is not None else sim.current_time
+        )
+
+        if key_provider is None:
+            self._key_provider: Callable[[int], bytes | None] = lambda _addr: None
+        elif isinstance(key_provider, dict):
+            keys = dict(key_provider)
+            self._key_provider = keys.get
+        else:
+            self._key_provider = key_provider
+
+        #: Sessions by ``FragIndex``.
+        self.sessions: dict[int, FragServerSession] = {}
+        #: Every ``FragSessionStatusAns`` received, oldest first.
+        self.status_reports: list[FragStatusReport] = []
+        #: Latest report per ``(FragIndex, DevAddr)``.
+        self.latest_status: dict[tuple[int, int], FragStatusReport] = {}
+        #: Called as ``(dev_addr, command)`` for every parsed uplink command.
+        self.on_answer: Callable[[int, FragCommandType], None] | None = None
+
+        self._pending: dict[int, deque[bytes]] = defaultdict(deque)
+
+    def port(self) -> int:
+        """FPort 201 (§2.1)."""
+        return FRAGMENTATION_FPORT
+
+    # -- sizing ------------------------------------------------------------
+
+    @staticmethod
+    def fragment_payload_size_for(data_rate: int, fopts_len: int = 0) -> int:
+        """Largest ``FragSize`` that still fits one frame at *data_rate* (§3.6).
+
+        The region's maximum application payload minus the 3 octets of
+        ``DataFragment`` overhead. For EU868 with empty FOpts this is 39 octets
+        at DR0–DR2, 103 at DR3 and 210 at DR4–DR5.
+        """
+        return max_fragment_payload(max_frm_payload(data_rate, fopts_len))
+
+    # -- session management ------------------------------------------------
+
+    def create_session(
+        self,
+        dev_addrs: list[int],
+        *,
+        frag_index: int,
+        data: bytes,
+        frag_size: int,
+        session_cnt: int,
+        mc_group_bit_mask: int = 0,
+        redundancy_fragments: int | None = None,
+        redundancy_ratio: float | None = None,
+        descriptor: int = 0,
+        block_ack_delay: int = 0,
+        ack_reception: bool = False,
+        frag_algo: int = 0,
+    ) -> FragServerSession:
+        """Create a session and queue a ``FragSessionSetupReq`` per device (§3.3).
+
+        The data block is split with
+        :class:`~simulator.lorawan.fuota.fragmentation.FragmentationEncoder`, so
+        ``NbFrag`` and ``Padding`` are derived from *data* and *frag_size* rather
+        than passed in. Each device gets its own copy of the request, MIC'd with
+        its ``DataBlockIntKey``.
+
+        :param dev_addrs: Devices taking part in the session.
+        :param frag_index: ``FragIndex``, 0..3.
+        :param data: The data block to transport.
+        :param frag_size: ``FragSize`` in octets; check it against
+            :meth:`fragment_payload_size_for`.
+        :param session_cnt: ``SessionCnt``; must be strictly greater than the one
+            used for the previous session on this ``FragIndex`` (§3.3).
+        :param mc_group_bit_mask: Multicast groups allowed to feed the session.
+            Bit *X* enables ``McGroupID = X``; unicast is always allowed.
+        :param redundancy_fragments: Coded fragments to plan on top of
+            ``NbFrag``. Mutually exclusive with *redundancy_ratio*.
+        :param redundancy_ratio: Redundancy as a fraction of ``NbFrag``, rounded
+            up (0.2 → 20% extra fragments). §A.3 suggests ``M + 2`` on average
+            and ``M + 7`` for 99% success, on top of the expected losses.
+        :param descriptor: Vendor-specific 4-octet ``Descriptor``.
+        :param block_ack_delay: ``BlockAckDelay``, 0..7, the answer-spreading
+            exponent the devices apply.
+        :param ack_reception: Ask the devices for ``FragDataBlockReceivedReq``.
+        :param frag_algo: ``FragAlgo``; 0 is the only defined value.
+        :returns: The new :class:`FragServerSession`.
+        """
+        if redundancy_fragments is not None and redundancy_ratio is not None:
+            raise ValueError(
+                "pass either redundancy_fragments or redundancy_ratio, not both"
+            )
+
+        encoder = FragmentationEncoder(data, frag_size)
+
+        if redundancy_ratio is not None:
+            if redundancy_ratio < 0:
+                raise ValueError(
+                    f"redundancy_ratio must be >= 0, got {redundancy_ratio}"
+                )
+            redundancy = math.ceil(encoder.nb_frag * redundancy_ratio)
+        else:
+            redundancy = redundancy_fragments if redundancy_fragments is not None else 0
+
+        session = FragServerSession(
+            frag_index=_check_frag_index(frag_index),
+            encoder=encoder,
+            data=bytes(data),
+            dev_addrs=list(dev_addrs),
+            mc_group_bit_mask=mc_group_bit_mask,
+            descriptor=descriptor,
+            session_cnt=session_cnt,
+            block_ack_delay=block_ack_delay,
+            ack_reception=ack_reception,
+            frag_algo=frag_algo,
+            redundancy_fragments=redundancy,
+        )
+        self.sessions[frag_index] = session
+
+        base = session.setup_request()
+        for dev_addr in session.dev_addrs:
+            key = self._key_provider(dev_addr)
+            request = base.with_mic(key, session.data) if key is not None else base
+            if key is None:
+                logger.warning(
+                    f"{self.time_provider():.2f}s  TS004-NS  no DataBlockIntKey for "
+                    f"0x{dev_addr:08X}; FragSessionSetupReq goes out with a zero MIC"
+                )
+            self._queue(dev_addr, encode_commands([request]))
+
+        logger.info(
+            f"{self.time_provider():.2f}s  TS004-NS  session {frag_index} created: "
+            f"{len(session.data)} octets -> NbFrag={session.nb_frag} "
+            f"FragSize={session.frag_size} Padding={session.padding} "
+            f"(+{redundancy} redundancy) for {len(session.dev_addrs)} device(s)"
+        )
+        return session
+
+    def request_status(
+        self, dev_addrs: list[int], frag_index: int, participants: bool = False
+    ) -> bytes:
+        """Queue a unicast ``FragSessionStatusReq`` to each device (§3.2).
+
+        :param participants: False → only devices still missing fragments answer;
+            True → every device answers, a full roll call.
+        :returns: The encoded message, which is also what a caller would put on a
+            multicast group to poll the whole fleet at once.
+        """
+        payload = encode_commands(
+            [
+                FragSessionStatusReq(
+                    frag_index=_check_frag_index(frag_index), participants=participants
+                )
+            ]
+        )
+        for dev_addr in dev_addrs:
+            self._queue(dev_addr, payload)
+        logger.info(
+            f"{self.time_provider():.2f}s  TS004-NS  status requested for session "
+            f"{frag_index} from {len(dev_addrs)} device(s) "
+            f"(Participants={int(participants)})"
+        )
+        return payload
+
+    def delete_session(self, dev_addrs: list[int], frag_index: int) -> bytes:
+        """Queue a unicast ``FragSessionDeleteReq`` to each device (§3.4)."""
+        payload = encode_commands(
+            [FragSessionDeleteReq(frag_index=_check_frag_index(frag_index))]
+        )
+        for dev_addr in dev_addrs:
+            self._queue(dev_addr, payload)
+        logger.info(
+            f"{self.time_provider():.2f}s  TS004-NS  session {frag_index} delete "
+            f"requested from {len(dev_addrs)} device(s)"
+        )
+        return payload
+
+    def request_package_version(self, dev_addrs: list[int]) -> bytes:
+        """Queue a unicast ``PackageVersionReq`` to each device (§3.1)."""
+        payload = encode_commands([PackageVersionReq()])
+        for dev_addr in dev_addrs:
+            self._queue(dev_addr, payload)
+        return payload
+
+    # -- fragment transmission ---------------------------------------------
+
+    def broadcast_fragments(
+        self,
+        frag_index: int,
+        *,
+        group_addr: int,
+        start_time: float,
+        interval: float,
+        count: int | None = None,
+        start_n: int = 1,
+    ) -> list[ScheduledMulticastDownlink]:
+        """Schedule ``DataFragment`` messages on a multicast group (§3.6).
+
+        One fragment per frame, ``N`` running from *start_n*, spaced *interval*
+        seconds apart from *start_time*. The gateway's own duty-cycle limiter may
+        stretch the spacing further; the schedule is a request, not a guarantee.
+
+        Because the encoder generates parity lines on the fly, a repair round is
+        just another call with ``start_n`` past the highest ``N`` already sent —
+        for example ``start_n=session.highest_n_sent + 1``.
+
+        :param count: Fragments to schedule. None sends the rest of the planned
+            ``NbFrag + redundancy_fragments`` from *start_n* onwards.
+        :returns: The queue entries, in transmission order.
+        """
+        session = self._session(frag_index)
+        if start_n < 1:
+            raise ValueError(f"fragment index N is 1-based, got {start_n}")
+        if count is None:
+            count = max(0, session.total_fragments - start_n + 1)
+
+        entries: list[ScheduledMulticastDownlink] = []
+        for k in range(count):
+            n = start_n + k
+            payload = encode_commands(
+                [
+                    DataFragment(
+                        frag_index=session.frag_index,
+                        index_n=n,
+                        payload=session.encoder.fragment(n),
+                    )
+                ]
+            )
+            entries.append(
+                self.network_server.schedule_multicast_downlink(
+                    group_addr,
+                    fport=FRAGMENTATION_FPORT,
+                    payload=payload,
+                    at_time=start_time + k * interval,
+                )
+            )
+            session.highest_n_sent = max(session.highest_n_sent, n)
+
+        session.fragments_scheduled += count
+        logger.info(
+            f"{self.time_provider():.2f}s  TS004-NS  session {frag_index}: "
+            f"{count} fragment(s) N={start_n}..{start_n + count - 1} scheduled on "
+            f"0x{group_addr:08X} from {start_time:.2f}s every {interval:.2f}s"
+        )
+        return entries
+
+    def send_fragment_unicast(self, dev_addr: int, frag_index: int, n: int) -> bytes:
+        """Queue a single ``DataFragment`` as a unicast downlink (§3.6).
+
+        Unicast is always an allowed fragment source regardless of
+        ``McGroupBitMask``, which makes this the natural repair path for a
+        device that is far behind the rest of the fleet.
+
+        The frame goes through
+        :meth:`~simulator.lorawan.network_server.NetworkServer.queue_downlink`,
+        whose explicit queue is served before any application, so a repair
+        fragment is not held up behind this package's own pending commands.
+        """
+        session = self._session(frag_index)
+        payload = encode_commands(
+            [
+                DataFragment(
+                    frag_index=session.frag_index,
+                    index_n=n,
+                    payload=session.encoder.fragment(n),
+                )
+            ]
+        )
+        self.network_server.queue_downlink(
+            dev_addr, fport=FRAGMENTATION_FPORT, payload=payload
+        )
+        session.highest_n_sent = max(session.highest_n_sent, n)
+        return payload
+
+    # -- downlink / uplink plumbing ----------------------------------------
+
+    def _queue(self, dev_addr: int, payload: bytes) -> None:
+        self._pending[dev_addr].append(payload)
+
+    async def get_downlink(self, dev_addr: int) -> bytes | None:
+        """Hand the network server this package's next command for a device."""
+        queue = self._pending.get(dev_addr)
+        if not queue:
+            return None
+        return queue.popleft()
+
+    def pending_downlinks(self, dev_addr: int) -> list[bytes]:
+        """Queued but unsent commands for a device, oldest first (read-only)."""
+        return list(self._pending.get(dev_addr, ()))
+
+    async def on_uplink(self, dev_addr: int, payload: bytes) -> None:
+        """Process a FPort 201 uplink from a device (§3)."""
+        for command in parse_uplink_commands(payload):
+            match command:
+                case FragSessionSetupAns():
+                    self._handle_setup_ans(dev_addr, command)
+                case FragSessionStatusAns():
+                    self._handle_status_ans(dev_addr, command)
+                case FragDataBlockReceivedReq():
+                    self._handle_block_received(dev_addr, command)
+                case FragSessionDeleteAns():
+                    self._handle_delete_ans(dev_addr, command)
+                case PackageVersionAns():
+                    logger.info(
+                        f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} "
+                        f"runs package {command.package_identifier} "
+                        f"version {command.package_version}"
+                    )
+                case _:
+                    logger.debug(
+                        f"{self.time_provider():.2f}s  TS004-NS  ignoring "
+                        f"{type(command).__name__} from 0x{dev_addr:08X}"
+                    )
+            if self.on_answer is not None:
+                self.on_answer(dev_addr, command)
+
+    def _handle_setup_ans(self, dev_addr: int, ans: FragSessionSetupAns) -> None:
+        session = self.sessions.get(ans.frag_index)
+        if session is not None:
+            session.setup_answers[dev_addr] = ans
+        if ans.accepted:
+            logger.info(
+                f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} accepted "
+                f"session {ans.frag_index}"
+            )
+        else:
+            logger.warning(
+                f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} REFUSED "
+                f"session {ans.frag_index}: StatusBitMask="
+                f"0x{ans.encode_payload()[0]:02X}"
+            )
+
+    def _handle_status_ans(self, dev_addr: int, ans: FragSessionStatusAns) -> None:
+        report = FragStatusReport(
+            dev_addr=dev_addr,
+            frag_index=ans.frag_index,
+            nb_frag_received=ans.nb_frag_received,
+            missing_frag=ans.missing_frag,
+            memory_error=ans.memory_error,
+            mic_error=ans.mic_error,
+            session_does_not_exist=ans.session_does_not_exist,
+            time=self.time_provider(),
+        )
+        self.status_reports.append(report)
+        self.latest_status[(ans.frag_index, dev_addr)] = report
+        logger.info(
+            f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} session "
+            f"{ans.frag_index}: received={ans.nb_frag_received} "
+            f"missing={ans.missing_frag} "
+            f"memory_error={int(ans.memory_error)} mic_error={int(ans.mic_error)} "
+            f"no_session={int(ans.session_does_not_exist)}"
+        )
+
+    def _handle_block_received(
+        self, dev_addr: int, req: FragDataBlockReceivedReq
+    ) -> None:
+        session = self.sessions.get(req.frag_index)
+        if session is not None:
+            session.completed.add(dev_addr)
+            if req.mic_error:
+                session.mic_errors.add(dev_addr)
+
+        if req.mic_error:
+            logger.warning(
+                f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} completed "
+                f"session {req.frag_index} but reports a MIC ERROR"
+            )
+        else:
+            logger.info(
+                f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} completed "
+                f"session {req.frag_index}, MIC ok"
+            )
+
+        # §3.5: the answer SHALL echo the FragIndex of the request.
+        self._queue(
+            dev_addr,
+            encode_commands([FragDataBlockReceivedAns(frag_index=req.frag_index)]),
+        )
+
+    def _handle_delete_ans(self, dev_addr: int, ans: FragSessionDeleteAns) -> None:
+        session = self.sessions.get(ans.frag_index)
+        if session is not None:
+            session.delete_answers[dev_addr] = ans
+        logger.info(
+            f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} deleted session "
+            f"{ans.frag_index}"
+            + ("" if ans.accepted else " (it did not exist)")
+        )
+
+    # -- fleet view --------------------------------------------------------
+
+    def _session(self, frag_index: int) -> FragServerSession:
+        session = self.sessions.get(frag_index)
+        if session is None:
+            raise KeyError(f"no fragmentation session with FragIndex {frag_index}")
+        return session
+
+    def devices_acked_setup(self, frag_index: int) -> set[int]:
+        """Devices that accepted the ``FragSessionSetupReq`` (§3.3)."""
+        session = self.sessions.get(frag_index)
+        if session is None:
+            return set()
+        return {
+            addr for addr, ans in session.setup_answers.items() if ans.accepted
+        }
+
+    def devices_complete(self, frag_index: int) -> set[int]:
+        """Devices known to hold the whole data block.
+
+        A device counts as complete when it sent ``FragDataBlockReceivedReq``
+        (§3.5) or when its last ``FragSessionStatusAns`` reported
+        ``MissingFrag == 0`` (§3.2). With ``AckReception = 0`` and no status
+        round the server has no way of knowing, which is exactly why TS004 v2.0.0
+        added CID 0x04.
+        """
+        session = self.sessions.get(frag_index)
+        complete = set(session.completed) if session is not None else set()
+        for (index, dev_addr), report in self.latest_status.items():
+            if index == frag_index and report.complete:
+                complete.add(dev_addr)
+        return complete
+
+    def max_missing(self, frag_index: int) -> int:
+        """Largest ``MissingFrag`` across the latest status answers (§3.2).
+
+        The number of *independent* coded fragments the worst-off device still
+        needs, and therefore the minimum size of a repair round. §A.3 suggests
+        budgeting a couple of fragments on top, since a coded fragment can turn
+        out to be linearly dependent.
+        """
+        return max(
+            (
+                report.missing_frag
+                for (index, _addr), report in self.latest_status.items()
+                if index == frag_index and not report.session_does_not_exist
+            ),
+            default=0,
+        )

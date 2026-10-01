@@ -10,6 +10,11 @@ import random
 
 import pytest
 
+from simulator.lorawan.crypto import compute_data_mic, encrypt_frm_payload
+from simulator.lorawan.enums.frame_types import MType
+from simulator.lorawan.frame import FCtrl, FHDR, MACPayload, MHDR, PHYPayload
+from simulator.lorawan.network_server import NetworkServer
+from simulator.lorawan.region import max_frm_payload
 from simulator.lorawan.fuota.crypto import (
     compute_data_block_mic,
     derive_data_block_int_key,
@@ -21,6 +26,10 @@ from simulator.lorawan.fuota.fragmentation import (
 )
 from simulator.lorawan.fuota.frag_transport import (
     DATA_FRAGMENT_HEADER_SIZE,
+    FragmentationDeviceApplication,
+    FragmentationServerApplication,
+    FragServerSession,
+    FragSessionState,
     FRAGMENTATION_FPORT,
     MAX_FRAG_SESSIONS,
     MAX_MISSING_FRAG,
@@ -808,3 +817,1063 @@ def test_end_to_end_with_padding_and_status_report():
     done = FragSessionStatusAns(frag_index=0, nb_frag_received=decoder.nb_frames_received)
     assert done.missing_frag == 0
     assert done.mic_error is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Application classes (TS004-2.0.0 §3) — device side and network-server side
+# ═══════════════════════════════════════════════════════════════════════════
+
+DEV_ADDR = 0x26011234
+DEV_ADDR_B = 0x26011235
+DEV_ADDR_C = 0x26011236
+NWK_S_KEY = bytes.fromhex("2B7E151628AED2A6ABF7158809CF4F3C")
+APP_S_KEY = bytes.fromhex("3C4F9C098815F7ABA6D2AE281615E72B")
+GEN_APP_KEY = bytes.fromhex("000102030405060708090A0B0C0D0E0F")
+DATA_BLOCK_INT_KEY = derive_data_block_int_key(key=GEN_APP_KEY)
+
+MC_ADDR = 0xFF000001
+MC_NWK_KEY = bytes.fromhex("AABBCCDD11223344AABBCCDD11223344")
+MC_APP_KEY = bytes.fromhex("11223344AABBCCDD11223344AABBCCDD")
+
+
+def _build_uplink(dev_addr: int, fcnt: int, fport: int, payload: bytes) -> bytes:
+    """A real encrypted + MIC'd uplink frame, as `NetworkServer.handle_uplink` wants it."""
+    encrypted = encrypt_frm_payload(
+        APP_S_KEY, dev_addr=dev_addr, fcnt=fcnt, uplink=True, payload=payload,
+    )
+    fhdr = FHDR(dev_addr=dev_addr, fctrl=FCtrl(), fcnt=fcnt)
+    mac_payload = MACPayload(fhdr=fhdr, fport=fport, frm_payload=encrypted)
+    mhdr = MHDR(mtype=MType.UNCONFIRMED_DATA_UP)
+    mic = compute_data_mic(
+        NWK_S_KEY, dev_addr=dev_addr, fcnt=fcnt, uplink=True,
+        mhdr_and_payload=bytes([mhdr.encode()]) + mac_payload.encode(uplink=True),
+    )
+    return PHYPayload(mhdr=mhdr, mac_payload=mac_payload, mic=mic).encode()
+
+
+def _decrypt_downlink(raw: bytes, dev_addr: int, fcnt: int) -> tuple[int, bytes]:
+    """`(FPort, plaintext)` of a unicast downlink built by the network server."""
+    phy = PHYPayload.decode_data(raw)
+    assert phy.mac_payload is not None
+    plain = encrypt_frm_payload(
+        APP_S_KEY, dev_addr=dev_addr, fcnt=fcnt, uplink=False,
+        payload=phy.mac_payload.frm_payload,
+    )
+    assert phy.mac_payload.fport is not None
+    return phy.mac_payload.fport, plain
+
+
+def _app_setup_req(data: bytes, frag_size: int, **kwargs) -> FragSessionSetupReq:
+    """A `FragSessionSetupReq` matching `data`, MIC'd with `DATA_BLOCK_INT_KEY`."""
+    encoder = FragmentationEncoder(data, frag_size)
+    req = FragSessionSetupReq(
+        nb_frag=encoder.nb_frag, frag_size=frag_size, padding=encoder.padding, **kwargs
+    )
+    return req.with_mic(DATA_BLOCK_INT_KEY, data)
+
+
+def _block(size: int, seed: int = 1) -> bytes:
+    return bytes(random.Random(seed).getrandbits(8) for _ in range(size))
+
+
+async def _feed(
+    app: FragmentationDeviceApplication,
+    encoder: FragmentationEncoder,
+    indices,
+    frag_index: int = 0,
+) -> None:
+    """Hand a sequence of coded fragment indices to a device application."""
+    for n in indices:
+        await app.on_downlink(
+            DataFragment(frag_index, n, encoder.fragment(n)).encode()
+        )
+
+
+def _single_uplink(app: FragmentationDeviceApplication):
+    """Pop exactly one queued uplink and return its single parsed command."""
+    payload = app.pop_pending_uplink()
+    assert payload is not None, "expected an uplink to be queued"
+    commands = parse_uplink_commands(payload)
+    assert len(commands) == 1, commands
+    return commands[0]
+
+
+# ── Device: FragSessionSetupReq acceptance (§3.3) ───────────────────────────
+
+class TestDeviceSetup:
+    @pytest.mark.asyncio
+    async def test_accepts_a_valid_setup(self):
+        app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY)
+        data = _block(200)
+        req = _app_setup_req(data, 20, frag_index=1, session_cnt=1, descriptor=0xDEADBEEF)
+
+        await app.on_downlink(req.encode())
+
+        assert isinstance(app.sessions[1], FragSessionState)
+
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.accepted
+        assert ans.frag_index == 1
+        session = app.sessions[1]
+        assert session.nb_frag == 10
+        assert session.frag_size == 20
+        assert session.descriptor == 0xDEADBEEF
+        assert app.progress(1) == (0, 10)
+        assert not app.is_complete(1)
+
+    @pytest.mark.asyncio
+    async def test_frag_algo_unsupported(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(_app_setup_req(_block(40), 10, frag_algo=1).encode())
+
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.frag_algo_unsupported
+        assert not ans.accepted
+        assert app.sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_frag_index_unsupported(self):
+        app = FragmentationDeviceApplication(max_sessions=2)
+        await app.on_downlink(_app_setup_req(_block(40), 10, frag_index=3).encode())
+
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.frag_index_unsupported
+        assert ans.frag_index == 3
+        assert not ans.accepted
+
+    @pytest.mark.asyncio
+    async def test_not_enough_memory_from_nb_frag(self):
+        app = FragmentationDeviceApplication(max_nb_frag=5)
+        await app.on_downlink(_app_setup_req(_block(100), 10).encode())
+
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.not_enough_memory
+        assert not ans.accepted
+
+    @pytest.mark.asyncio
+    async def test_not_enough_memory_from_block_size(self):
+        app = FragmentationDeviceApplication(max_block_size=64)
+        await app.on_downlink(_app_setup_req(_block(100), 10).encode())
+
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.not_enough_memory
+
+    @pytest.mark.asyncio
+    async def test_wrong_descriptor(self):
+        app = FragmentationDeviceApplication(
+            descriptor_filter=lambda descriptor: descriptor == 0x01020304
+        )
+        await app.on_downlink(_app_setup_req(_block(40), 10, descriptor=0x99).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.wrong_descriptor
+        assert not ans.accepted
+
+        await app.on_downlink(
+            _app_setup_req(_block(40), 10, descriptor=0x01020304, session_cnt=1).encode()
+        )
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.accepted
+
+    @pytest.mark.asyncio
+    async def test_first_session_may_use_session_cnt_zero(self):
+        """SessionCntPrev starts at -1, so SessionCnt = 0 is legal once (§3.3)."""
+        app = FragmentationDeviceApplication()
+        assert app.last_session_cnt[0] == -1
+        await app.on_downlink(_app_setup_req(_block(40), 10, session_cnt=0).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.accepted
+
+    @pytest.mark.asyncio
+    async def test_session_cnt_replay_is_refused(self):
+        """SessionCntPrev commits on the first DataFragment, not at setup (§3.3)."""
+        app = FragmentationDeviceApplication()
+        data = _block(40)
+        encoder = FragmentationEncoder(data, 10)
+
+        await app.on_downlink(_app_setup_req(data, 10, session_cnt=7).encode())
+        assert _single_uplink(app).accepted
+        # Nothing committed yet: a replay is still accepted at this point.
+        assert app.last_session_cnt[0] == -1
+
+        await _feed(app, encoder, [1])
+        assert app.last_session_cnt[0] == 7
+
+        for replayed in (0, 7):
+            await app.on_downlink(
+                _app_setup_req(data, 10, session_cnt=replayed).encode()
+            )
+            ans = _single_uplink(app)
+            assert isinstance(ans, FragSessionSetupAns)
+            assert ans.session_cnt_replay
+            assert not ans.accepted
+
+        await app.on_downlink(_app_setup_req(data, 10, session_cnt=8).encode())
+        assert _single_uplink(app).accepted
+
+    @pytest.mark.asyncio
+    async def test_refused_setup_leaves_the_running_session_alone(self):
+        """v2.0.0: the old session is replaced only if the new setup succeeds (§3.3)."""
+        app = FragmentationDeviceApplication()
+        data = _block(40)
+        encoder = FragmentationEncoder(data, 10)
+        await app.on_downlink(_app_setup_req(data, 10, session_cnt=1).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, [1, 2])
+        assert app.progress(0) == (2, 4)
+
+        # Refused: SessionCnt replay.
+        await app.on_downlink(_app_setup_req(data, 10, session_cnt=1).encode())
+        assert not _single_uplink(app).accepted
+        assert app.progress(0) == (2, 4)
+
+    @pytest.mark.asyncio
+    async def test_accepted_setup_replaces_the_running_session(self):
+        app = FragmentationDeviceApplication()
+        data = _block(40)
+        encoder = FragmentationEncoder(data, 10)
+        await app.on_downlink(_app_setup_req(data, 10, session_cnt=1).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, [1, 2])
+        assert app.progress(0) == (2, 4)
+
+        await app.on_downlink(_app_setup_req(_block(80), 20, session_cnt=2).encode())
+        assert _single_uplink(app).accepted
+        assert app.progress(0) == (0, 4)
+        assert app.sessions[0].frag_size == 20
+
+    @pytest.mark.asyncio
+    async def test_four_sessions_run_side_by_side(self):
+        app = FragmentationDeviceApplication()
+        for index in range(MAX_FRAG_SESSIONS):
+            await app.on_downlink(
+                _app_setup_req(_block(40, seed=index), 10, frag_index=index).encode()
+            )
+            ans = _single_uplink(app)
+            assert ans.accepted and ans.frag_index == index
+        assert sorted(app.sessions) == [0, 1, 2, 3]
+
+
+# ── Device: DataFragment reception (§3.6) ──────────────────────────────────
+
+class TestDeviceFragments:
+    @pytest.mark.asyncio
+    async def test_reconstructs_through_losses_and_verifies_the_mic(self):
+        data = _block(600)
+        encoder = FragmentationEncoder(data, 24)  # 25 fragments
+        seen: list[tuple[int, bytes, int]] = []
+        app = FragmentationDeviceApplication(
+            gen_app_key=GEN_APP_KEY,
+            on_block_received=lambda i, d, desc: seen.append((i, d, desc)),
+        )
+        await app.on_downlink(
+            _app_setup_req(data, 24, session_cnt=3, descriptor=0xABCD).encode()
+        )
+        app.pop_pending_uplink()
+
+        # Lose every third uncoded fragment, then stream redundancy until done.
+        delivered = [n for n in range(1, encoder.nb_frag + 1) if n % 3 != 0]
+        await _feed(app, encoder, delivered)
+        assert not app.is_complete(0)
+
+        n = encoder.nb_frag + 1
+        while not app.is_complete(0):
+            await _feed(app, encoder, [n])
+            n += 1
+            assert n < encoder.nb_frag + 60, "decoder failed to converge"
+
+        assert app.completed_blocks[0] == data
+        assert app.sessions[0].data == data
+        assert app.sessions[0].mic_ok is True
+        assert app.fragments_received == app.sessions[0].frames_received
+        assert seen == [(0, data, 0xABCD)]
+
+    @pytest.mark.asyncio
+    async def test_mic_failure_with_the_wrong_key(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=bytes(16))
+        await app.on_downlink(_app_setup_req(data, 12).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        assert app.is_complete(0)
+        assert app.completed_blocks[0] == data
+        assert app.sessions[0].mic_ok is False
+
+    @pytest.mark.asyncio
+    async def test_without_a_key_the_mic_is_simply_not_checked(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(_app_setup_req(data, 12).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        assert app.sessions[0].mic_ok is None
+
+    @pytest.mark.asyncio
+    async def test_fragments_after_completion_are_dropped(self):
+        """§3.6: once reconstructed, further messages on that FragIndex are dropped."""
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY)
+        await app.on_downlink(_app_setup_req(data, 12).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+        received = app.fragments_received
+        frames = app.sessions[0].frames_received
+
+        await _feed(app, encoder, [1, 2, encoder.nb_frag + 1])
+
+        assert app.fragments_received == received
+        assert app.sessions[0].frames_received == frames
+        assert app.fragments_dropped == 3
+
+    @pytest.mark.asyncio
+    async def test_fragments_for_an_unknown_session_are_dropped(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(DataFragment(2, 1, b"\x01" * 10).encode())
+        assert app.fragments_dropped == 1
+        assert app.fragments_received == 0
+
+    @pytest.mark.asyncio
+    async def test_a_fragment_of_the_wrong_length_is_dropped(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(_app_setup_req(_block(40), 10).encode())
+        app.pop_pending_uplink()
+
+        await app.on_downlink(DataFragment(0, 1, b"\x01" * 9).encode())
+
+        assert app.fragments_dropped == 1
+        assert app.progress(0) == (0, 4)
+
+    @pytest.mark.asyncio
+    async def test_duplicates_count_as_frames_but_not_as_progress(self):
+        """NbFragReceived counts repeats; the decoder rank does not (§3.2)."""
+        data = _block(40)
+        encoder = FragmentationEncoder(data, 10)
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(_app_setup_req(data, 10).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, [1, 1, 1, 2])
+
+        assert app.sessions[0].frames_received == 4
+        assert app.progress(0) == (2, 4)
+
+    @pytest.mark.asyncio
+    async def test_lmax_aborts_defragmentation_with_a_memory_error(self):
+        data = _block(400)
+        encoder = FragmentationEncoder(data, 20)  # 20 fragments
+        app = FragmentationDeviceApplication(lmax=4)
+        await app.on_downlink(_app_setup_req(data, 20).encode())
+        app.pop_pending_uplink()
+
+        # One coded fragment is enough: all 20 uncoded fragments count as lost.
+        await _feed(app, encoder, [encoder.nb_frag + 1])
+
+        assert app.sessions[0].memory_error
+        assert not app.is_complete(0)
+        assert app.fragments_dropped == 0
+        # The session stops taking fragments once it has given up.
+        await _feed(app, encoder, [1, 2])
+        assert app.fragments_dropped == 2
+
+
+# ── Device: FragSessionStatusReq / Ans (§3.2) ──────────────────────────────
+
+class TestDeviceStatus:
+    @pytest.mark.asyncio
+    async def test_status_reports_frames_received_and_missing_uncoded(self):
+        data = _block(400)
+        encoder = FragmentationEncoder(data, 20)  # 20 fragments
+        app = FragmentationDeviceApplication(rng=random.Random(1))
+        await app.on_downlink(_app_setup_req(data, 20, frag_index=2).encode())
+        app.pop_pending_uplink()
+
+        # 11 frames, one of them a duplicate -> 10 distinct uncoded fragments.
+        await _feed(app, encoder, [*range(1, 11), 1], frag_index=2)
+
+        await app.on_downlink(FragSessionStatusReq(frag_index=2).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.frag_index == 2
+        assert ans.nb_frag_received == 11
+        assert ans.missing_frag == 10
+        assert ans.memory_error is False
+        assert ans.mic_error is False
+        assert ans.session_does_not_exist is False
+
+    @pytest.mark.asyncio
+    async def test_missing_frag_saturates_at_255(self):
+        data = _block(1200)
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(_app_setup_req(data, 4).encode())  # 300 fragments
+        app.pop_pending_uplink()
+
+        await app.on_downlink(FragSessionStatusReq().encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.missing_frag == MAX_MISSING_FRAG == 255
+
+    @pytest.mark.asyncio
+    async def test_unknown_session_answers_the_one_octet_form(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(FragSessionStatusReq(frag_index=1).encode())
+
+        payload = app.pop_pending_uplink()
+        assert payload is not None
+        assert len(payload) == 2  # CID + 1-octet Status
+        ans = parse_uplink_commands(payload)[0]
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.session_does_not_exist
+
+    @pytest.mark.asyncio
+    async def test_participants_zero_keeps_a_finished_device_silent(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY)
+        await app.on_downlink(_app_setup_req(data, 12).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        await app.on_downlink(FragSessionStatusReq(participants=False).encode())
+        assert app.pending_uplinks == []
+
+    @pytest.mark.asyncio
+    async def test_participants_one_gets_an_answer_from_everyone(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY)
+        await app.on_downlink(_app_setup_req(data, 12).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        await app.on_downlink(FragSessionStatusReq(participants=True).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.missing_frag == 0
+        assert ans.mic_error is False
+        assert ans.nb_frag_received == encoder.nb_frag
+
+    @pytest.mark.asyncio
+    async def test_mic_error_is_reported_once_the_block_is_complete(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=bytes(16))
+        await app.on_downlink(_app_setup_req(data, 12).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        await app.on_downlink(FragSessionStatusReq(participants=True).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.missing_frag == 0
+        assert ans.mic_error is True
+
+    @pytest.mark.asyncio
+    async def test_memory_error_is_reported(self):
+        data = _block(400)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(lmax=2)
+        await app.on_downlink(_app_setup_req(data, 20).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, [encoder.nb_frag + 1])
+
+        await app.on_downlink(FragSessionStatusReq().encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.memory_error is True
+
+    @pytest.mark.asyncio
+    async def test_the_answer_is_spread_over_the_block_ack_delay_window(self):
+        """§3.2: answers are spread over rand() * 2**(BlockAckDelay + 4) seconds."""
+        app = FragmentationDeviceApplication(rng=random.Random(7))
+        await app.on_downlink(_app_setup_req(_block(40), 10, block_ack_delay=3).encode())
+        app.pop_pending_uplink()
+
+        delays: list[float] = []
+
+        async def capture(payload: bytes, delay: float = 0.0) -> None:
+            delays.append(delay)
+
+        app.queue_uplink = capture  # type: ignore[method-assign]
+        await app.on_downlink(FragSessionStatusReq().encode())
+
+        assert len(delays) == 1
+        assert 0.0 <= delays[0] < 2 ** (3 + 4)
+
+
+# ── Device: delete, package version, completion acknowledgement ────────────
+
+class TestDeviceMisc:
+    @pytest.mark.asyncio
+    async def test_delete_removes_the_session(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(_app_setup_req(_block(40), 10, frag_index=1).encode())
+        app.pop_pending_uplink()
+
+        await app.on_downlink(FragSessionDeleteReq(frag_index=1).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionDeleteAns)
+        assert ans.accepted
+        assert ans.frag_index == 1
+        assert 1 not in app.sessions
+
+    @pytest.mark.asyncio
+    async def test_delete_of_an_unknown_session_is_refused(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(FragSessionDeleteReq(frag_index=3).encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionDeleteAns)
+        assert ans.session_does_not_exist
+        assert not ans.accepted
+
+    @pytest.mark.asyncio
+    async def test_package_version(self):
+        app = FragmentationDeviceApplication()
+        await app.on_downlink(PackageVersionReq().encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, PackageVersionAns)
+        assert (ans.package_identifier, ans.package_version) == (3, 2)
+
+    @pytest.mark.asyncio
+    async def test_ack_reception_sends_frag_data_block_received(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY, rng=random.Random(2))
+        await app.on_downlink(_app_setup_req(data, 12, ack_reception=True).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        req = _single_uplink(app)
+        assert isinstance(req, FragDataBlockReceivedReq)
+        assert req.frag_index == 0
+        assert req.mic_error is False
+        assert app.sessions[0].ack_pending
+
+        await app.on_downlink(FragDataBlockReceivedAns(frag_index=0).encode())
+        assert not app.sessions[0].ack_pending
+
+    @pytest.mark.asyncio
+    async def test_ack_reception_reports_a_mic_error(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=bytes(16))
+        await app.on_downlink(_app_setup_req(data, 12, ack_reception=True).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        req = _single_uplink(app)
+        assert isinstance(req, FragDataBlockReceivedReq)
+        assert req.mic_error is True
+
+    @pytest.mark.asyncio
+    async def test_no_ack_when_ack_reception_is_clear(self):
+        data = _block(120)
+        encoder = FragmentationEncoder(data, 12)
+        app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY)
+        await app.on_downlink(_app_setup_req(data, 12, ack_reception=False).encode())
+        app.pop_pending_uplink()
+
+        await _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+        assert app.pending_uplinks == []
+
+    def test_port_is_201(self):
+        assert FragmentationDeviceApplication().port() == FRAGMENTATION_FPORT
+
+    def test_max_sessions_is_validated(self):
+        with pytest.raises(ValueError):
+            FragmentationDeviceApplication(max_sessions=5)
+
+
+# ── Server: session creation and fragment scheduling (§3.3, §3.6) ──────────
+
+def _server(**kwargs) -> tuple[NetworkServer, FragmentationServerApplication]:
+    ns = NetworkServer()
+    for addr in (DEV_ADDR, DEV_ADDR_B, DEV_ADDR_C):
+        ns.register_device(addr, NWK_S_KEY, APP_S_KEY)
+    ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+    app = FragmentationServerApplication(ns, time_provider=lambda: 0.0, **kwargs)
+    ns.register_application(app)
+    return ns, app
+
+
+class TestServerSessionCreation:
+    @pytest.mark.asyncio
+    async def test_setup_request_carries_a_per_device_mic(self):
+        other_key = derive_data_block_int_key(key=bytes.fromhex("FF" * 16))
+        _ns, server = _server(
+            key_provider={DEV_ADDR: DATA_BLOCK_INT_KEY, DEV_ADDR_B: other_key}
+        )
+        data = _block(500)
+
+        session = server.create_session(
+            [DEV_ADDR, DEV_ADDR_B],
+            frag_index=1,
+            data=data,
+            frag_size=50,
+            session_cnt=4,
+            mc_group_bit_mask=0b0001,
+            descriptor=0x01020304,
+            block_ack_delay=2,
+            ack_reception=True,
+        )
+
+        assert isinstance(session, FragServerSession)
+        assert session.nb_frag == 10
+        assert session.frag_size == 50
+        assert session.padding == 0
+        assert session.total_fragments == 10
+
+        payload = await server.get_downlink(DEV_ADDR)
+        assert payload is not None
+        req = parse_downlink_commands(payload)[0]
+        assert isinstance(req, FragSessionSetupReq)
+        assert req.frag_index == 1
+        assert req.nb_frag == 10
+        assert req.frag_size == 50
+        assert req.mc_group_bit_mask == 0b0001
+        assert req.descriptor == 0x01020304
+        assert req.session_cnt == 4
+        assert req.block_ack_delay == 2
+        assert req.ack_reception is True
+        assert req.frag_algo == 0
+        # The MIC verifies with this device's key and only with this one.
+        assert req.verify_mic(DATA_BLOCK_INT_KEY, data)
+        assert not req.verify_mic(other_key, data)
+
+        payload_b = await server.get_downlink(DEV_ADDR_B)
+        assert payload_b is not None
+        req_b = parse_downlink_commands(payload_b)[0]
+        assert isinstance(req_b, FragSessionSetupReq)
+        assert req_b.verify_mic(other_key, data)
+        assert req_b.mic != req.mic
+
+    @pytest.mark.asyncio
+    async def test_padding_follows_the_encoder(self):
+        _ns, server = _server(key_provider={DEV_ADDR: DATA_BLOCK_INT_KEY})
+        data = _block(95)
+        session = server.create_session(
+            [DEV_ADDR], frag_index=0, data=data, frag_size=10, session_cnt=1
+        )
+        assert (session.nb_frag, session.padding) == (10, 5)
+
+        payload = await server.get_downlink(DEV_ADDR)
+        assert payload is not None
+        req = parse_downlink_commands(payload)[0]
+        assert isinstance(req, FragSessionSetupReq)
+        assert req.padding == 5
+        assert req.block_size == len(data)
+        # The MIC is over the un-padded block.
+        assert req.verify_mic(DATA_BLOCK_INT_KEY, data)
+
+    @pytest.mark.asyncio
+    async def test_a_device_without_a_key_gets_a_zero_mic(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10, session_cnt=1
+        )
+        payload = await server.get_downlink(DEV_ADDR)
+        assert payload is not None
+        req = parse_downlink_commands(payload)[0]
+        assert isinstance(req, FragSessionSetupReq)
+        assert req.mic == b"\x00\x00\x00\x00"
+
+    def test_redundancy_ratio_rounds_up(self):
+        _ns, server = _server()
+        session = server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(400), frag_size=20,
+            session_cnt=1, redundancy_ratio=0.25,
+        )
+        assert session.nb_frag == 20
+        assert session.redundancy_fragments == 5
+        assert session.total_fragments == 25
+
+    def test_redundancy_arguments_are_exclusive(self):
+        _ns, server = _server()
+        with pytest.raises(ValueError):
+            server.create_session(
+                [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10,
+                session_cnt=1, redundancy_fragments=2, redundancy_ratio=0.1,
+            )
+
+    def test_fragment_payload_size_for_matches_the_region(self):
+        assert FragmentationServerApplication.fragment_payload_size_for(0) == 39
+        assert FragmentationServerApplication.fragment_payload_size_for(3) == 103
+        assert FragmentationServerApplication.fragment_payload_size_for(5) == 210
+        assert FragmentationServerApplication.fragment_payload_size_for(5, 15) == (
+            max_frm_payload(5, 15) - DATA_FRAGMENT_HEADER_SIZE
+        )
+
+    def test_port_is_201(self):
+        _ns, server = _server()
+        assert server.port() == FRAGMENTATION_FPORT
+
+
+class TestServerFragmentScheduling:
+    def test_broadcast_schedules_the_whole_session(self):
+        ns, server = _server()
+        data = _block(400)
+        session = server.create_session(
+            [DEV_ADDR], frag_index=0, data=data, frag_size=20,
+            session_cnt=1, redundancy_fragments=4,
+        )
+
+        entries = server.broadcast_fragments(
+            0, group_addr=MC_ADDR, start_time=10.0, interval=2.0
+        )
+
+        assert len(entries) == 24 == session.total_fragments
+        assert session.highest_n_sent == 24
+        queued = ns.pending_multicast_downlinks()
+        assert len(queued) == 24
+        assert [e.at_time for e in queued[:3]] == [10.0, 12.0, 14.0]
+        assert all(e.fport == FRAGMENTATION_FPORT for e in queued)
+        assert all(e.group_addr == MC_ADDR for e in queued)
+
+        # The payloads decode back to the encoder's own fragments.
+        encoder = FragmentationEncoder(data, 20)
+        for k, entry in enumerate(queued, start=1):
+            fragment = parse_downlink_commands(entry.payload)[0]
+            assert isinstance(fragment, DataFragment)
+            assert fragment.frag_index == 0
+            assert fragment.index_n == k
+            assert fragment.payload == encoder.fragment(k)
+            assert len(entry.payload) == 20 + DATA_FRAGMENT_HEADER_SIZE
+
+    def test_broadcast_with_an_explicit_count_and_start(self):
+        ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=2, data=_block(400), frag_size=20, session_cnt=1
+        )
+        server.broadcast_fragments(
+            2, group_addr=MC_ADDR, start_time=0.0, interval=1.0
+        )
+        ns.pop_due_multicast_downlinks(1e9)
+
+        entries = server.broadcast_fragments(
+            2, group_addr=MC_ADDR, start_time=100.0, interval=0.5, count=3, start_n=21
+        )
+
+        assert len(entries) == 3
+        indices = []
+        for entry in entries:
+            fragment = parse_downlink_commands(entry.payload)[0]
+            assert isinstance(fragment, DataFragment)
+            assert fragment.frag_index == 2
+            indices.append(fragment.index_n)
+        assert indices == [21, 22, 23]
+        assert [e.at_time for e in entries] == [100.0, 100.5, 101.0]
+        assert server.sessions[2].highest_n_sent == 23
+
+    def test_broadcast_rejects_a_zero_index(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10, session_cnt=1
+        )
+        with pytest.raises(ValueError):
+            server.broadcast_fragments(
+                0, group_addr=MC_ADDR, start_time=0.0, interval=1.0, start_n=0
+            )
+
+    def test_broadcast_of_an_unknown_session(self):
+        _ns, server = _server()
+        with pytest.raises(KeyError):
+            server.broadcast_fragments(
+                1, group_addr=MC_ADDR, start_time=0.0, interval=1.0
+            )
+
+    @pytest.mark.asyncio
+    async def test_unicast_repair_fragment(self):
+        ns, server = _server()
+        data = _block(400)
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=data, frag_size=20, session_cnt=1
+        )
+        await server.get_downlink(DEV_ADDR)  # drain the setup request
+
+        server.send_fragment_unicast(DEV_ADDR, 0, 25)
+
+        # It goes on the network server's explicit queue, not this package's.
+        assert await server.get_downlink(DEV_ADDR) is None
+        uplink = _build_uplink(DEV_ADDR, 0, FRAGMENTATION_FPORT, b"")
+        raw = await ns.handle_uplink(uplink)
+        assert raw is not None
+        fport, plain = _decrypt_downlink(raw, DEV_ADDR, 0)
+        assert fport == FRAGMENTATION_FPORT
+        fragment = parse_downlink_commands(plain)[0]
+        assert isinstance(fragment, DataFragment)
+        assert fragment.index_n == 25
+        assert fragment.payload == FragmentationEncoder(data, 20).fragment(25)
+
+
+# ── Server: uplink answers (§3.2–§3.5) ─────────────────────────────────────
+
+class TestServerAnswers:
+    @pytest.mark.asyncio
+    async def test_setup_answers_are_tracked(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR, DEV_ADDR_B], frag_index=0, data=_block(40),
+            frag_size=10, session_cnt=1,
+        )
+
+        await server.on_uplink(DEV_ADDR, FragSessionSetupAns(frag_index=0).encode())
+        await server.on_uplink(
+            DEV_ADDR_B,
+            FragSessionSetupAns(frag_index=0, not_enough_memory=True).encode(),
+        )
+
+        assert server.devices_acked_setup(0) == {DEV_ADDR}
+        assert server.sessions[0].setup_answers[DEV_ADDR_B].not_enough_memory
+
+    @pytest.mark.asyncio
+    async def test_status_answers_feed_max_missing(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR, DEV_ADDR_B], frag_index=0, data=_block(400),
+            frag_size=20, session_cnt=1,
+        )
+
+        await server.on_uplink(
+            DEV_ADDR,
+            FragSessionStatusAns(frag_index=0, nb_frag_received=18, missing_frag=3).encode(),
+        )
+        await server.on_uplink(
+            DEV_ADDR_B,
+            FragSessionStatusAns(frag_index=0, nb_frag_received=20, missing_frag=0).encode(),
+        )
+
+        assert len(server.status_reports) == 2
+        assert server.max_missing(0) == 3
+        assert server.devices_complete(0) == {DEV_ADDR_B}
+        report = server.latest_status[(0, DEV_ADDR)]
+        assert (report.nb_frag_received, report.missing_frag) == (18, 3)
+        assert report.complete is False
+
+        # A later answer replaces the older one.
+        await server.on_uplink(
+            DEV_ADDR,
+            FragSessionStatusAns(frag_index=0, nb_frag_received=24, missing_frag=0).encode(),
+        )
+        assert server.max_missing(0) == 0
+        assert server.devices_complete(0) == {DEV_ADDR, DEV_ADDR_B}
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_does_not_exist_is_not_counted_as_missing(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10, session_cnt=1
+        )
+        await server.on_uplink(
+            DEV_ADDR, FragSessionStatusAns(session_does_not_exist=True).encode()
+        )
+        assert server.max_missing(0) == 0
+        assert server.devices_complete(0) == set()
+
+    @pytest.mark.asyncio
+    async def test_block_received_is_acknowledged(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=1, data=_block(40), frag_size=10,
+            session_cnt=1, ack_reception=True,
+        )
+        await server.get_downlink(DEV_ADDR)  # drain the setup request
+
+        await server.on_uplink(
+            DEV_ADDR, FragDataBlockReceivedReq(frag_index=1).encode()
+        )
+
+        assert server.devices_complete(1) == {DEV_ADDR}
+        payload = await server.get_downlink(DEV_ADDR)
+        assert payload is not None
+        ans = parse_downlink_commands(payload)[0]
+        assert isinstance(ans, FragDataBlockReceivedAns)
+        assert ans.frag_index == 1
+
+    @pytest.mark.asyncio
+    async def test_a_reported_mic_error_is_recorded(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10,
+            session_cnt=1, ack_reception=True,
+        )
+        await server.on_uplink(
+            DEV_ADDR, FragDataBlockReceivedReq(frag_index=0, mic_error=True).encode()
+        )
+        assert server.sessions[0].mic_errors == {DEV_ADDR}
+
+    @pytest.mark.asyncio
+    async def test_delete_round_trip(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10, session_cnt=1
+        )
+        await server.get_downlink(DEV_ADDR)
+
+        server.delete_session([DEV_ADDR], 0)
+        payload = await server.get_downlink(DEV_ADDR)
+        assert payload is not None
+        req = parse_downlink_commands(payload)[0]
+        assert isinstance(req, FragSessionDeleteReq)
+        assert req.frag_index == 0
+
+        await server.on_uplink(DEV_ADDR, FragSessionDeleteAns(frag_index=0).encode())
+        assert server.sessions[0].delete_answers[DEV_ADDR].accepted
+
+    @pytest.mark.asyncio
+    async def test_request_status_queues_per_device(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR, DEV_ADDR_B], frag_index=0, data=_block(40),
+            frag_size=10, session_cnt=1,
+        )
+        await server.get_downlink(DEV_ADDR)
+        await server.get_downlink(DEV_ADDR_B)
+
+        server.request_status([DEV_ADDR, DEV_ADDR_B], 0, participants=True)
+
+        for addr in (DEV_ADDR, DEV_ADDR_B):
+            payload = await server.get_downlink(addr)
+            assert payload is not None
+            req = parse_downlink_commands(payload)[0]
+            assert isinstance(req, FragSessionStatusReq)
+            assert req.frag_index == 0
+            assert req.participants is True
+        assert server.pending_downlinks(DEV_ADDR) == []
+
+    @pytest.mark.asyncio
+    async def test_on_answer_callback_sees_every_command(self):
+        _ns, server = _server()
+        seen: list[tuple[int, str]] = []
+        server.on_answer = lambda addr, cmd: seen.append((addr, type(cmd).__name__))
+
+        await server.on_uplink(
+            DEV_ADDR,
+            encode_commands([FragSessionSetupAns(), PackageVersionAns()]),
+        )
+
+        assert seen == [
+            (DEV_ADDR, "FragSessionSetupAns"),
+            (DEV_ADDR, "PackageVersionAns"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_package_version_request(self):
+        _ns, server = _server()
+        server.request_package_version([DEV_ADDR])
+        payload = await server.get_downlink(DEV_ADDR)
+        assert payload == b"\x00"
+
+
+# ── Device + server over the network server (§3) ───────────────────────────
+
+class TestEndToEndOverNetworkServer:
+    @pytest.mark.asyncio
+    async def test_setup_answer_travels_back_through_handle_uplink(self):
+        ns, server = _server(key_provider={DEV_ADDR: DATA_BLOCK_INT_KEY})
+        device_app = FragmentationDeviceApplication(gen_app_key=GEN_APP_KEY)
+        data = _block(500)
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=data, frag_size=50, session_cnt=1,
+            descriptor=0xCAFE,
+        )
+
+        # Device uplink -> network server -> downlink carrying FragSessionSetupReq.
+        raw = await ns.handle_uplink(_build_uplink(DEV_ADDR, 0, FRAGMENTATION_FPORT, b""))
+        assert raw is not None
+        fport, plain = _decrypt_downlink(raw, DEV_ADDR, 0)
+        assert fport == FRAGMENTATION_FPORT
+        await device_app.on_downlink(plain)
+
+        assert device_app.sessions[0].nb_frag == 10
+        assert device_app.sessions[0].descriptor == 0xCAFE
+
+        # The device's answer travels back on the next uplink.
+        answer = device_app.pop_pending_uplink()
+        assert answer is not None
+        await ns.handle_uplink(
+            _build_uplink(DEV_ADDR, 1, FRAGMENTATION_FPORT, answer)
+        )
+        assert server.devices_acked_setup(0) == {DEV_ADDR}
+
+    @pytest.mark.asyncio
+    async def test_full_transfer_with_status_and_repair(self):
+        """Setup, lossy broadcast, status round, repair round, completion ack."""
+        ns, server = _server(key_provider={DEV_ADDR: DATA_BLOCK_INT_KEY})
+        device_app = FragmentationDeviceApplication(
+            gen_app_key=GEN_APP_KEY, rng=random.Random(5)
+        )
+        data = _block(1000)
+        session = server.create_session(
+            [DEV_ADDR], frag_index=0, data=data, frag_size=40, session_cnt=1,
+            ack_reception=True, block_ack_delay=1,
+        )
+        assert session.nb_frag == 25
+
+        setup_payload = await server.get_downlink(DEV_ADDR)
+        assert setup_payload is not None
+        await device_app.on_downlink(setup_payload)
+        answer = device_app.pop_pending_uplink()
+        assert answer is not None
+        await server.on_uplink(DEV_ADDR, answer)
+        assert server.devices_acked_setup(0) == {DEV_ADDR}
+
+        # Broadcast round: every fifth frame is lost on the way to this device.
+        entries = server.broadcast_fragments(
+            0, group_addr=MC_ADDR, start_time=0.0, interval=1.0
+        )
+        for k, entry in enumerate(entries):
+            if k % 5 == 4:
+                continue
+            await device_app.on_downlink(entry.payload)
+        assert not device_app.is_complete(0)
+
+        # Status round.
+        server.request_status([DEV_ADDR], 0, participants=False)
+        status_req = await server.get_downlink(DEV_ADDR)
+        assert status_req is not None
+        await device_app.on_downlink(status_req)
+        status_ans = device_app.pop_pending_uplink()
+        assert status_ans is not None
+        await server.on_uplink(DEV_ADDR, status_ans)
+        missing = server.max_missing(0)
+        assert missing == 5
+
+        # Repair round. A coded fragment can turn out to be linearly dependent, so
+        # §A.3 budgets a handful on top of MissingFrag; here 5 of the 10 are wasted.
+        repair = server.broadcast_fragments(
+            0, group_addr=MC_ADDR, start_time=100.0, interval=1.0,
+            count=missing + 5, start_n=session.highest_n_sent + 1,
+        )
+        for entry in repair:
+            await device_app.on_downlink(entry.payload)
+
+        assert device_app.is_complete(0)
+        assert device_app.completed_blocks[0] == data
+        assert device_app.sessions[0].mic_ok is True
+
+        # Completion acknowledgement.
+        ack = device_app.pop_pending_uplink()
+        assert ack is not None
+        await server.on_uplink(DEV_ADDR, ack)
+        assert server.devices_complete(0) == {DEV_ADDR}
+        ack_ans = await server.get_downlink(DEV_ADDR)
+        assert ack_ans is not None
+        await device_app.on_downlink(ack_ans)
+        assert not device_app.sessions[0].ack_pending
