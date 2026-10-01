@@ -47,10 +47,31 @@ ambiguities):
 
 from __future__ import annotations
 
+import inspect
 import logging
+import random
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import ClassVar
+
+from simulator.environment import simulation_env as sim
+from simulator.lorawan.application import Application
+from simulator.lorawan.device import LoRaWanDevice, MulticastGroup
+from simulator.lorawan.enums.operating_mode import OperatingMode
+from simulator.lorawan.fuota.crypto import (
+    decrypt_mc_key,
+    derive_mc_ke_key,
+    derive_mc_root_key,
+    derive_multicast_key_material,
+    encrypt_mc_key,
+)
+from simulator.lorawan.fuota.device_app import FuotaDeviceApplication
+from simulator.lorawan.network_server import NetworkServer
+from simulator.lorawan.region import (
+    BEACON_INTERVAL, EU868_DATA_RATES, MAX_FCNT, RX2_DEFAULT_FREQUENCY, max_frm_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +101,13 @@ __all__ = [
     "parse_downlink_commands",
     "parse_uplink_commands",
     "encode_commands",
+    "EU868_MIN_DL_FREQUENCY",
+    "EU868_MAX_DL_FREQUENCY",
+    "MulticastSessionRequest",
+    "MulticastSetupDeviceApplication",
+    "ServerMulticastGroup",
+    "DeviceSetupState",
+    "MulticastSetupServerApplication",
 ]
 
 
@@ -988,3 +1016,1067 @@ def encode_commands(commands: list[MulticastSetupCommand]) -> bytes:
     for cmd in commands:
         buf.extend(cmd.encode())
     return bytes(buf)
+
+
+# ===========================================================================
+# Application classes — TS005-2.0.0 §3 "Remote Multicast Setup" package
+# ===========================================================================
+#
+# Everything above this banner is pure wire framing. What follows is the
+# stateful half of the package: the device-side state machine that answers the
+# commands, and the network-server-side orchestrator that issues them.
+#
+# Simulator conventions used here:
+#
+# - ``sim.current_time()`` **is** the GPS time base. The simulation starts at
+#   GPS second 0, so a TS005 ``SessionTime`` maps straight onto a simulation
+#   timestamp and no epoch conversion is ever done. Both classes take an
+#   injectable ``time_provider`` so unit tests can pin "now" without a run.
+# - TS005 commands are always unicast (§3), so answers go out with no random
+#   spreading delay — unlike TS004, where a whole multicast group would answer
+#   at once.
+# ---------------------------------------------------------------------------
+
+
+#: Lowest downlink frequency the EU868 band plan allows, in hertz. Used to
+#: validate ``DLFreq`` and raise ``FreqError`` (TS005 §4.5).
+EU868_MIN_DL_FREQUENCY = 863_000_000
+
+#: Highest downlink frequency the EU868 band plan allows, in hertz.
+EU868_MAX_DL_FREQUENCY = 870_000_000
+
+
+def _dl_frequency_supported(dl_frequency: int) -> bool:
+    """Whether a ``DLFreq`` value is usable by an EU868 device (TS005 §4.5/§4.6).
+
+    ``DLFreq = 0`` is always accepted: for Class C it means "keep the group's
+    own channel" and for Class B it selects the region's default beacon
+    frequency-hopping scheme (§4.6).
+    """
+    if dl_frequency == 0:
+        return True
+    return EU868_MIN_DL_FREQUENCY <= dl_frequency <= EU868_MAX_DL_FREQUENCY
+
+
+@dataclass
+class MulticastSessionRequest:
+    """One ``McClassB/CSessionReq`` as seen and answered by a device.
+
+    Recorded in :attr:`MulticastSetupDeviceApplication.session_history` so tests
+    and metric collectors can inspect what the device was asked to do and what
+    it replied, without reaching into the device itself.
+
+    :ivar mode: ``OperatingMode.CLASS_C`` or ``OperatingMode.CLASS_B``.
+    :ivar mc_addr: The group's ``McAddr``, or None when the group was undefined.
+    :ivar session_time: The ``SessionTime`` actually used, i.e. after the Class B
+        128 s alignment of §4.6 has been applied.
+    :ivar requested_session_time: The ``SessionTime`` exactly as received.
+    :ivar started: True when the device actually scheduled the session.
+    """
+
+    mode: OperatingMode
+    group_id: int
+    mc_addr: int | None
+    session_time: int
+    requested_session_time: int
+    timeout_seconds: int
+    data_rate: int
+    frequency: int | None
+    ping_periodicity: int | None
+    received_at: int
+    answer: _SessionAns
+    started: bool = False
+
+
+class MulticastSetupDeviceApplication(FuotaDeviceApplication):
+    """Device-side TS005 Remote Multicast Setup package (FPort 200).
+
+    Parses every command of a downlink payload in order, executes it, and sends
+    **one** concatenated uplink carrying all the answers (§3: "several commands
+    may be concatenated in a single payload; they are executed first to last").
+    Because TS005 traffic is unicast the answer goes out with no delay.
+
+    With a :class:`~simulator.lorawan.device.LoRaWanDevice` attached the device
+    is the single source of truth for the multicast contexts: groups are created
+    with ``join_multicast_group`` and sessions with ``start_class_c_session`` /
+    ``start_class_b_session``. Without one the package keeps its own dictionary
+    of contexts so the state machine can be unit tested without a simulation.
+
+    Reference: LoRaWAN Remote Multicast Setup TS005-2.0.0 §3 to §4.6.
+    """
+
+    def __init__(
+        self,
+        device: LoRaWanDevice | None = None,
+        *,
+        mc_ke_key: bytes | None = None,
+        gen_app_key: bytes | None = None,
+        lorawan_1_1: bool = False,
+        rng: random.Random | None = None,
+        time_provider: Callable[[], int] | None = None,
+        max_uplink_payload: int | None = None,
+    ) -> None:
+        """
+        :param device: The device this package runs on, or None for codec-level use.
+        :param mc_ke_key: ``McKEKey`` (16 bytes). When omitted it is derived from
+            *gen_app_key* through ``McRootKey`` (TS005 §4.3.1/§4.3.2).
+        :param gen_app_key: ``GenAppKey`` (LoRaWAN 1.0.x) or ``AppKey``
+            (LoRaWAN 1.1+), used only when *mc_ke_key* is not given.
+        :param lorawan_1_1: Select the LoRaWAN 1.1 ``McRootKey`` derivation
+            (``0x20`` prefix over ``AppKey``) instead of the 1.0.x one
+            (``0x00`` prefix over ``GenAppKey``).
+        :param time_provider: Returns the device's current GPS second. Defaults
+            to ``int(sim.current_time())``.
+        :param max_uplink_payload: FRMPayload budget used when deciding how many
+            ``McGroupStatusAns`` records fit (§4.2). Defaults to the DR5 limit.
+        """
+        super().__init__(device, rng)
+
+        if mc_ke_key is None:
+            if gen_app_key is None:
+                raise ValueError(
+                    "MulticastSetupDeviceApplication needs either mc_ke_key or "
+                    "gen_app_key to recover McKey (TS005 §4.3)"
+                )
+            mc_ke_key = derive_mc_ke_key(
+                mc_root_key=derive_mc_root_key(key=gen_app_key, lorawan_1_1=lorawan_1_1)
+            )
+        if len(mc_ke_key) != 16:
+            raise ValueError(f"mc_ke_key must be 16 bytes, got {len(mc_ke_key)}")
+
+        self.mc_ke_key = mc_ke_key
+        self.lorawan_1_1 = lorawan_1_1
+        self._time_provider = (
+            time_provider if time_provider is not None else lambda: int(sim.current_time())
+        )
+        self.max_uplink_payload = (
+            max_uplink_payload if max_uplink_payload is not None else max_frm_payload(5)
+        )
+
+        #: Multicast contexts held when no device is attached, keyed by ``McGroupID``.
+        self._groups: dict[int, MulticastGroup] = {}
+        #: Every session request received, oldest first (tests and metrics).
+        self.session_history: list[MulticastSessionRequest] = []
+        #: Number of ``PackageVersionReq`` commands answered.
+        self.package_version_requests = 0
+
+    def port(self) -> int:
+        return MULTICAST_SETUP_FPORT
+
+    # ---- Multicast contexts ----
+
+    @property
+    def max_groups(self) -> int:
+        """Number of multicast contexts this device supports (``McGroupID`` range)."""
+        if self.device is not None:
+            return min(self.device.max_multicast_groups, MAX_MULTICAST_GROUPS)
+        return MAX_MULTICAST_GROUPS
+
+    @property
+    def groups(self) -> dict[int, MulticastGroup]:
+        """The multicast contexts currently defined, keyed by ``McGroupID`` (§4.2)."""
+        if self.device is not None:
+            return {g.group_id: g for g in self.device.multicast_groups.values()}
+        return dict(self._groups)
+
+    def get_group(self, group_id: int) -> MulticastGroup | None:
+        """The multicast context stored under an ``McGroupID``, or None."""
+        if self.device is not None:
+            return self.device.get_multicast_group_by_id(group_id)
+        return self._groups.get(group_id)
+
+    # ---- Downlink handling ----
+
+    async def on_downlink(self, payload: bytes) -> None:
+        """Execute every command in a TS005 downlink and answer them in one uplink (§3)."""
+        commands = parse_downlink_commands(payload)
+        if not commands:
+            return
+
+        answers: list[MulticastSetupCommand] = []
+        used = 0
+        for command in commands:
+            answer = await self._handle_command(command, budget=self.max_uplink_payload - used)
+            if answer is None:
+                continue
+            answers.append(answer)
+            used += answer.encoded_size
+
+        if not answers:
+            return
+
+        encoded = encode_commands(answers)
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP  answering "
+            f"{len(commands)} command(s) with {len(answers)} answer(s), {len(encoded)} bytes"
+        )
+        # TS005 commands are unicast (§3), so there is no need to spread the answers of a
+        # whole group in time the way TS004's BlockAckDelay does.
+        await self.queue_uplink(encoded)
+
+    async def _handle_command(
+        self, command: MulticastSetupCommandType, *, budget: int,
+    ) -> MulticastSetupCommand | None:
+        match command:
+            case PackageVersionReq():
+                self.package_version_requests += 1
+                return PackageVersionAns(
+                    package_identifier=PACKAGE_IDENTIFIER, package_version=PACKAGE_VERSION,
+                )
+            case McGroupStatusReq():
+                return self._handle_group_status(command, budget=budget)
+            case McGroupSetupReq():
+                return self._handle_group_setup(command)
+            case McGroupDeleteReq():
+                return self._handle_group_delete(command)
+            case McClassCSessionReq():
+                return await self._handle_class_c_session(command)
+            case McClassBSessionReq():
+                return await self._handle_class_b_session(command)
+            case _:
+                logger.warning(
+                    f"{sim.current_time():.2f}s  MC-SETUP  ignoring unexpected "
+                    f"{type(command).__name__} on the device side"
+                )
+                return None
+
+    def _handle_group_status(self, req: McGroupStatusReq, *, budget: int) -> McGroupStatusAns:
+        """Report the requested multicast contexts (TS005 §4.2).
+
+        Records are emitted in ascending ``McGroupID``; when they do not all fit
+        in the remaining payload budget the device drops them "starting with the
+        highest ``McGroupID``" and clears their bits in ``AnsGroupMask``.
+        """
+        groups = self.groups
+        selected = sorted(
+            group_id for group_id in groups if req.req_group_mask & (1 << group_id)
+        )
+
+        # 1 CID octet + 1 Status octet, then 5 octets per record.
+        room = max(0, (budget - 2) // 5)
+        if len(selected) > room:
+            dropped = selected[room:]
+            selected = selected[:room]
+            logger.debug(
+                f"{sim.current_time():.2f}s  MC-SETUP  McGroupStatusAns does not fit, "
+                f"dropping McGroupID(s) {dropped}"
+            )
+
+        mask = 0
+        entries: list[McGroupStatusEntry] = []
+        for group_id in selected:
+            mask |= 1 << group_id
+            entries.append(
+                McGroupStatusEntry(group_id=group_id, mc_addr=groups[group_id].group_addr)
+            )
+
+        return McGroupStatusAns(
+            nb_total_groups=len(groups), ans_group_mask=mask, groups=entries,
+        )
+
+    def _handle_group_setup(self, req: McGroupSetupReq) -> McGroupSetupAns:
+        """Create or replace a multicast context (TS005 §4.3).
+
+        ``McKey`` is recovered with ``aes128_encrypt(McKEKey, McKey_encrypted)``
+        (§4.3.3 — the inversion is deliberate so devices only need AES encrypt),
+        then ``McAppSKey``/``McNwkSKey`` are derived from it and ``McAddr``.
+        """
+        if req.group_id >= self.max_groups:
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP  McGroupSetupReq for unsupported "
+                f"McGroupID={req.group_id} (device supports {self.max_groups})"
+            )
+            return McGroupSetupAns(group_id=req.group_id, id_error=True)
+
+        mc_key = decrypt_mc_key(
+            mc_ke_key=self.mc_ke_key, mc_key_encrypted=req.mc_key_encrypted,
+        )
+        material = derive_multicast_key_material(mc_key=mc_key, mc_addr=req.mc_addr)
+
+        try:
+            group = MulticastGroup(
+                group_addr=req.mc_addr,
+                nwk_s_key=material.mc_nwk_s_key,
+                app_s_key=material.mc_app_s_key,
+                group_id=req.group_id,
+                min_fcnt=req.min_fcnt,
+                max_fcnt=req.max_fcnt,
+            )
+        except AssertionError:
+            # A counter window with minMcFCnt > maxMcFCnt is unusable. TS005 has no
+            # dedicated status bit for it, so it is reported as an ID error.
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP  McGroupSetupReq for McGroupID="
+                f"{req.group_id} has an invalid counter window "
+                f"[{req.min_fcnt}, {req.max_fcnt}]"
+            )
+            return McGroupSetupAns(group_id=req.group_id, id_error=True)
+
+        if self.device is not None:
+            joined = self.device.join_multicast_group(group)
+        else:
+            # Re-using an McGroupID or an McAddr replaces the previous context, which is
+            # exactly what LoRaWanDevice.join_multicast_group does.
+            for stored_id, stored in list(self._groups.items()):
+                if stored.group_addr == group.group_addr and stored_id != req.group_id:
+                    del self._groups[stored_id]
+            self._groups[req.group_id] = group
+            joined = True
+
+        if not joined:
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP  device refused multicast group "
+                f"0x{req.mc_addr:08X} (McGroupID={req.group_id})"
+            )
+            return McGroupSetupAns(group_id=req.group_id, id_error=True)
+
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP  multicast group 0x{req.mc_addr:08X} "
+            f"set up as McGroupID={req.group_id}, "
+            f"McFCnt window [{req.min_fcnt}, {req.max_fcnt}]"
+        )
+        return McGroupSetupAns(group_id=req.group_id, id_error=False)
+
+    def _handle_group_delete(self, req: McGroupDeleteReq) -> McGroupDeleteAns:
+        """Delete a multicast context and any session scheduled on it (TS005 §4.4)."""
+        group = self.get_group(req.group_id)
+        if group is None:
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP  McGroupDeleteReq for undefined "
+                f"McGroupID={req.group_id}"
+            )
+            return McGroupDeleteAns(group_id=req.group_id, mc_group_undefined=True)
+
+        if self.device is not None:
+            self.device.leave_multicast_group(group.group_addr)
+        else:
+            self._groups.pop(req.group_id, None)
+
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP  multicast group 0x{group.group_addr:08X} "
+            f"(McGroupID={req.group_id}) deleted"
+        )
+        return McGroupDeleteAns(group_id=req.group_id, mc_group_undefined=False)
+
+    # ---- Sessions ----
+
+    def _validate_session(
+        self, group_id: int, data_rate: int, dl_frequency: int,
+    ) -> tuple[MulticastGroup | None, bool, bool, bool]:
+        """Check a session request's group, data rate and frequency.
+
+        :returns: ``(group, mc_group_undefined, dr_error, freq_error)``.
+        """
+        group = self.get_group(group_id)
+        return (
+            group,
+            group is None,
+            data_rate not in EU868_DATA_RATES,
+            not _dl_frequency_supported(dl_frequency),
+        )
+
+    def _session_frequency(self, group: MulticastGroup | None, dl_frequency: int) -> int | None:
+        """Resolve ``DLFreq = 0`` to the group's channel, or the region's RX2 default."""
+        if dl_frequency != 0:
+            return dl_frequency
+        if group is not None and group.frequency is not None:
+            return group.frequency
+        return RX2_DEFAULT_FREQUENCY
+
+    async def _handle_class_c_session(self, req: McClassCSessionReq) -> McClassCSessionAns:
+        """Schedule a multicast Class C session (TS005 §4.5)."""
+        group, undefined, dr_error, freq_error = self._validate_session(
+            req.group_id, req.data_rate, req.dl_frequency,
+        )
+        now = self._time_provider()
+        start_missed = req.session_time < now
+
+        answer = McClassCSessionAns(
+            group_id=req.group_id,
+            mc_group_undefined=undefined,
+            dr_error=dr_error,
+            freq_error=freq_error,
+            start_missed=start_missed,
+        )
+        frequency = self._session_frequency(group, req.dl_frequency)
+        started = await self._apply_session(
+            answer=answer,
+            group=group,
+            mode=OperatingMode.CLASS_C,
+            session_time=req.session_time,
+            timeout_seconds=req.timeout_seconds,
+            data_rate=req.data_rate,
+            frequency=frequency,
+            ping_periodicity=None,
+            now=now,
+        )
+        self.session_history.append(MulticastSessionRequest(
+            mode=OperatingMode.CLASS_C,
+            group_id=req.group_id,
+            mc_addr=group.group_addr if group is not None else None,
+            session_time=req.session_time,
+            requested_session_time=req.session_time,
+            timeout_seconds=req.timeout_seconds,
+            data_rate=req.data_rate,
+            frequency=frequency,
+            ping_periodicity=None,
+            received_at=now,
+            answer=answer,
+            started=started,
+        ))
+        return answer
+
+    async def _handle_class_b_session(self, req: McClassBSessionReq) -> McClassBSessionAns:
+        """Schedule a multicast Class B session (TS005 §4.6).
+
+        ``SessionTime`` SHALL be an integer multiple of 128 s (one beacon
+        period). The specification does not say what a device does with a
+        misaligned value; this implementation **rounds down to the preceding
+        beacon boundary** and logs a warning, so a misaligned request still
+        lines up with a beacon instead of being silently dropped. Rounding down
+        can push the start into the past, in which case ``StartMissed`` is
+        raised exactly as it would be for any other past session.
+        """
+        group, undefined, dr_error, freq_error = self._validate_session(
+            req.group_id, req.data_rate, req.dl_frequency,
+        )
+        now = self._time_provider()
+
+        session_time = req.session_time
+        if session_time % BEACON_INTERVAL != 0:
+            aligned = session_time - (session_time % BEACON_INTERVAL)
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP  McClassBSessionReq SessionTime "
+                f"{session_time} is not a multiple of {BEACON_INTERVAL} s (TS005 §4.6), "
+                f"rounding down to {aligned}"
+            )
+            session_time = aligned
+
+        start_missed = session_time < now
+        answer = McClassBSessionAns(
+            group_id=req.group_id,
+            mc_group_undefined=undefined,
+            dr_error=dr_error,
+            freq_error=freq_error,
+            start_missed=start_missed,
+        )
+        frequency = self._session_frequency(group, req.dl_frequency)
+        started = await self._apply_session(
+            answer=answer,
+            group=group,
+            mode=OperatingMode.CLASS_B,
+            session_time=session_time,
+            timeout_seconds=req.timeout_seconds,
+            data_rate=req.data_rate,
+            frequency=frequency,
+            ping_periodicity=req.periodicity,
+            now=now,
+        )
+        self.session_history.append(MulticastSessionRequest(
+            mode=OperatingMode.CLASS_B,
+            group_id=req.group_id,
+            mc_addr=group.group_addr if group is not None else None,
+            session_time=session_time,
+            requested_session_time=req.session_time,
+            timeout_seconds=req.timeout_seconds,
+            data_rate=req.data_rate,
+            frequency=frequency,
+            ping_periodicity=req.periodicity,
+            received_at=now,
+            answer=answer,
+            started=started,
+        ))
+        return answer
+
+    async def _apply_session(
+        self,
+        *,
+        answer: _SessionAns,
+        group: MulticastGroup | None,
+        mode: OperatingMode,
+        session_time: int,
+        timeout_seconds: int,
+        data_rate: int,
+        frequency: int | None,
+        ping_periodicity: int | None,
+        now: int,
+    ) -> bool:
+        """Fill in ``TimeToStart`` and hand an accepted session to the device.
+
+        ``TimeToStart`` is only present when status bits 2..7 are all clear
+        (§4.5); it counts the seconds from this answer's uplink to the start of
+        the session and saturates at :data:`TIME_TO_START_UNSYNCHRONIZED`
+        (``0xFFFFFF``), which tells the Application Server the device's clock is
+        out of synchronisation.
+
+        :returns: True when the session was actually scheduled on the device.
+        """
+        if answer.has_error:
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP  Class {mode.value} session for "
+                f"McGroupID={answer.group_id} rejected "
+                f"(status 0x{answer.status_byte:02X})"
+            )
+            return False
+
+        assert group is not None
+        answer.time_to_start = min(session_time - now, TIME_TO_START_UNSYNCHRONIZED)
+
+        if self.device is None or not sim.is_running():
+            # Codec-level use: the answer is complete, but there is no device (or no
+            # running simulation) to hang a background task off.
+            return False
+
+        if mode is OperatingMode.CLASS_C:
+            await self.device.start_class_c_session(
+                group.group_addr,
+                start_time=float(session_time),
+                timeout_seconds=float(timeout_seconds),
+                data_rate=data_rate,
+                frequency=frequency,
+            )
+        else:
+            await self.device.start_class_b_session(
+                group.group_addr,
+                start_time=float(session_time),
+                timeout_seconds=float(timeout_seconds),
+                data_rate=data_rate,
+                frequency=frequency,
+                ping_periodicity=ping_periodicity if ping_periodicity is not None else 4,
+            )
+
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP  Class {mode.value} session accepted on "
+            f"0x{group.group_addr:08X} (McGroupID={answer.group_id}): start at "
+            f"{session_time}s, {timeout_seconds}s long, DR{data_rate}, "
+            f"TimeToStart={answer.time_to_start}s"
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Network-server side
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ServerMulticastGroup:
+    """A multicast group as the network-server package knows it (TS005 §4.3).
+
+    :ivar members: Devices that were sent an ``McGroupSetupReq`` for this group.
+    :ivar session_requested: Devices that were sent a session request for it.
+    """
+
+    group_id: int
+    mc_addr: int
+    mc_key: bytes
+    mc_app_s_key: bytes
+    mc_nwk_s_key: bytes
+    min_fcnt: int = 0
+    max_fcnt: int = MAX_FCNT
+    data_rate: int | None = None
+    frequency: int | None = None
+    members: set[int] = field(default_factory=set)
+    session_requested: set[int] = field(default_factory=set)
+
+
+@dataclass
+class DeviceSetupState:
+    """What the server has learned about one device's multicast configuration.
+
+    :ivar groups: ``McGroupID`` -> ``McAddr`` for every group the device
+        acknowledged without an ``IDerror``.
+    :ivar setup_errors: ``McGroupID``s the device reported ``IDerror`` for.
+    :ivar delete_errors: ``McGroupID``s the device reported ``McGroupUndefined``
+        for in answer to an ``McGroupDeleteReq``.
+    :ivar time_to_start: ``McGroupID`` -> the ``TimeToStart`` of the most recent
+        accepted session answer, in seconds.
+    :ivar clock_offset: ``McGroupID`` -> the difference, in seconds, between the
+        device's ``TimeToStart`` and the interval the server itself expected.
+        Non-zero means the device's clock has drifted (§4.5).
+    """
+
+    dev_addr: int
+    package_identifier: int | None = None
+    package_version: int | None = None
+    groups: dict[int, int] = field(default_factory=dict)
+    setup_errors: set[int] = field(default_factory=set)
+    delete_errors: set[int] = field(default_factory=set)
+    last_status: McGroupStatusAns | None = None
+    class_c_answers: dict[int, McClassCSessionAns] = field(default_factory=dict)
+    class_b_answers: dict[int, McClassBSessionAns] = field(default_factory=dict)
+    session_answers: list[_SessionAns] = field(default_factory=list)
+    time_to_start: dict[int, int] = field(default_factory=dict)
+    clock_offset: dict[int, int] = field(default_factory=dict)
+
+    def last_session_answer(self, group_id: int) -> _SessionAns | None:
+        """The most recent Class B or Class C answer for a group, whichever came last."""
+        for answer in reversed(self.session_answers):
+            if answer.group_id == group_id:
+                return answer
+        return None
+
+
+class MulticastSetupServerApplication(Application):
+    """Network-server side TS005 Remote Multicast Setup package (FPort 200).
+
+    Drives the setup phase of a FUOTA campaign: it creates the group on the
+    :class:`~simulator.lorawan.network_server.NetworkServer`, encrypts ``McKey``
+    once per device with that device's ``McKEKey``, and queues the commands as
+    pending downlinks. Like the TS003 clock-sync server package it never calls
+    ``queue_downlink``: the network server polls :meth:`get_downlink` and the
+    answers arrive through :meth:`on_uplink`, which keeps the package decoupled
+    from the gateway and from the radio layer entirely.
+
+    Several commands are concatenated into one FRMPayload whenever they fit in
+    the region's maximum payload for the server's default data rate (§3).
+
+    Reference: LoRaWAN Remote Multicast Setup TS005-2.0.0 §3 to §4.6.
+    """
+
+    def __init__(
+        self,
+        network_server: NetworkServer,
+        *,
+        key_provider: Callable[[int], bytes] | Mapping[int, bytes],
+        lorawan_1_1: bool = False,
+        time_provider: Callable[[], int] | None = None,
+        max_downlink_payload: int | None = None,
+        on_answer: Callable[[int, MulticastSetupCommandType], object] | None = None,
+    ) -> None:
+        """
+        :param network_server: The network server the groups are created on.
+        :param key_provider: Maps a ``DevAddr`` to that device's ``McKEKey``,
+            either as a callable or as a plain mapping.
+        :param lorawan_1_1: Recorded for completeness; the key derivation itself
+            happens in whatever produced the ``McKEKey`` values.
+        :param time_provider: Returns the current GPS second. Defaults to
+            ``int(sim.current_time())``.
+        :param max_downlink_payload: FRMPayload budget per downlink. Defaults to
+            the region limit for the network server's default data rate.
+        :param on_answer: Optional hook invoked as ``on_answer(dev_addr, cmd)``
+            for every answer parsed, for orchestrators that drive the next step
+            of a FUOTA campaign. May be a coroutine function.
+        """
+        self.network_server = network_server
+        self.lorawan_1_1 = lorawan_1_1
+        self._key_provider = key_provider
+        self._time_provider = (
+            time_provider if time_provider is not None else lambda: int(sim.current_time())
+        )
+        self.max_downlink_payload = (
+            max_downlink_payload
+            if max_downlink_payload is not None
+            else max_frm_payload(network_server._default_data_rate)
+        )
+        self.on_answer = on_answer
+
+        self._pending: dict[int, deque[MulticastSetupCommand]] = defaultdict(deque)
+        #: Groups created through :meth:`setup_group`, keyed by ``McGroupID``.
+        self.groups: dict[int, ServerMulticastGroup] = {}
+        #: Per-device view of the multicast configuration, keyed by ``DevAddr``.
+        self.device_state: dict[int, DeviceSetupState] = {}
+        #: Number of answers parsed, for metrics.
+        self.answers_received = 0
+        #: Last session request issued per ``McGroupID``, used to check device clocks.
+        self._last_session_request_sent: dict[
+            int, McClassCSessionReq | McClassBSessionReq
+        ] = {}
+
+    def port(self) -> int:
+        return MULTICAST_SETUP_FPORT
+
+    # ---- Helpers ----
+
+    def mc_ke_key(self, dev_addr: int) -> bytes:
+        """The ``McKEKey`` of a device, from the configured key provider."""
+        if callable(self._key_provider):
+            key = self._key_provider(dev_addr)
+        else:
+            key = self._key_provider[dev_addr]
+        if len(key) != 16:
+            raise ValueError(
+                f"McKEKey for 0x{dev_addr:08X} must be 16 bytes, got {len(key)}"
+            )
+        return key
+
+    def state(self, dev_addr: int) -> DeviceSetupState:
+        """The (lazily created) state record of a device."""
+        state = self.device_state.get(dev_addr)
+        if state is None:
+            state = DeviceSetupState(dev_addr=dev_addr)
+            self.device_state[dev_addr] = state
+        return state
+
+    def _queue(self, dev_addrs: Iterable[int], command: MulticastSetupCommand) -> None:
+        for dev_addr in dev_addrs:
+            self._pending[dev_addr].append(command)
+            self.state(dev_addr)
+
+    # ---- Campaign API ----
+
+    def setup_group(
+        self,
+        dev_addrs: Sequence[int],
+        *,
+        group_id: int,
+        mc_addr: int,
+        mc_key: bytes,
+        min_fcnt: int = 0,
+        max_fcnt: int = MAX_FCNT,
+        data_rate: int | None = None,
+        frequency: int | None = None,
+    ) -> ServerMulticastGroup:
+        """Create a multicast group and queue an ``McGroupSetupReq`` per device (§4.3).
+
+        The group's session keys are derived from *mc_key* and *mc_addr* and the
+        group is registered on the network server, so multicast downlinks can be
+        scheduled for it straight away. Each device receives its own copy of the
+        command because ``McKey_encrypted`` is wrapped with that device's
+        ``McKEKey``.
+
+        :returns: The :class:`ServerMulticastGroup` record (also stored in
+            :attr:`groups`).
+        """
+        _check_group_id(group_id)
+        if len(mc_key) != 16:
+            raise ValueError(f"mc_key must be 16 bytes, got {len(mc_key)}")
+
+        material = derive_multicast_key_material(mc_key=mc_key, mc_addr=mc_addr)
+        self.network_server.create_multicast_group(
+            mc_addr,
+            material.mc_nwk_s_key,
+            material.mc_app_s_key,
+            group_id=group_id,
+            min_fcnt=min_fcnt,
+            max_fcnt=max_fcnt,
+            data_rate=data_rate,
+            frequency=frequency,
+        )
+
+        group = ServerMulticastGroup(
+            group_id=group_id,
+            mc_addr=mc_addr,
+            mc_key=mc_key,
+            mc_app_s_key=material.mc_app_s_key,
+            mc_nwk_s_key=material.mc_nwk_s_key,
+            min_fcnt=min_fcnt,
+            max_fcnt=max_fcnt,
+            data_rate=data_rate,
+            frequency=frequency,
+            members=set(dev_addrs),
+        )
+        self.groups[group_id] = group
+
+        for dev_addr in dev_addrs:
+            self._pending[dev_addr].append(McGroupSetupReq(
+                group_id=group_id,
+                mc_addr=mc_addr,
+                mc_key_encrypted=encrypt_mc_key(
+                    mc_ke_key=self.mc_ke_key(dev_addr), mc_key=mc_key,
+                ),
+                min_fcnt=min_fcnt,
+                max_fcnt=max_fcnt,
+            ))
+            self.state(dev_addr)
+
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  group 0x{mc_addr:08X} "
+            f"(McGroupID={group_id}) created for {len(group.members)} device(s), "
+            f"McFCnt window [{min_fcnt}, {max_fcnt}]"
+        )
+        return group
+
+    def request_status(self, dev_addrs: Sequence[int], mask: int = 0x0F) -> None:
+        """Queue an ``McGroupStatusReq`` with the given ``ReqGroupMask`` (§4.2)."""
+        self._queue(dev_addrs, McGroupStatusReq(req_group_mask=mask))
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  McGroupStatusReq "
+            f"(mask 0x{mask & 0x0F:X}) queued for {len(dev_addrs)} device(s)"
+        )
+
+    def request_package_version(self, dev_addrs: Sequence[int]) -> None:
+        """Queue a ``PackageVersionReq`` (§4.1)."""
+        self._queue(dev_addrs, PackageVersionReq())
+
+    def delete_group(self, dev_addrs: Sequence[int], group_id: int) -> None:
+        """Queue an ``McGroupDeleteReq`` and forget the group's membership (§4.4)."""
+        _check_group_id(group_id)
+        self._queue(dev_addrs, McGroupDeleteReq(group_id=group_id))
+        group = self.groups.get(group_id)
+        if group is not None:
+            group.members.difference_update(dev_addrs)
+            group.session_requested.difference_update(dev_addrs)
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  McGroupDeleteReq for McGroupID="
+            f"{group_id} queued for {len(dev_addrs)} device(s)"
+        )
+
+    def start_class_c_session(
+        self,
+        dev_addrs: Sequence[int],
+        *,
+        group_id: int,
+        session_time: int,
+        session_timeout: int,
+        dl_frequency: int = 0,
+        data_rate: int | None = None,
+    ) -> McClassCSessionReq:
+        """Queue an ``McClassCSessionReq`` for a group (§4.5).
+
+        :param session_time: Start of the session in GPS seconds, i.e. a
+            simulation timestamp.
+        :param session_timeout: The 4-bit ``TimeOut`` exponent; the session lasts
+            at most ``2**session_timeout`` **seconds**.
+        :param dl_frequency: ``DLFreq`` in hertz; 0 leaves the choice to the device.
+        :param data_rate: Downlink data rate index; defaults to the group's own
+            rate, then to the network server's default.
+        """
+        group = self._require_group(group_id)
+        request = McClassCSessionReq(
+            group_id=group_id,
+            session_time=session_time,
+            session_timeout=session_timeout,
+            dl_frequency=dl_frequency if dl_frequency else (group.frequency or 0),
+            data_rate=self._resolve_data_rate(group, data_rate),
+        )
+        self._queue(dev_addrs, request)
+        self._last_session_request_sent[group_id] = request
+        group.session_requested.update(dev_addrs)
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  Class C session on "
+            f"0x{group.mc_addr:08X} (McGroupID={group_id}) at {session_time}s for "
+            f"{request.timeout_seconds}s queued for {len(dev_addrs)} device(s)"
+        )
+        return request
+
+    def start_class_b_session(
+        self,
+        dev_addrs: Sequence[int],
+        *,
+        group_id: int,
+        session_time: int,
+        session_timeout: int,
+        periodicity: int = 4,
+        dl_frequency: int = 0,
+        data_rate: int | None = None,
+    ) -> McClassBSessionReq:
+        """Queue an ``McClassBSessionReq`` for a group (§4.6).
+
+        :param session_time: Start of the session in GPS seconds. TS005 §4.6
+            requires a multiple of 128 (one beacon period); a misaligned value is
+            passed through unchanged so a simulation can exercise the device's
+            handling of it.
+        :param session_timeout: The 4-bit ``TimeOut`` exponent; the session lasts
+            at most ``128 * 2**session_timeout`` seconds.
+        :param periodicity: ``Periodicity`` in the ``PingSlotInfoReq`` encoding,
+            so the group opens ``128 >> periodicity`` ping slots per beacon period.
+        """
+        group = self._require_group(group_id)
+        if session_time % BEACON_INTERVAL != 0:
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP-NS  Class B SessionTime "
+                f"{session_time} is not a multiple of {BEACON_INTERVAL} s (TS005 §4.6)"
+            )
+        request = McClassBSessionReq(
+            group_id=group_id,
+            session_time=session_time,
+            periodicity=periodicity,
+            session_timeout=session_timeout,
+            dl_frequency=dl_frequency if dl_frequency else (group.frequency or 0),
+            data_rate=self._resolve_data_rate(group, data_rate),
+        )
+        self._queue(dev_addrs, request)
+        self._last_session_request_sent[group_id] = request
+        group.session_requested.update(dev_addrs)
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  Class B session on "
+            f"0x{group.mc_addr:08X} (McGroupID={group_id}) at {session_time}s for "
+            f"{request.timeout_seconds}s, {request.ping_nb} ping slot(s) per beacon "
+            f"period, queued for {len(dev_addrs)} device(s)"
+        )
+        return request
+
+    def _require_group(self, group_id: int) -> ServerMulticastGroup:
+        group = self.groups.get(group_id)
+        if group is None:
+            raise KeyError(
+                f"No multicast group set up under McGroupID={group_id}; call "
+                f"setup_group() first"
+            )
+        return group
+
+    def _resolve_data_rate(self, group: ServerMulticastGroup, data_rate: int | None) -> int:
+        if data_rate is not None:
+            return data_rate
+        if group.data_rate is not None:
+            return group.data_rate
+        return self.network_server._default_data_rate
+
+    # ---- Application plumbing ----
+
+    async def get_downlink(self, dev_addr: int) -> bytes | None:
+        """Hand the network server the next FRMPayload for a device.
+
+        Consecutive queued commands are concatenated while they fit in
+        :attr:`max_downlink_payload` (§3). A single command that cannot fit at
+        all is dropped with a warning rather than blocking the queue forever.
+        """
+        queue = self._pending.get(dev_addr)
+        if not queue:
+            return None
+
+        buf = bytearray()
+        while queue and len(buf) + queue[0].encoded_size <= self.max_downlink_payload:
+            buf.extend(queue.popleft().encode())
+
+        if not buf:
+            dropped = queue.popleft()
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP-NS  dropping "
+                f"{type(dropped).__name__} for 0x{dev_addr:08X}: {dropped.encoded_size} "
+                f"bytes exceeds the {self.max_downlink_payload} byte FRMPayload limit"
+            )
+            return None
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  downlink for 0x{dev_addr:08X}: "
+            f"{len(buf)} bytes, {len(queue)} command(s) still queued"
+        )
+        return bytes(buf)
+
+    async def on_uplink(self, dev_addr: int, payload: bytes) -> None:
+        """Record the answers a device sent back (§4.1 to §4.6)."""
+        commands = parse_uplink_commands(payload)
+        state = self.state(dev_addr)
+
+        for command in commands:
+            self.answers_received += 1
+            self._record_answer(state, command)
+            if self.on_answer is not None:
+                result = self.on_answer(dev_addr, command)
+                if inspect.isawaitable(result):
+                    await result
+
+    def _record_answer(
+        self, state: DeviceSetupState, command: MulticastSetupCommandType,
+    ) -> None:
+        dev_addr = state.dev_addr
+        match command:
+            case PackageVersionAns():
+                state.package_identifier = command.package_identifier
+                state.package_version = command.package_version
+            case McGroupStatusAns():
+                state.last_status = command
+                for entry in command.groups:
+                    state.groups[entry.group_id] = entry.mc_addr
+            case McGroupSetupAns():
+                if command.id_error:
+                    state.setup_errors.add(command.group_id)
+                    state.groups.pop(command.group_id, None)
+                    logger.warning(
+                        f"{sim.current_time():.2f}s  MC-SETUP-NS  0x{dev_addr:08X} "
+                        f"rejected McGroupID={command.group_id} (IDerror)"
+                    )
+                else:
+                    state.setup_errors.discard(command.group_id)
+                    group = self.groups.get(command.group_id)
+                    state.groups[command.group_id] = (
+                        group.mc_addr if group is not None else 0
+                    )
+                    logger.info(
+                        f"{sim.current_time():.2f}s  MC-SETUP-NS  0x{dev_addr:08X} "
+                        f"joined McGroupID={command.group_id}"
+                    )
+            case McGroupDeleteAns():
+                if command.mc_group_undefined:
+                    state.delete_errors.add(command.group_id)
+                else:
+                    state.delete_errors.discard(command.group_id)
+                    state.groups.pop(command.group_id, None)
+            case McClassCSessionAns() | McClassBSessionAns():
+                self._record_session_answer(state, command)
+            case _:
+                logger.warning(
+                    f"{sim.current_time():.2f}s  MC-SETUP-NS  ignoring unexpected "
+                    f"{type(command).__name__} from 0x{dev_addr:08X}"
+                )
+
+    def _record_session_answer(self, state: DeviceSetupState, answer: _SessionAns) -> None:
+        state.session_answers.append(answer)
+        if isinstance(answer, McClassCSessionAns):
+            state.class_c_answers[answer.group_id] = answer
+        else:
+            assert isinstance(answer, McClassBSessionAns)
+            state.class_b_answers[answer.group_id] = answer
+
+        if answer.has_error:
+            logger.warning(
+                f"{sim.current_time():.2f}s  MC-SETUP-NS  0x{state.dev_addr:08X} refused "
+                f"the session on McGroupID={answer.group_id} "
+                f"(status 0x{answer.status_byte:02X})"
+            )
+            state.time_to_start.pop(answer.group_id, None)
+            return
+
+        assert answer.time_to_start is not None
+        state.time_to_start[answer.group_id] = answer.time_to_start
+
+        # The server timestamps the uplink, so comparing its own view of the interval with
+        # the device's TimeToStart exposes a drifting device clock (§4.5).
+        request = self._last_session_request(answer.group_id)
+        if request is not None:
+            expected = request.session_time - self._time_provider()
+            state.clock_offset[answer.group_id] = answer.time_to_start - expected
+
+        logger.info(
+            f"{sim.current_time():.2f}s  MC-SETUP-NS  0x{state.dev_addr:08X} accepted the "
+            f"session on McGroupID={answer.group_id}, TimeToStart="
+            f"{answer.time_to_start}s"
+        )
+
+    def _last_session_request(
+        self, group_id: int,
+    ) -> McClassCSessionReq | McClassBSessionReq | None:
+        """The most recent session request this package queued for a group."""
+        return self._last_session_request_sent.get(group_id)
+
+    # ---- Progress helpers for orchestrators ----
+
+    def all_devices_acked_group(self, group_id: int) -> bool:
+        """Whether every device the group was set up for acknowledged it (§4.3)."""
+        group = self.groups.get(group_id)
+        if group is None or not group.members:
+            return False
+        return all(
+            group_id in self.state(dev_addr).groups for dev_addr in group.members
+        )
+
+    def devices_in_session(self, group_id: int) -> set[int]:
+        """Devices that accepted the latest session request for a group (§4.5/§4.6).
+
+        A device is counted once it has answered without any error bit set, which
+        is exactly the condition under which it will switch class at
+        ``SessionTime``.
+        """
+        group = self.groups.get(group_id)
+        if group is None:
+            return set()
+        in_session: set[int] = set()
+        for dev_addr in group.session_requested:
+            answer = self.state(dev_addr).last_session_answer(group_id)
+            if answer is not None and not answer.has_error:
+                in_session.add(dev_addr)
+        return in_session
+
+    def pending_devices(self, dev_addrs: Iterable[int] | None = None) -> set[int]:
+        """Devices that still have TS005 commands waiting to go out.
+
+        :param dev_addrs: Restrict the answer to these devices; by default every
+            device the package has ever queued something for is considered.
+        """
+        candidates = self._pending.keys() if dev_addrs is None else dev_addrs
+        return {dev_addr for dev_addr in candidates if self._pending.get(dev_addr)}
+
+    def pending_commands(self, dev_addr: int) -> list[MulticastSetupCommand]:
+        """A read-only snapshot of a device's queued commands, in send order."""
+        return list(self._pending.get(dev_addr, ()))
