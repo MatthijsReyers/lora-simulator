@@ -8,7 +8,7 @@ from simulator.lora.packet import LoraPacket
 from simulator.lorawan.beacon import encode_beacon, compute_ping_slot_times
 from simulator.lorawan.network_server import NetworkServer
 from simulator.lorawan.region import (
-    EU868_DATA_RATES,
+    EU868_DATA_RATES, RECEIVE_DELAY1,
     BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
 )
 
@@ -75,6 +75,9 @@ class LoRaWanGateway:
                 return
 
             assert isinstance(result, LoraPacket)
+            # The radio hands the frame over as soon as its last symbol lands, so this is
+            # effectively the end of the uplink (bar a few ticks of processing delay).
+            uplink_end = sim.current_time()
             raw_uplink = result.payload
             self.frames_forwarded += 1
 
@@ -86,10 +89,10 @@ class LoRaWanGateway:
             downlink_raw = await self.network_server.handle_uplink(raw_uplink)
 
             if downlink_raw is not None:
-                # Transmit downlink in RX1 window
-                # The device expects the downlink RECEIVE_DELAY1 after its TX ended.
-                # By now, some processing time has passed. We transmit immediately —
-                # the device's RX window should still be open.
+                # Transmit the downlink in the device's RX1 window, which opens exactly
+                # RECEIVE_DELAY1 after the uplink ended. Sending it any earlier only reaches
+                # devices that (incorrectly) leave their receiver on between windows.
+                await sim.sleep_until(uplink_end + RECEIVE_DELAY1)
                 logger.debug(
                     f"{sim.current_time():.2f}s  GW  sending downlink ({len(downlink_raw)} bytes)"
                 )

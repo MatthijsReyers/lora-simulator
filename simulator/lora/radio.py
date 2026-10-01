@@ -58,6 +58,10 @@ class LoraRadio(ABC):
 
     _tx_config: LoraConfig
     _tx_power: int = 14  # in dBm
+
+    # Simulation time at which the last transmission's final symbol left the antenna, None until
+    # the radio has transmitted anything.
+    _tx_end_time: float|None = None
     # __tx_freq_hop_enable: bool = False
     # __tx_freq_hop_period: int = 0
     # __tx_timeout: int = 3_000  # in milliseconds
@@ -151,6 +155,18 @@ class LoraRadio(ABC):
     @property
     def tx_power(self) -> int:
         return self._tx_power
+
+    @property
+    def tx_end_time(self) -> float|None:
+        """
+            Simulation time at which the last transmission's final symbol left the antenna, or
+            None if the radio has not transmitted yet.
+
+            Upper layers need this to time their receive windows: `transmit_data_blocking` only
+            returns once the radio has also finished its (time consuming) transition out of TX,
+            which is a little after the air time itself ended.
+        """
+        return self._tx_end_time
 
     @property
     def tx_frequency(self) -> int:
@@ -328,7 +344,8 @@ class LoraRadio(ABC):
             if metadata: 
                 return (packet, meta)
             return packet
-        except asyncio.QueueEmpty:
+        except asyncio.TimeoutError:
+            # An empty queue times out immediately, it does not raise QueueEmpty.
             return None
 
 
@@ -463,6 +480,10 @@ class LoraRadio(ABC):
 
         phy_layer = LoraPhyLayer()
         airtime = await phy_layer.transmit_packet_blocking(self, packet)
+
+        # Record the end of the air time before transitioning out of TX, the transition itself
+        # costs simulation time that upper layers must not count towards their receive windows.
+        self._tx_end_time = sim.current_time()
 
         if self._rx_continuous:
             self._set_state(RadioState.RX)

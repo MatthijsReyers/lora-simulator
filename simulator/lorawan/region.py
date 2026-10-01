@@ -54,6 +54,12 @@ RECEIVE_DELAY2 = 2   # RX2 opens 2 seconds after TX end (RECEIVE_DELAY1 + 1)
 # as the minimum, but in practice a fixed value works for simulation.
 RX_WINDOW_DURATION = 0.5
 
+# How early a device starts listening before a receive window's nominal opening time (seconds).
+# A device that only starts listening at the nominal time would miss a downlink that is exactly
+# on time, because the radio still needs to come out of sleep. Real devices also use this margin
+# to absorb clock drift between themselves and the network.
+RX_WINDOW_GUARD = 0.005
+
 # Join-accept delays
 JOIN_ACCEPT_DELAY1 = 5  # seconds
 JOIN_ACCEPT_DELAY2 = 6  # seconds

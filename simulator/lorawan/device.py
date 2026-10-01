@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from simulator.environment import simulation_env as sim
 from simulator.lora.client_radio import LoraClientRadio
+from simulator.lora.enums.radio_state import RadioState
 from simulator.lora.packet import LoraPacket
 from simulator.lorawan.application import Application
 from simulator.lorawan.enums.frame_types import MType
@@ -26,7 +27,8 @@ from simulator.lorawan.mac_commands import (
 )
 from simulator.lorawan.beacon import decode_beacon, compute_ping_slot_times
 from simulator.lorawan.region import (
-    EU868_DATA_RATES, RECEIVE_DELAY1, RECEIVE_DELAY2, MAX_FCNT,
+    EU868_DATA_RATES, RECEIVE_DELAY1, RECEIVE_DELAY2, RX_WINDOW_DURATION,
+    RX_WINDOW_GUARD, MAX_FCNT,
     JOIN_ACCEPT_DELAY1, JOIN_ACCEPT_DELAY2,
     BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
     PING_SLOT_LEN, CLASS_B_DEFAULT_PING_NB, MAX_BEACON_LESS_PERIOD,
@@ -135,6 +137,8 @@ class LoRaWanDevice:
         """
         old_mode = self.operating_mode
         self.operating_mode = mode
+        # Whether the receiver stays on between windows depends on the mode.
+        self._configure_radio()
         logger.debug(
             f"{sim.current_time():.2f}s  DEVICE  mode {old_mode.value} -> {mode.value}"
         )
@@ -152,11 +156,15 @@ class LoRaWanDevice:
             await self._start_class_c_rx()
 
     def _configure_radio(self) -> None:
-        """Configure the radio for the current data rate."""
+        """Configure the radio for the current data rate and operating mode."""
         dr = EU868_DATA_RATES[self.data_rate]
         self.radio.set_rx_config(
             spreading_factor=dr.spreading_factor.value,
             bandwidth=dr.bandwidth.to_khz(),
+            # Only Class C devices keep their receiver running between windows. Class A and
+            # Class B open short single shot windows instead, so their radio has to drop back
+            # out of RX on its own once a packet arrives or a transmission finishes.
+            rx_continuous=self.operating_mode == OperatingMode.CLASS_C,
         )
         self.radio.set_tx_config(
             power=self.tx_power,
@@ -186,33 +194,29 @@ class LoRaWanDevice:
 
         await self.radio.transmit_data_blocking(raw)
 
+        tx_end = self.radio.tx_end_time
+        assert tx_end is not None, "Join accept windows opened without a JoinRequest"
+        await self.radio.off()
+
         # RX1 window at JOIN_ACCEPT_DELAY1
-        await sim.sleep(JOIN_ACCEPT_DELAY1)
-        try:
-            result = await self.radio.receive_data_within(0.5)
-            assert isinstance(result, LoraPacket)
+        result = await self._rx_window(tx_end + JOIN_ACCEPT_DELAY1, RX_WINDOW_DURATION)
+        if result is not None:
             join_result = process_join_accept(
                 result.payload, self._otaa_credentials, dev_nonce,
             )
             if join_result is not None:
                 self._activate_from_join(join_result)
                 return True
-        except TimeoutError:
-            pass
 
         # RX2 window at JOIN_ACCEPT_DELAY2
-        await sim.sleep(JOIN_ACCEPT_DELAY2 - JOIN_ACCEPT_DELAY1 - 0.5)
-        try:
-            result = await self.radio.receive_data_within(0.5)
-            assert isinstance(result, LoraPacket)
+        result = await self._rx_window(tx_end + JOIN_ACCEPT_DELAY2, RX_WINDOW_DURATION)
+        if result is not None:
             join_result = process_join_accept(
                 result.payload, self._otaa_credentials, dev_nonce,
             )
             if join_result is not None:
                 self._activate_from_join(join_result)
                 return True
-        except TimeoutError:
-            pass
 
         logger.warning(
             f"{sim.current_time():.2f}s  DEVICE  Join failed (no JoinAccept received)"
@@ -310,27 +314,70 @@ class LoRaWanDevice:
             return await self._class_c_rx_windows()
         return False
 
-    async def _class_a_rx_windows(self) -> bool:
-        """Class A: two short RX windows after uplink."""
-        # RX1
-        await sim.sleep(RECEIVE_DELAY1)
-        try:
-            result = await self.radio.receive_data_within(0.5)
-            assert isinstance(result, LoraPacket)
-            await self._process_downlink(result.payload)
-            return True
-        except TimeoutError:
-            pass
+    async def _rx_window(self, open_at: float, duration: float) -> LoraPacket | None:
+        """
+            Sleep until a receive window, hold it open, and power the radio back down after.
 
-        # RX2
-        await sim.sleep(RECEIVE_DELAY2 - RECEIVE_DELAY1 - 0.5)
+            The radio is only ever in RX for the duration of the window itself. A Class A or
+            Class B device has no reason to keep its receiver powered outside of its windows, and
+            leaving it on is what used to make these devices draw continuous RX power for the
+            whole simulation.
+
+            :param open_at: Simulation timestamp at which the radio should be listening.
+            :param duration: In seconds, how long to keep the window open.
+            :returns: The received packet, or None when the window closed empty.
+        """
+        # Wake up the radio slightly before the window opens, to account for startup time and
+        # clock drift.
+        wake_at = open_at - RX_WINDOW_GUARD - self.radio.power_profile.standby_startup_time()
+        if wake_at > sim.current_time():
+            await sim.sleep_until(wake_at)
+        await self.radio.standby()
+
         try:
-            result = await self.radio.receive_data_within(0.5)
+            try:
+                result = await self.radio.receive_data_within(duration + RX_WINDOW_GUARD)
+            except TimeoutError:
+                # The window only bounds how long the device waits for a preamble to show up.
+                # Once it has locked onto one it keeps the receiver on until the frame is over,
+                # so a downlink that starts just before the window closes still gets received.
+                if not self.radio.carrier_sense_instant():
+                    return None
+                await self.radio.wait_for_channel_idle()
+                result = await self.radio.receive_data_nowait()
+                if result is None:
+                    return None
             assert isinstance(result, LoraPacket)
+            return result
+        finally:
+            if self.radio.get_state() != RadioState.TX:
+                await self.radio.off()
+
+    async def _class_a_rx_windows(self) -> bool:
+        """
+            Class A: two short RX windows after an uplink, radio asleep in between.
+
+            Outside of the two windows the radio goes back to its lowest power state, which is
+            what gives a Class A device its characteristic burst shaped power trace.
+        """
+        # Both windows are timed from the end of the uplink's air time, not from where we are
+        # now: the radio also spends time transitioning out of TX before handing control back.
+        tx_end = self.radio.tx_end_time
+        assert tx_end is not None, "Receive windows opened without a preceding transmission"
+
+        # The transmitter drops into standby when the uplink finishes, from where the radio can
+        # go all the way back to sleep until RX1 opens.
+        await self.radio.off()
+
+        result = await self._rx_window(tx_end + RECEIVE_DELAY1, RX_WINDOW_DURATION)
+        if result is not None:
             await self._process_downlink(result.payload)
             return True
-        except TimeoutError:
-            pass
+
+        result = await self._rx_window(tx_end + RECEIVE_DELAY2, RX_WINDOW_DURATION)
+        if result is not None:
+            await self._process_downlink(result.payload)
+            return True
 
         return False
 
@@ -340,10 +387,10 @@ class LoRaWanDevice:
         The background Class C RX task handles unsolicited downlinks between
         uplinks. This method only handles the RX1 window after a TX.
         """
-        # RX1 window (same as Class A)
+        # RX1 window (same as Class A, except the receiver never powers down)
         await sim.sleep(RECEIVE_DELAY1)
         try:
-            result = await self.radio.receive_data_within(0.5)
+            result = await self.radio.receive_data_within(RX_WINDOW_DURATION)
             assert isinstance(result, LoraPacket)
             await self._process_downlink(result.payload)
             return True
@@ -604,7 +651,6 @@ class LoRaWanDevice:
         reverts to Class A (beacon sync lost).
         """
         missed_beacons = 0
-        await self.radio.receive(continuous=True)
 
         while sim.is_running() and not self._class_b_stop.is_set():
             # If we have timing info, sleep until just before the expected
@@ -619,11 +665,14 @@ class LoRaWanDevice:
                     await sim.sleep_until(wake_at)
 
             try:
-                await self.radio.receive(continuous=True)
-                result = await self.radio.receive_data_within(
-                    BEACON_RESERVED + 2.0
+                # A beacon window is a single shot window like any other: `receive(continuous=
+                # True)` would latch the radio into Class C style continuous RX and leave it
+                # there for the rest of the simulation.
+                result = await self._rx_window(
+                    sim.current_time(), BEACON_RESERVED + 2.0
                 )
-                assert isinstance(result, LoraPacket)
+                if result is None:
+                    raise TimeoutError
                 beacon_time = decode_beacon(result.payload)
                 if beacon_time is None:
                     continue  # Not a beacon frame; keep listening
@@ -682,16 +731,14 @@ class LoRaWanDevice:
             if slot_time <= sim.current_time():
                 continue  # Already past this slot
 
-            await sim.sleep_until(slot_time)
-
             try:
-                result = await self.radio.receive_data_within(PING_SLOT_LEN)
-                assert isinstance(result, LoraPacket)
+                result = await self._rx_window(slot_time, PING_SLOT_LEN)
+                if result is None:
+                    continue  # Nothing in this slot
                 # Ignore beacon frames that leak into ping slot windows
                 if decode_beacon(result.payload) is not None:
                     continue
                 await self._process_downlink(result.payload)
-            except (TimeoutError, RuntimeError):
-                # TimeoutError: no data in this slot
-                # RuntimeError: radio busy (e.g., concurrent uplink TX)
+            except RuntimeError:
+                # Radio busy (e.g., concurrent uplink TX)
                 pass
