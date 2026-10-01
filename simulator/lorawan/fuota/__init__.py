@@ -17,8 +17,30 @@ from simulator.lorawan.fuota.crypto import (
     derive_multicast_key_material,
     encrypt_mc_key,
 )
+from simulator.lorawan.fuota.fragmentation import (
+    MAX_NB_FRAG,
+    FragmentationDecoder,
+    FragmentationEncoder,
+    encode_data_block,
+    fragment_indices_for_coded,
+    is_power_of_two,
+    matrix_line,
+    matrix_line_bits,
+    prbs23,
+    required_memory_bytes,
+)
 
 __all__ = [
+    "MAX_NB_FRAG",
+    "FragmentationDecoder",
+    "FragmentationEncoder",
+    "encode_data_block",
+    "fragment_indices_for_coded",
+    "is_power_of_two",
+    "matrix_line",
+    "matrix_line_bits",
+    "prbs23",
+    "required_memory_bytes",
     "MulticastKeyMaterial",
     "compute_data_block_mic",
     "decrypt_mc_key",
