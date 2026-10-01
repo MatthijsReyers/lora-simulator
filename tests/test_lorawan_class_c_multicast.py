@@ -86,6 +86,24 @@ class TestMulticastGroup:
         assert group.nwk_s_key == MC_NWK_KEY
         assert group.app_s_key == MC_APP_KEY
 
+    def test_ts005_fields_default_to_a_wide_open_group(self):
+        group = MulticastGroup(
+            group_addr=MC_ADDR, nwk_s_key=MC_NWK_KEY, app_s_key=MC_APP_KEY,
+        )
+        assert group.group_id == 0
+        assert group.min_fcnt == 0
+        assert group.max_fcnt == 0xFFFFFFFF
+        assert group.data_rate is None
+        assert group.frequency is None
+
+    def test_invalid_group_id_rejected(self):
+        with pytest.raises(AssertionError):
+            MulticastGroup(MC_ADDR, MC_NWK_KEY, MC_APP_KEY, group_id=4)
+
+    def test_inverted_counter_window_rejected(self):
+        with pytest.raises(AssertionError):
+            MulticastGroup(MC_ADDR, MC_NWK_KEY, MC_APP_KEY, min_fcnt=10, max_fcnt=5)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Mode switching
@@ -159,6 +177,16 @@ class TestDeviceMulticast:
         device.join_multicast_group(group)
         device.leave_multicast_group(MC_ADDR)
         assert MC_ADDR not in device._multicast_groups
+
+    def test_join_returns_true_and_get_multicast_group_finds_it(self):
+        session = DeviceSession(dev_addr=DEV_ADDR, nwk_s_key=NWK_S_KEY, app_s_key=APP_S_KEY)
+        device = LoRaWanDevice(session=session)
+        group = MulticastGroup(
+            group_addr=MC_ADDR, nwk_s_key=MC_NWK_KEY, app_s_key=MC_APP_KEY, group_id=1,
+        )
+        assert device.join_multicast_group(group) is True
+        assert device.get_multicast_group(MC_ADDR) is group
+        assert device.get_multicast_group_by_id(1) is group
 
     def test_leave_nonexistent_group_no_error(self):
         session = DeviceSession(dev_addr=DEV_ADDR, nwk_s_key=NWK_S_KEY, app_s_key=APP_S_KEY)
@@ -279,6 +307,23 @@ class TestNetworkServerMulticast:
         assert record.group_addr == MC_ADDR
         assert record.fcnt_down == 0
         assert MC_ADDR in ns._multicast_groups
+
+    def test_create_multicast_group_with_ts005_parameters(self):
+        ns = NetworkServer()
+        record = ns.create_multicast_group(
+            MC_ADDR, MC_NWK_KEY, MC_APP_KEY,
+            group_id=2, min_fcnt=100, max_fcnt=200,
+            data_rate=3, frequency=869_525_000,
+        )
+        assert record.group_id == 2
+        assert record.min_fcnt == 100
+        assert record.max_fcnt == 200
+        # The server starts counting at minMcFCnt.
+        assert record.fcnt_down == 100
+        assert record.data_rate == 3
+        assert record.frequency == 869_525_000
+        assert ns.get_multicast_group(MC_ADDR) is record
+        assert ns.get_multicast_group(0xDEADBEEF) is None
 
     def test_build_multicast_downlink_valid(self):
         ns = NetworkServer()

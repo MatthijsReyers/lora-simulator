@@ -24,6 +24,10 @@ DEV_ADDR  = 0x26011234
 NWK_S_KEY = bytes.fromhex("2B7E151628AED2A6ABF7158809CF4F3C")
 APP_S_KEY = bytes.fromhex("3C4F9C098815F7ABA6D2AE281615E72B")
 
+MC_ADDR    = 0xFF000001
+MC_NWK_KEY = bytes.fromhex("AABBCCDD11223344AABBCCDD11223344")
+MC_APP_KEY = bytes.fromhex("11223344AABBCCDD11223344AABBCCDD")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Beacon encoding / decoding
@@ -219,3 +223,39 @@ class TestNetworkServerClassB:
 
         schedule = await ns.get_class_b_downlink_schedule(beacon_time=0)
         assert schedule == []
+
+    @pytest.mark.asyncio
+    async def test_class_b_schedule_merges_unicast_and_multicast(self):
+        """Multicast groups get their own ping slots, computed from the McAddr."""
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        ns.enable_class_b(DEV_ADDR, ping_nb=16)
+        ns.queue_downlink(DEV_ADDR, fport=1, payload=b"\x01")
+
+        ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+        ns.enable_multicast_class_b(MC_ADDR, ping_nb=16)
+        ns.schedule_multicast_downlink(MC_ADDR, fport=1, payload=b"\x02")
+
+        schedule = await ns.get_class_b_downlink_schedule(beacon_time=0)
+
+        assert [slot for (_, _, slot) in schedule] == sorted(
+            slot for (_, _, slot) in schedule
+        )
+        addrs = {addr for (addr, _, _) in schedule}
+        assert addrs == {DEV_ADDR, MC_ADDR}
+
+        unicast_slots = compute_ping_slot_times(0, DEV_ADDR, 16)
+        multicast_slots = compute_ping_slot_times(0, MC_ADDR, 16)
+        for addr, _raw, slot in schedule:
+            assert slot in (unicast_slots if addr == DEV_ADDR else multicast_slots)
+
+    @pytest.mark.asyncio
+    async def test_disable_multicast_class_b(self):
+        ns = NetworkServer()
+        ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
+        ns.enable_multicast_class_b(MC_ADDR, ping_nb=8)
+        assert ns.get_multicast_group(MC_ADDR).class_b_ping_nb == 8  # type: ignore[union-attr]
+
+        ns.disable_multicast_class_b(MC_ADDR)
+        ns.schedule_multicast_downlink(MC_ADDR, fport=1, payload=b"\x02")
+        assert await ns.get_class_b_downlink_schedule(beacon_time=0) == []

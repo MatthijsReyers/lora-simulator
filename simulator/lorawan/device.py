@@ -5,6 +5,7 @@ import random
 from dataclasses import dataclass, field
 
 from simulator.environment import simulation_env as sim
+from simulator.exceptions import SimulatorException
 from simulator.lora.client_radio import LoraClientRadio
 from simulator.lora.enums.radio_state import RadioState
 from simulator.lora.packet import LoraPacket
@@ -28,11 +29,15 @@ from simulator.lorawan.mac_commands import (
 from simulator.lorawan.beacon import decode_beacon, compute_ping_slot_times
 from simulator.lorawan.region import (
     EU868_DATA_RATES, RECEIVE_DELAY1, RECEIVE_DELAY2, RX_WINDOW_DURATION,
-    RX_WINDOW_GUARD, MAX_FCNT,
+    RX_WINDOW_GUARD, MAX_FCNT, max_frm_payload,
     JOIN_ACCEPT_DELAY1, JOIN_ACCEPT_DELAY2,
     BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
     PING_SLOT_LEN, CLASS_B_DEFAULT_PING_NB, MAX_BEACON_LESS_PERIOD,
 )
+
+
+# TS005 §2.1: a device supports at most four multicast contexts, indexed by McGroupID 0..3.
+MAX_MULTICAST_GROUPS = 4
 
 
 logger = logging.getLogger(__name__)
@@ -50,16 +55,88 @@ class DeviceSession:
 
 @dataclass
 class MulticastGroup:
-    """LoRaWAN multicast group session (downlink only).
+    """LoRaWAN multicast group context (downlink only).
 
-    A multicast group uses a shared DevAddr and session keys. All devices in the
-    group can decrypt downlinks addressed to this DevAddr. Multicast groups do not
-    send uplinks — they are used for FUOTA and other broadcast scenarios.
+    A multicast group uses a shared DevAddr (``McAddr``) and shared session keys
+    (``McNwkSKey`` / ``McAppSKey``). All devices in the group can decrypt downlinks
+    addressed to this address. Multicast groups never send uplinks — they are used for
+    FUOTA and other broadcast scenarios.
+
+    Reference: LoRaWAN Remote Multicast Setup TS005-2.0.0 §2.1 (multicast group context)
+    and §2.5 (``McGroupSetupReq``).
+
+    :ivar group_addr: ``McAddr``, the 4-octet multicast network address.
+    :ivar group_id: ``McGroupID``, the device-local index of this context (0–3).
+    :ivar min_fcnt: ``minMcFCnt``, the lowest multicast frame counter the server will use.
+    :ivar max_fcnt: ``maxMcFCnt``, the group's lifetime expressed as a counter ceiling.
+    :ivar fcnt_down: The next multicast frame counter the device will accept. A frame is
+        taken only when ``min_fcnt <= fcnt <= max_fcnt`` *and* ``fcnt >= fcnt_down``, so a
+        device that missed the first K frames still accepts frame K+1 while a replay of an
+        already-accepted counter is dropped.
+    :ivar data_rate: Downlink data rate index to use while a session on this group runs, or
+        None to keep the device's own RX configuration.
+    :ivar frequency: Downlink frequency in hertz to use while a session runs, or None.
     """
     group_addr: int
     nwk_s_key: bytes
     app_s_key: bytes
     fcnt_down: int = 0
+    group_id: int = 0
+    min_fcnt: int = 0
+    max_fcnt: int = MAX_FCNT
+    data_rate: int | None = None
+    frequency: int | None = None
+
+    def __post_init__(self) -> None:
+        assert 0 <= self.group_id < MAX_MULTICAST_GROUPS, (
+            f"McGroupID must be 0-{MAX_MULTICAST_GROUPS - 1}, got {self.group_id}"
+        )
+        assert 0 <= self.min_fcnt <= self.max_fcnt <= MAX_FCNT, (
+            f"Invalid multicast counter window [{self.min_fcnt}, {self.max_fcnt}]"
+        )
+        # A group whose window starts above zero has not accepted anything below minMcFCnt.
+        self.fcnt_down = max(self.fcnt_down, self.min_fcnt)
+
+    def accepts_fcnt(self, fcnt: int) -> bool:
+        """Whether a multicast downlink with this frame counter may be accepted.
+
+        Reference: TS005-2.0.0 §2.5 — the device accepts a frame only while
+        ``minMcFCnt <= McFCnt <= maxMcFCnt``, and never twice.
+        """
+        if not (self.min_fcnt <= fcnt <= self.max_fcnt):
+            return False
+        return fcnt >= self.fcnt_down
+
+    def record_fcnt(self, fcnt: int) -> None:
+        """Remember an accepted frame counter so the same frame is not taken twice."""
+        self.fcnt_down = fcnt + 1
+
+
+@dataclass
+class MulticastSession:
+    """A scheduled or running Class B/C multicast session on the device.
+
+    Reference: TS005-2.0.0 §2.7 (``McClassCSessionReq``) and §2.8 (``McClassBSessionReq``).
+
+    Times are simulation timestamps. ``sim.current_time()`` is the device's GPS time base:
+    the simulator starts at GPS second 0, so a TS005 ``SessionTime`` maps straight onto a
+    simulation timestamp without conversion.
+    """
+    group_addr: int
+    mode: OperatingMode
+    start_time: float
+    end_time: float
+    data_rate: int
+    frequency: int | None = None
+    ping_nb: int | None = None
+    running: bool = False
+    #: Set when a newer session for the same group took over; the superseded session then
+    #: leaves the radio alone instead of reverting it.
+    superseded: bool = False
+
+    @property
+    def timeout_seconds(self) -> float:
+        return self.end_time - self.start_time
 
 
 class LoRaWanDevice:
@@ -85,6 +162,7 @@ class LoRaWanDevice:
         operating_mode: OperatingMode = OperatingMode.CLASS_A,
         otaa_credentials: OTAACredentials | None = None,
         ping_nb: int = CLASS_B_DEFAULT_PING_NB,
+        max_multicast_groups: int = MAX_MULTICAST_GROUPS,
     ):
         assert session is not None or otaa_credentials is not None, (
             "Provide either a session (ABP) or otaa_credentials (OTAA)"
@@ -92,6 +170,11 @@ class LoRaWanDevice:
         self.radio = LoraClientRadio()
         self.session = session
         self.data_rate = data_rate
+        # Downlink RX parameters, kept separate from the uplink data rate so a multicast
+        # session can retune the receiver without disturbing uplinks or RX1 (TS005 §2.7).
+        # None means "follow the uplink data rate / leave the radio on its current channel".
+        self.rx_data_rate: int | None = None
+        self.rx_frequency: int | None = None
         self.tx_power = tx_power
         self.operating_mode = operating_mode
         self.rx1_delay = RECEIVE_DELAY1
@@ -101,6 +184,9 @@ class LoRaWanDevice:
         self._otaa_credentials = otaa_credentials
         self._dev_nonce: int = 0
         self._multicast_groups: dict[int, MulticastGroup] = {}  # group_addr -> group
+        self.max_multicast_groups = max_multicast_groups
+        self._multicast_sessions: dict[int, MulticastSession] = {}  # group_addr -> session
+        self._session_cancels: dict[int, asyncio.Event] = {}  # group_addr -> cancel flag
         self._class_c_running = False
         self._class_c_stop = asyncio.Event()
         # Class B state
@@ -117,17 +203,94 @@ class LoRaWanDevice:
         assert 1 <= port <= 223, f"FPort must be 1-223, got {port}"
         self._applications[port] = app
 
-    def join_multicast_group(self, group: MulticastGroup) -> None:
-        """Join a multicast group to receive group downlinks."""
+    def join_multicast_group(self, group: MulticastGroup) -> bool:
+        """Join a multicast group to receive group downlinks.
+
+        A device holds at most ``max_multicast_groups`` contexts (TS005 §2.1, four by
+        default). Joining a group whose ``group_id`` (``McGroupID``) is already in use
+        *replaces* that context, mirroring a repeated ``McGroupSetupReq`` for the same
+        index; so does re-joining the same ``group_addr``. A join that would need a fifth
+        distinct ``McGroupID`` is refused.
+
+        :returns: True when the group was stored, False when no context was free. (The
+            return value is new; callers that ignore it behave exactly as before.)
+        """
+        existing = self._multicast_groups.get(group.group_addr)
+        if existing is None:
+            # Re-using an McGroupID replaces whatever context was stored under it.
+            by_id = self.get_multicast_group_by_id(group.group_id)
+            if by_id is not None:
+                del self._multicast_groups[by_id.group_addr]
+            elif len(self._multicast_groups) >= self.max_multicast_groups:
+                logger.warning(
+                    f"{sim.current_time():.2f}s  DEVICE  cannot join multicast group "
+                    f"0x{group.group_addr:08X}: all {self.max_multicast_groups} contexts in use"
+                )
+                return False
+
         self._multicast_groups[group.group_addr] = group
         logger.debug(
             f"{sim.current_time():.2f}s  DEVICE  joined multicast group "
-            f"0x{group.group_addr:08X}"
+            f"0x{group.group_addr:08X} (McGroupID={group.group_id})"
         )
+        return True
 
     def leave_multicast_group(self, group_addr: int) -> None:
-        """Leave a multicast group."""
+        """Leave a multicast group and cancel any session scheduled on it."""
+        self.cancel_session(group_addr)
         self._multicast_groups.pop(group_addr, None)
+
+    def get_multicast_group(self, group_addr: int) -> MulticastGroup | None:
+        """Look a multicast context up by its ``McAddr``."""
+        return self._multicast_groups.get(group_addr)
+
+    def get_multicast_group_by_id(self, group_id: int) -> MulticastGroup | None:
+        """Look a multicast context up by its device-local ``McGroupID`` (TS005 §2.1)."""
+        for group in self._multicast_groups.values():
+            if group.group_id == group_id:
+                return group
+        return None
+
+    @property
+    def multicast_groups(self) -> dict[int, MulticastGroup]:
+        """All multicast contexts currently held, keyed by ``McAddr``."""
+        return dict(self._multicast_groups)
+
+    # ---- Downlink RX configuration ----
+
+    def set_rx_config(self, data_rate: int | None, frequency: int | None = None) -> None:
+        """Override the downlink RX parameters used outside Class A RX1/RX2.
+
+        Class C continuous RX and Class B ping slots listen with these parameters; uplinks
+        and the Class A RX1 window keep using the device's own ``data_rate``, as required by
+        TS005 §2.7 ("except during Class A RX1 and RX2 slots").
+
+        :param data_rate: EU868 data rate index, or None to fall back to the uplink rate.
+        :param frequency: Carrier frequency in hertz, or None to leave the radio tuned where
+            it is.
+        """
+        assert data_rate is None or data_rate in EU868_DATA_RATES, (
+            f"Unknown data rate DR{data_rate}"
+        )
+        self.rx_data_rate = data_rate
+        self.rx_frequency = frequency
+        self._configure_radio()
+
+    def clear_rx_config(self) -> None:
+        """Drop any downlink RX override and go back to the device's own parameters."""
+        self.set_rx_config(None, None)
+
+    def _apply_uplink_rx_config(self) -> None:
+        """Temporarily tune the receiver to the unicast parameters (RX1/RX2)."""
+        dr = EU868_DATA_RATES[self.data_rate]
+        self.radio.set_rx_config(
+            spreading_factor=dr.spreading_factor.value,
+            bandwidth=dr.bandwidth.to_khz(),
+            rx_continuous=self.operating_mode == OperatingMode.CLASS_C,
+            # RX1/RX2 live on the channel the uplink went out on, which is the one the
+            # transmitter is tuned to.
+            frequency=self.radio.tx_frequency,
+        )
 
     async def switch_mode(self, mode: OperatingMode) -> None:
         """Switch operating mode at runtime.
@@ -156,16 +319,25 @@ class LoRaWanDevice:
             await self._start_class_c_rx()
 
     def _configure_radio(self) -> None:
-        """Configure the radio for the current data rate and operating mode."""
-        dr = EU868_DATA_RATES[self.data_rate]
+        """Configure the radio for the current data rate and operating mode.
+
+        The transmitter always follows the device's own ``data_rate``. The receiver follows
+        ``rx_data_rate`` / ``rx_frequency`` when those overrides are set (a running multicast
+        session), and the uplink data rate otherwise.
+        """
+        rx_dr = EU868_DATA_RATES[
+            self.rx_data_rate if self.rx_data_rate is not None else self.data_rate
+        ]
         self.radio.set_rx_config(
-            spreading_factor=dr.spreading_factor.value,
-            bandwidth=dr.bandwidth.to_khz(),
+            spreading_factor=rx_dr.spreading_factor.value,
+            bandwidth=rx_dr.bandwidth.to_khz(),
             # Only Class C devices keep their receiver running between windows. Class A and
             # Class B open short single shot windows instead, so their radio has to drop back
             # out of RX on its own once a packet arrives or a transmission finishes.
             rx_continuous=self.operating_mode == OperatingMode.CLASS_C,
+            frequency=self.rx_frequency,
         )
+        dr = EU868_DATA_RATES[self.data_rate]
         self.radio.set_tx_config(
             power=self.tx_power,
             spreading_factor=dr.spreading_factor.value,
@@ -253,6 +425,16 @@ class LoRaWanDevice:
         assert self.session is not None, "Device not activated (call join() or provide session)"
         assert self.session.fcnt_up <= MAX_FCNT, "Frame counter overflow"
 
+        # MAC answers ride along in FOpts and eat into the room left for the application
+        # payload, so they have to be drained before the size can be checked.
+        fopts = self._drain_mac_answers()
+        limit = max_frm_payload(self.data_rate, len(fopts))
+        if len(payload) > limit:
+            raise ValueError(
+                f"Payload of {len(payload)} bytes exceeds the {limit} byte FRMPayload limit "
+                f"at DR{self.data_rate} with {len(fopts)} FOpts bytes"
+            )
+
         # Encrypt FRMPayload
         encrypted = encrypt_frm_payload(
             self.session.app_s_key,
@@ -264,7 +446,6 @@ class LoRaWanDevice:
 
         # Build the frame
         mtype = MType.CONFIRMED_DATA_UP if confirmed else MType.UNCONFIRMED_DATA_UP
-        fopts = self._drain_mac_answers()
         fhdr = FHDR(
             dev_addr=self.session.dev_addr,
             fctrl=FCtrl(class_b=self.operating_mode == OperatingMode.CLASS_B),
@@ -369,17 +550,26 @@ class LoRaWanDevice:
         # go all the way back to sleep until RX1 opens.
         await self.radio.off()
 
-        result = await self._rx_window(tx_end + RECEIVE_DELAY1, RX_WINDOW_DURATION)
-        if result is not None:
-            await self._process_downlink(result.payload)
-            return True
+        # TS005 §2.7: a running multicast session must not disturb the Class A windows, those
+        # keep listening with the unicast parameters.
+        restore = self._rx_override_active()
+        if restore:
+            self._apply_uplink_rx_config()
+        try:
+            result = await self._rx_window(tx_end + RECEIVE_DELAY1, RX_WINDOW_DURATION)
+            if result is not None:
+                await self._process_downlink(result.payload)
+                return True
 
-        result = await self._rx_window(tx_end + RECEIVE_DELAY2, RX_WINDOW_DURATION)
-        if result is not None:
-            await self._process_downlink(result.payload)
-            return True
+            result = await self._rx_window(tx_end + RECEIVE_DELAY2, RX_WINDOW_DURATION)
+            if result is not None:
+                await self._process_downlink(result.payload)
+                return True
 
-        return False
+            return False
+        finally:
+            if restore:
+                self._configure_radio()
 
     async def _class_c_rx_windows(self) -> bool:
         """Class C: RX1 window after uplink, then resume continuous RX2.
@@ -387,19 +577,31 @@ class LoRaWanDevice:
         The background Class C RX task handles unsolicited downlinks between
         uplinks. This method only handles the RX1 window after a TX.
         """
-        # RX1 window (same as Class A, except the receiver never powers down)
-        await sim.sleep(RECEIVE_DELAY1)
+        # RX1 window (same as Class A, except the receiver never powers down). A multicast
+        # session's parameters are suspended for the window (TS005 §2.7).
+        restore = self._rx_override_active()
+        if restore:
+            self._apply_uplink_rx_config()
         try:
-            result = await self.radio.receive_data_within(RX_WINDOW_DURATION)
-            assert isinstance(result, LoraPacket)
-            await self._process_downlink(result.payload)
-            return True
-        except TimeoutError:
-            pass
+            await sim.sleep(RECEIVE_DELAY1)
+            try:
+                result = await self.radio.receive_data_within(RX_WINDOW_DURATION)
+                assert isinstance(result, LoraPacket)
+                await self._process_downlink(result.payload)
+                return True
+            except TimeoutError:
+                pass
+        finally:
+            if restore:
+                self._configure_radio()
 
         # Resume continuous RX2 — the background _class_c_rx_loop picks up from here
         await self.radio.receive(continuous=True)
         return False
+
+    def _rx_override_active(self) -> bool:
+        """Whether a downlink RX override (from a multicast session) is in effect."""
+        return self.rx_data_rate is not None or self.rx_frequency is not None
 
     async def _start_class_c_rx(self) -> None:
         """Start the Class C continuous RX background task."""
@@ -447,6 +649,15 @@ class LoRaWanDevice:
         # Resolve keys: unicast session or multicast group
         mc_group = self._multicast_groups.get(dev_addr)
         if mc_group is not None:
+            # TS005 §2.5: a multicast frame is only taken while it sits inside the group's
+            # [minMcFCnt, maxMcFCnt] window and has not been accepted before.
+            if not mc_group.accepts_fcnt(mac.fhdr.fcnt):
+                logger.debug(
+                    f"{sim.current_time():.2f}s  DEVICE  multicast frame dropped, FCnt="
+                    f"{mac.fhdr.fcnt} outside [{mc_group.fcnt_down}, {mc_group.max_fcnt}] "
+                    f"for group 0x{dev_addr:08X}"
+                )
+                return
             nwk_s_key = mc_group.nwk_s_key
             app_s_key = mc_group.app_s_key
             is_multicast = True
@@ -477,8 +688,7 @@ class LoRaWanDevice:
         # Update downlink frame counter
         if is_multicast:
             assert mc_group is not None
-            if mac.fhdr.fcnt >= mc_group.fcnt_down:
-                mc_group.fcnt_down = mac.fhdr.fcnt + 1
+            mc_group.record_fcnt(mac.fhdr.fcnt)
         else:
             assert self.session is not None
             if mac.fhdr.fcnt >= self.session.fcnt_down:
@@ -619,6 +829,228 @@ class LoRaWanDevice:
             encoded = encoded[:15]
         return encoded
 
+    # ---- Timed multicast sessions (TS005 §2.7 / §2.8) ----
+
+    async def start_class_c_session(
+        self,
+        group_addr: int,
+        *,
+        start_time: float,
+        timeout_seconds: float,
+        data_rate: int,
+        frequency: int | None = None,
+    ) -> None:
+        """Schedule a Class C multicast session on a joined group.
+
+        A background task sleeps until *start_time*, applies the session's RX parameters,
+        switches the device to Class C, and reverts to the previous operating mode and RX
+        configuration ``timeout_seconds`` later. Scheduling a session for a group that
+        already has one replaces (and cancels) the previous one, per the "replace" reading
+        of TS005 §2.7.
+
+        Time base: *start_time* is a simulation timestamp. ``sim.current_time()`` is the
+        device's GPS clock, so a TS005 ``SessionTime`` is used directly.
+
+        Reference: TS005-2.0.0 §2.7 — session runs from ``SessionTime`` to
+        ``SessionTime + 2^TimeOut``.
+
+        :param group_addr: ``McAddr`` of a group the device has joined.
+        :param start_time: Absolute simulation time at which the session opens.
+        :param timeout_seconds: Maximum session length; the device reverts at
+            ``start_time + timeout_seconds``.
+        :param data_rate: Downlink data rate index used for the session.
+        :param frequency: Downlink frequency in hertz, or None to stay on the current
+            channel.
+        """
+        await self._start_session(MulticastSession(
+            group_addr=group_addr,
+            mode=OperatingMode.CLASS_C,
+            start_time=start_time,
+            end_time=start_time + timeout_seconds,
+            data_rate=data_rate,
+            frequency=frequency,
+        ))
+
+    async def start_class_b_session(
+        self,
+        group_addr: int,
+        *,
+        start_time: float,
+        timeout_seconds: float,
+        data_rate: int,
+        frequency: int | None = None,
+        ping_periodicity: int = 4,
+    ) -> None:
+        """Schedule a Class B multicast session on a joined group.
+
+        The device switches to Class B (beacon loop) for the duration of the session and
+        additionally opens the group's ping slots, computed from the *multicast* address.
+
+        Reference: TS005-2.0.0 §2.8 — ``Periodicity`` uses the ``PingSlotInfoReq`` encoding,
+        so the group opens ``128 / 2**ping_periodicity`` slots per beacon period.
+
+        :param ping_periodicity: ``Periodicity`` field, 0–7. 0 means 128 ping slots per
+            beacon period, 7 means one.
+        """
+        assert 0 <= ping_periodicity <= 7, "Periodicity must be 0-7 (TS005 §2.8)"
+        await self._start_session(MulticastSession(
+            group_addr=group_addr,
+            mode=OperatingMode.CLASS_B,
+            start_time=start_time,
+            end_time=start_time + timeout_seconds,
+            data_rate=data_rate,
+            frequency=frequency,
+            ping_nb=128 >> ping_periodicity,
+        ))
+
+    async def _start_session(self, session: MulticastSession) -> None:
+        """Register a session, replacing any previous one for the same group, and run it."""
+        assert session.group_addr in self._multicast_groups, (
+            f"No multicast group 0x{session.group_addr:08X} on this device"
+        )
+        self.cancel_session(session.group_addr, superseded=True)
+
+        cancel = asyncio.Event()
+        self._session_cancels[session.group_addr] = cancel
+        self._multicast_sessions[session.group_addr] = session
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  DEVICE  Class {session.mode.value} multicast session "
+            f"scheduled for 0x{session.group_addr:08X} at {session.start_time:.2f}s "
+            f"(timeout {session.timeout_seconds:.2f}s, DR{session.data_rate})"
+        )
+
+        await sim.start_child_task(self._run_session(session, cancel))
+
+    def cancel_session(self, group_addr: int, superseded: bool = False) -> bool:
+        """Cancel a scheduled or running multicast session.
+
+        The session's task wakes up immediately and, unless it is being replaced by a newer
+        session, restores the operating mode and RX configuration it had applied. Reverting
+        needs to await the mode switch, so the device leaves the session a tick or so after
+        this call returns.
+
+        :param superseded: Internal. True when a newer session for the same group is taking
+            over, in which case the cancelled session leaves the radio untouched.
+        :returns: True when a session was cancelled, False when there was none.
+        """
+        cancel = self._session_cancels.pop(group_addr, None)
+        session = self._multicast_sessions.pop(group_addr, None)
+        if cancel is None and session is None:
+            return False
+        if session is not None:
+            session.superseded = superseded
+        if cancel is not None:
+            cancel.set()
+        logger.debug(
+            f"{sim.current_time():.2f}s  DEVICE  multicast session on 0x{group_addr:08X} "
+            f"cancelled"
+        )
+        return True
+
+    def active_session(self, group_addr: int | None = None) -> MulticastSession | None:
+        """The scheduled or running session for a group, or any running session.
+
+        :param group_addr: When given, the session registered for that group (whether it has
+            started or is still waiting for its start time). When omitted, the first session
+            that is currently running.
+        """
+        if group_addr is not None:
+            return self._multicast_sessions.get(group_addr)
+        for session in self._multicast_sessions.values():
+            if session.running:
+                return session
+        return None
+
+    def active_sessions(self) -> list[MulticastSession]:
+        """Every scheduled or running multicast session, in registration order."""
+        return list(self._multicast_sessions.values())
+
+    async def _run_session(self, session: MulticastSession, cancel: asyncio.Event) -> None:
+        """Background task driving one multicast session from start to timeout."""
+        previous_mode = self.operating_mode
+        previous_rx: tuple[int | None, int | None] = (self.rx_data_rate, self.rx_frequency)
+        try:
+            if await self._sleep_until_or_cancel(session.start_time, cancel):
+                session.running = False
+                self._forget_session(session)
+                return
+            if not sim.is_running():
+                self._forget_session(session)
+                return
+
+            previous_mode = self.operating_mode
+            previous_rx = (self.rx_data_rate, self.rx_frequency)
+            session.running = True
+            self.set_rx_config(session.data_rate, session.frequency)
+            await self.switch_mode(session.mode)
+
+            logger.info(
+                f"{sim.current_time():.2f}s  DEVICE  Class {session.mode.value} multicast "
+                f"session started on 0x{session.group_addr:08X} until "
+                f"{session.end_time:.2f}s"
+            )
+
+            cancelled = await self._sleep_until_or_cancel(session.end_time, cancel)
+            session.running = False
+
+            # A replacing session owns the radio now, undoing its configuration would be
+            # wrong. An explicit cancel, and a plain timeout, both revert the device.
+            if not session.superseded:
+                if not cancelled:
+                    logger.info(
+                        f"{sim.current_time():.2f}s  DEVICE  multicast session on "
+                        f"0x{session.group_addr:08X} timed out, reverting to Class "
+                        f"{previous_mode.value}"
+                    )
+                self.set_rx_config(*previous_rx)
+                await self.switch_mode(previous_mode)
+            self._forget_session(session)
+
+        except SimulatorException:
+            # The simulation ended underneath us. Restoring radio state is pointless at that
+            # point, but the bookkeeping must still run so the device does not look like it
+            # is sitting in a session afterwards. Swallowed on purpose: the environment's
+            # task wrapper treats any escaping exception as a fatal simulation error.
+            session.running = False
+            self._forget_session(session)
+
+    async def _sleep_until_or_cancel(self, timestamp: float, cancel: asyncio.Event) -> bool:
+        """Sleep until *timestamp*, waking early when *cancel* is set.
+
+        :returns: True when the sleep was cut short by the cancel event.
+        """
+        if cancel.is_set():
+            return True
+        if timestamp <= sim.current_time():
+            return False
+
+        # Never ask the environment to sleep until the tick it is already on: that event
+        # can no longer fire and the task would hang.
+        sleeper = asyncio.ensure_future(
+            sim.sleep_until(max(timestamp, sim.next_tick()))
+        )
+        waiter = asyncio.ensure_future(cancel.wait())
+        try:
+            await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (sleeper, waiter):
+                if not task.done():
+                    task.cancel()
+            # `sim.sleep_until` re-acquires the timer lock from its own cancellation
+            # handler, so give it a chance to run before we carry on.
+            await asyncio.sleep(0)
+        if sleeper.done() and not sleeper.cancelled():
+            # Surface a simulation-end exception to the caller.
+            sleeper.result()
+        return cancel.is_set()
+
+    def _forget_session(self, session: MulticastSession) -> None:
+        """Drop the registration of *session*, unless it was already replaced by a new one."""
+        if self._multicast_sessions.get(session.group_addr) is session:
+            del self._multicast_sessions[session.group_addr]
+            self._session_cancels.pop(session.group_addr, None)
+
     # ---- Class B: beacon synchronization & ping slots ----
 
     async def _start_class_b(self) -> None:
@@ -668,9 +1100,19 @@ class LoRaWanDevice:
                 # A beacon window is a single shot window like any other: `receive(continuous=
                 # True)` would latch the radio into Class C style continuous RX and leave it
                 # there for the rest of the simulation.
-                result = await self._rx_window(
-                    sim.current_time(), BEACON_RESERVED + 2.0
-                )
+                # Beacons go out with the network's own parameters, never with a multicast
+                # session's, so the receiver is put back on the unicast settings for the
+                # beacon window.
+                retuned = self._rx_override_active()
+                if retuned:
+                    self._apply_uplink_rx_config()
+                try:
+                    result = await self._rx_window(
+                        sim.current_time(), BEACON_RESERVED + 2.0
+                    )
+                finally:
+                    if retuned:
+                        self._configure_radio()
                 if result is None:
                     raise TimeoutError
                 beacon_time = decode_beacon(result.payload)
@@ -711,19 +1153,60 @@ class LoRaWanDevice:
                     estimated = self._beacon_time + missed_beacons * BEACON_INTERVAL
                     await self._class_b_ping_slots(int(estimated))
 
+    def collect_ping_slots(
+        self, beacon_time: int,
+    ) -> list[tuple[float, MulticastSession | None]]:
+        """All ping slots the device should open in one beacon period.
+
+        The device's own unicast ping slots (computed from its ``DevAddr``) are merged with
+        the slots of every running Class B multicast session (computed from that group's
+        ``McAddr``). Slots that fall within one slot length of each other cannot both be
+        opened, so only the first survives; where a unicast and a multicast slot coincide the
+        multicast one wins, as required by TS005 §2.8.
+
+        Reference: LoRaWAN L2 1.0.4 §12.1 for the slot computation itself.
+
+        :returns: ``(slot_time, session)`` pairs sorted by time, where *session* is None for
+            a unicast slot.
+        """
+        entries: list[tuple[float, MulticastSession | None]] = []
+
+        if self.session is not None:
+            for slot_time in compute_ping_slot_times(
+                beacon_time=beacon_time,
+                dev_addr=self.session.dev_addr,
+                ping_nb=self.ping_nb,
+            ):
+                entries.append((slot_time, None))
+
+        for session in self._multicast_sessions.values():
+            if not session.running or session.mode != OperatingMode.CLASS_B:
+                continue
+            if not session.ping_nb:
+                continue
+            for slot_time in compute_ping_slot_times(
+                beacon_time=beacon_time,
+                dev_addr=session.group_addr,
+                ping_nb=session.ping_nb,
+            ):
+                entries.append((slot_time, session))
+
+        # Sorting multicast ahead of unicast at identical times makes the de-duplication
+        # below keep the multicast slot.
+        entries.sort(key=lambda entry: (entry[0], entry[1] is None))
+
+        merged: list[tuple[float, MulticastSession | None]] = []
+        for entry in entries:
+            if merged and entry[0] - merged[-1][0] < PING_SLOT_LEN:
+                continue
+            merged.append(entry)
+        return merged
+
     async def _class_b_ping_slots(self, beacon_time: int) -> None:
         """Open RX at each scheduled ping slot within a beacon period."""
-        assert self.session is not None
-
-        slot_times = compute_ping_slot_times(
-            beacon_time=beacon_time,
-            dev_addr=self.session.dev_addr,
-            ping_nb=self.ping_nb,
-        )
-
         guard_time = beacon_time + BEACON_INTERVAL - BEACON_GUARD
 
-        for slot_time in slot_times:
+        for slot_time, session in self.collect_ping_slots(beacon_time):
             if self._class_b_stop.is_set():
                 break
             if slot_time >= guard_time:
@@ -731,6 +1214,9 @@ class LoRaWanDevice:
             if slot_time <= sim.current_time():
                 continue  # Already past this slot
 
+            # A unicast slot listens with the unicast parameters even while a multicast
+            # session has retuned the receiver, and vice versa (TS005 §2.8).
+            retuned = self._tune_for_slot(session)
             try:
                 result = await self._rx_window(slot_time, PING_SLOT_LEN)
                 if result is None:
@@ -742,3 +1228,24 @@ class LoRaWanDevice:
             except RuntimeError:
                 # Radio busy (e.g., concurrent uplink TX)
                 pass
+            finally:
+                if retuned:
+                    self._configure_radio()
+
+    def _tune_for_slot(self, session: MulticastSession | None) -> bool:
+        """Tune the receiver for one ping slot; returns True if it has to be restored."""
+        if session is None:
+            if self._rx_override_active():
+                self._apply_uplink_rx_config()
+                return True
+            return False
+        if (self.rx_data_rate, self.rx_frequency) == (session.data_rate, session.frequency):
+            return False
+        dr = EU868_DATA_RATES[session.data_rate]
+        self.radio.set_rx_config(
+            spreading_factor=dr.spreading_factor.value,
+            bandwidth=dr.bandwidth.to_khz(),
+            rx_continuous=False,
+            frequency=session.frequency,
+        )
+        return True

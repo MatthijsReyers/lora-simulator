@@ -1,18 +1,66 @@
 
 from __future__ import annotations
+import asyncio
+import inspect
 import logging
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from simulator.environment import simulation_env as sim
+from simulator.exceptions import SimulatorException
+from simulator.lora.airtime import estimate_airtime
 from simulator.lora.gateway_radio import LoraGatewayRadio
 from simulator.lora.packet import LoraPacket
 from simulator.lorawan.beacon import encode_beacon, compute_ping_slot_times
-from simulator.lorawan.network_server import NetworkServer
+from simulator.lorawan.network_server import NetworkServer, ScheduledMulticastDownlink
 from simulator.lorawan.region import (
     EU868_DATA_RATES, RECEIVE_DELAY1,
     BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: Callback invoked after a scheduled multicast frame left the antenna. It is handed the queue
+#: entry and the raw PHYPayload that went on the air; the return value may be awaitable.
+MulticastCallback = Callable[
+    [ScheduledMulticastDownlink, bytes], Awaitable[None] | None
+]
+
+
+class DutyCycleLimiter:
+    """Time-on-air budget for one transmitter.
+
+    Models the usual sub-band limit the simple way: after a frame of ``airtime`` seconds the
+    transmitter stays quiet for ``airtime * (1/duty_cycle - 1)`` seconds, so over any long
+    stretch at most ``duty_cycle`` of the time is spent transmitting. Set it to 0.10 for the
+    EU868 869.4–869.65 MHz sub-band or 0.01 for the 1% sub-bands.
+
+    Reference: ETSI EN 300 220-2, as applied in RP002-1.0.4 §2.4.3.
+    """
+
+    def __init__(self, duty_cycle: float) -> None:
+        assert 0 < duty_cycle <= 1, "Duty cycle must be a fraction in (0, 1]"
+        self.duty_cycle = duty_cycle
+        self.quiet_until = 0.0
+
+    def quiet_time(self, airtime: float) -> float:
+        """How long the transmitter must stay off after a frame of *airtime* seconds."""
+        return airtime * (1 / self.duty_cycle - 1)
+
+    def reserve(self, airtime: float) -> None:
+        """Book the medium for a frame starting now plus the quiet time that follows it."""
+        end_of_quiet = sim.current_time() + airtime + self.quiet_time(airtime)
+        self.quiet_until = max(self.quiet_until, end_of_quiet)
+
+    async def wait_for_slot(self) -> None:
+        """Sleep until the transmitter is allowed to send again.
+
+        The wake-up is never scheduled before the next tick: asking the environment to sleep
+        until the tick it is already on would register an event that can no longer fire.
+        """
+        if sim.current_time() < self.quiet_until:
+            await sim.sleep_until(max(self.quiet_until, sim.next_tick()))
 
 
 class LoRaWanGateway:
@@ -27,12 +75,24 @@ class LoRaWanGateway:
         ``BEACON_INTERVAL`` seconds and transmits pending Class B downlinks at the
         correct ping slot times.
 
+        A third background task drains the network server's multicast downlink queue (see
+        ``NetworkServer.schedule_multicast_downlink``) and puts those frames on the air at
+        their scheduled time. All three tasks share one transmitter, so they take a lock
+        around it and respect a fixed priority: beacons first (their timing is what the whole
+        Class B network is synchronised to), then RX1 replies (the device only listens for a
+        fraction of a second), then multicast frames, which simply wait their turn.
+
         In a real deployment, the gateway communicates with the network server over IP
         (e.g., via the SemTech UDP protocol or gRPC). In simulation, it calls the
         network server directly.
 
         Reference: LoRaWAN L2 1.0.4 Specification §3 & §12.
     """
+
+    #: How long the multicast scheduler sleeps between checks of an empty or not-yet-due
+    #: queue. Small enough to hit ping-slot scale timing, large enough not to dominate the
+    #: event queue.
+    MULTICAST_POLL_INTERVAL = 0.05
 
     def __init__(
         self,
@@ -41,15 +101,37 @@ class LoRaWanGateway:
         data_rate: int = 5,
         tx_power: int = 14,
         class_b_enabled: bool = False,
+        duty_cycle: float | None = None,
+        on_multicast_transmitted: MulticastCallback | None = None,
     ):
+        """
+            :param duty_cycle: Transmit duty cycle as a fraction, e.g. ``0.10`` for a 10%
+                sub-band. None (the default) leaves the transmitter unlimited, which is how
+                the gateway behaved before this parameter existed.
+            :param on_multicast_transmitted: Optional hook called after each scheduled
+                multicast frame goes out.
+        """
         self.radio = radio if radio else LoraGatewayRadio()
         self.network_server = network_server
         self.data_rate = data_rate
         self.tx_power = tx_power
         self.frames_forwarded = 0
+        #: Number of scheduled multicast frames put on the air by the scheduler task.
+        self.multicast_frames_sent = 0
+        #: ``(time, group_addr, fport, len(raw))`` for every multicast frame transmitted.
+        self.multicast_log: list[tuple[float, int, int, int]] = []
+        self.on_multicast_transmitted = on_multicast_transmitted
+        self.duty_cycle = DutyCycleLimiter(duty_cycle) if duty_cycle is not None else None
         self._class_b_enabled = class_b_enabled
+        # Guards the single transmitter against concurrent use by the uplink loop, the
+        # beacon loop and the multicast scheduler.
+        self._radio_lock = asyncio.Lock()
+        # Non-zero while an RX1 reply or a beacon is pending; the multicast scheduler yields.
+        self._priority_tx = 0
+        self._multicast_batch: list[ScheduledMulticastDownlink] = []
         self._configure_radio()
         sim.create_task(self._run())
+        sim.create_task(self._multicast_loop())
         if class_b_enabled:
             sim.create_task(self._beacon_loop())
 
@@ -64,6 +146,63 @@ class LoRaWanGateway:
             power=self.tx_power,
             spreading_factor=dr.spreading_factor.value,
             bandwidth=dr.bandwidth.to_khz(),
+        )
+
+    # ---- Shared transmitter ----
+
+    async def _transmit(self, raw: bytes) -> float:
+        """Transmit with the current radio configuration, holding the transmitter lock."""
+        if self.duty_cycle is not None:
+            # Book the medium before the frame goes out: anything that checks the budget in
+            # the tick the transmission ends in has to already see the quiet time.
+            self.duty_cycle.reserve(self._estimated_airtime(raw, None))
+        async with self._radio_lock:
+            airtime = await self.radio.transmit_data_blocking(raw)
+            await self.radio.receive(continuous=True)
+        return float(airtime)
+
+    async def transmit_multicast(
+        self, raw: bytes, data_rate: int | None = None, frequency: int | None = None,
+    ) -> float:
+        """Transmit a prebuilt multicast frame, optionally on other radio parameters.
+
+        The transmitter is retuned for the frame and put back on the gateway's default
+        configuration afterwards, so an RX1 reply that follows still goes out with the
+        parameters the device expects.
+
+        :param data_rate: EU868 data rate index for this frame, or None for the gateway's
+            own rate.
+        :param frequency: Carrier frequency in hertz, or None to stay on the current channel.
+        :returns: The frame's time on air in seconds.
+        """
+        if data_rate is None and frequency is None:
+            return await self._transmit(raw)
+
+        dr = EU868_DATA_RATES[data_rate if data_rate is not None else self.data_rate]
+        if self.duty_cycle is not None:
+            self.duty_cycle.reserve(self._estimated_airtime(raw, data_rate))
+        async with self._radio_lock:
+            self.radio.set_tx_config(
+                power=self.tx_power,
+                spreading_factor=dr.spreading_factor.value,
+                bandwidth=dr.bandwidth.to_khz(),
+                frequency=frequency,
+            )
+            try:
+                airtime = await self.radio.transmit_data_blocking(raw)
+                await self.radio.receive(continuous=True)
+            finally:
+                self._configure_radio()
+        return float(airtime)
+
+    def _estimated_airtime(self, raw: bytes, data_rate: int | None) -> float:
+        """Time on air a frame would take, used by the duty cycle limiter before sending."""
+        dr = EU868_DATA_RATES[data_rate if data_rate is not None else self.data_rate]
+        return estimate_airtime(
+            payload_len=len(raw),
+            bandwidth=dr.bandwidth.to_khz(),
+            spreading_factor=dr.spreading_factor.value,
+            code_rate=5,
         )
 
     async def _run(self) -> None:
@@ -92,13 +231,95 @@ class LoRaWanGateway:
                 # Transmit the downlink in the device's RX1 window, which opens exactly
                 # RECEIVE_DELAY1 after the uplink ended. Sending it any earlier only reaches
                 # devices that (incorrectly) leave their receiver on between windows.
-                await sim.sleep_until(uplink_end + RECEIVE_DELAY1)
-                logger.debug(
-                    f"{sim.current_time():.2f}s  GW  sending downlink ({len(downlink_raw)} bytes)"
+                # The RX1 window is short and unmovable, so the multicast scheduler is told
+                # to stay off the air from now until the reply has gone out.
+                self._priority_tx += 1
+                try:
+                    await sim.sleep_until(uplink_end + RECEIVE_DELAY1)
+                    logger.debug(
+                        f"{sim.current_time():.2f}s  GW  sending downlink "
+                        f"({len(downlink_raw)} bytes)"
+                    )
+                    await self._transmit(downlink_raw)
+                finally:
+                    self._priority_tx -= 1
+
+    # ---- Multicast downlink scheduling ----
+
+    async def _multicast_loop(self) -> None:
+        """Background task: put queued multicast downlinks on the air when they are due.
+
+        The loop polls, so it is always sleeping when the simulation runs out; swallow that
+        so the environment does not treat a normal shutdown as a task failure.
+        """
+        try:
+            await self._multicast_scheduler()
+        except SimulatorException:
+            return
+
+    async def _multicast_scheduler(self) -> None:
+        while sim.is_running():
+            if not self._multicast_batch:
+                due_time = self.network_server.next_multicast_downlink_time()
+                if due_time is None:
+                    await sim.sleep(self.MULTICAST_POLL_INTERVAL)
+                    continue
+                now = sim.current_time()
+                if due_time > now:
+                    await sim.sleep_until(max(
+                        min(due_time, now + self.MULTICAST_POLL_INTERVAL),
+                        sim.next_tick(),
+                    ))
+                    continue
+                self._multicast_batch = (
+                    self.network_server.pop_due_multicast_downlinks(sim.current_time())
                 )
-                await self.radio.transmit_data_blocking(downlink_raw)
-                # Return to RX mode after transmitting
-                await self.radio.receive(continuous=True)
+                if not self._multicast_batch:
+                    await sim.sleep(self.MULTICAST_POLL_INTERVAL)
+                    continue
+
+            # A pending RX1 reply or beacon wins; the multicast frame simply waits.
+            if self._priority_tx > 0 or self._radio_lock.locked():
+                await sim.sleep(self.MULTICAST_POLL_INTERVAL)
+                continue
+
+            if self.duty_cycle is not None and sim.current_time() < self.duty_cycle.quiet_until:
+                await self.duty_cycle.wait_for_slot()
+                continue
+
+            entry = self._multicast_batch.pop(0)
+            await self._send_multicast(entry)
+
+    async def _send_multicast(self, entry: ScheduledMulticastDownlink) -> None:
+        """Build and transmit one queued multicast downlink."""
+        group = self.network_server.get_multicast_group(entry.group_addr)
+        if group is None:
+            logger.warning(
+                f"{sim.current_time():.2f}s  GW  dropping multicast for unknown group "
+                f"0x{entry.group_addr:08X}"
+            )
+            return
+
+        raw = self.network_server.build_multicast_downlink(
+            entry.group_addr, fport=entry.fport, payload=entry.payload,
+        )
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  GW  multicast TX  "
+            f"GroupAddr=0x{entry.group_addr:08X}  FPort={entry.fport}  {len(raw)} bytes"
+        )
+
+        await self.transmit_multicast(raw, group.data_rate, group.frequency)
+
+        self.multicast_frames_sent += 1
+        self.multicast_log.append(
+            (sim.current_time(), entry.group_addr, entry.fport, len(raw))
+        )
+
+        if self.on_multicast_transmitted is not None:
+            outcome: Any = self.on_multicast_transmitted(entry, raw)
+            if inspect.isawaitable(outcome):
+                await outcome
 
     # ---- Class B: beacon broadcasting & ping slot downlinks ----
 
@@ -117,8 +338,12 @@ class LoRaWanGateway:
                 f"{sim.current_time():.2f}s  GW  beacon broadcast time={beacon_time}"
             )
 
-            await self.radio.transmit_data_blocking(beacon_data)
-            await self.radio.receive(continuous=True)
+            # Nothing may delay a beacon: the whole Class B network keys its timing off it.
+            self._priority_tx += 1
+            try:
+                await self._transmit(beacon_data)
+            finally:
+                self._priority_tx -= 1
 
             # Transmit pending Class B downlinks at the correct ping slot times
             await self._send_class_b_downlinks(beacon_time)
@@ -146,5 +371,8 @@ class LoRaWanGateway:
                 f"0x{dev_addr:08X}"
             )
 
-            await self.radio.transmit_data_blocking(raw)
-            await self.radio.receive(continuous=True)
+            self._priority_tx += 1
+            try:
+                await self._transmit(raw)
+            finally:
+                self._priority_tx -= 1

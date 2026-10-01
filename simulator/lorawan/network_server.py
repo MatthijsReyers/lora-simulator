@@ -33,7 +33,9 @@ from simulator.lorawan.mac_commands import (
     DutyCycleAns, NewChannelAns,
 )
 from simulator.lorawan.beacon import compute_ping_slot_times
-from simulator.lorawan.region import MAX_FCNT, BEACON_RESERVED, PING_SLOT_LEN
+from simulator.lorawan.region import (
+    MAX_FCNT, BEACON_RESERVED, PING_SLOT_LEN, max_frm_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +63,58 @@ class PendingDownlink:
 
 @dataclass
 class MulticastGroupRecord:
-    """Network server's record for a multicast group."""
+    """Network server's record for a multicast group.
+
+    Mirrors the device-side ``MulticastGroup`` context of TS005-2.0.0 §2.1.
+
+    :ivar group_id: ``McGroupID``, the device-local index the group is set up under (0–3).
+    :ivar min_fcnt: ``minMcFCnt``, the first multicast counter the server will send.
+    :ivar max_fcnt: ``maxMcFCnt``, the counter ceiling that ends the group's lifetime.
+    :ivar data_rate: Downlink data rate index for sessions on this group, or None for the
+        gateway's default.
+    :ivar frequency: Downlink frequency in hertz for sessions on this group, or None.
+    :ivar class_b_enabled: Whether ping-slot downlinks are scheduled for this group.
+    :ivar class_b_ping_nb: Ping slots per beacon period for the group's Class B session.
+    """
     group_addr: int
     nwk_s_key: bytes
     app_s_key: bytes
     fcnt_down: int = 0
+    group_id: int = 0
+    min_fcnt: int = 0
+    max_fcnt: int = MAX_FCNT
+    data_rate: int | None = None
+    frequency: int | None = None
+    class_b_enabled: bool = False
+    class_b_ping_nb: int = 16
+
+    def __post_init__(self) -> None:
+        assert 0 <= self.group_id <= 3, f"McGroupID must be 0-3, got {self.group_id}"
+        assert 0 <= self.min_fcnt <= self.max_fcnt <= MAX_FCNT, (
+            f"Invalid multicast counter window [{self.min_fcnt}, {self.max_fcnt}]"
+        )
+        self.fcnt_down = max(self.fcnt_down, self.min_fcnt)
+
+
+@dataclass
+class ScheduledMulticastDownlink:
+    """A multicast payload waiting for its transmission slot.
+
+    The frame itself is only built when the gateway is about to transmit it, so the
+    multicast frame counter advances in actual send order.
+
+    :ivar at_time: Simulation time the frame should go out at; None means "as soon as the
+        gateway can".
+    :ivar sequence: Monotonic tie-breaker that keeps same-time downlinks in FIFO order.
+    """
+    group_addr: int
+    fport: int
+    payload: bytes
+    at_time: float | None = None
+    sequence: int = 0
+
+    def sort_key(self) -> tuple[float, int]:
+        return (self.at_time if self.at_time is not None else float("-inf"), self.sequence)
 
 
 class NetworkServer:
@@ -84,7 +133,13 @@ class NetworkServer:
     _multicast_groups: dict[int, MulticastGroupRecord]
 
 
-    def __init__(self, net_id: int = 0x000001) -> None:
+    def __init__(self, net_id: int = 0x000001, default_data_rate: int = 5) -> None:
+        #: Data rate assumed for payload-size checks when a group pins no rate of its own.
+        self._default_data_rate = default_data_rate
+        self._multicast_queue: list[ScheduledMulticastDownlink] = []
+        self._multicast_sequence = 0
+        #: Round-robin cursor into `_applications`, per device (see `_build_downlink`).
+        self._app_cursor: dict[int, int] = {}
         self._devices = {} # dev_addr -> DeviceRecord
         self._applications = {} # fport -> Application
         self._downlink_queue = {} # dev_addr -> queue
@@ -139,17 +194,35 @@ class NetworkServer:
 
 
     def create_multicast_group(
-        self, group_addr: int, nwk_s_key: bytes, app_s_key: bytes,
+        self,
+        group_addr: int,
+        nwk_s_key: bytes,
+        app_s_key: bytes,
+        *,
+        group_id: int = 0,
+        min_fcnt: int = 0,
+        max_fcnt: int = MAX_FCNT,
+        data_rate: int | None = None,
+        frequency: int | None = None,
     ) -> MulticastGroupRecord:
         """Create a multicast group for downlink-only broadcast.
 
-        Returns the MulticastGroupRecord (also stored internally).
+        Reference: TS005-2.0.0 §2.5 (``McGroupSetupReq``) for the ``McGroupID`` /
+        ``minMcFCnt`` / ``maxMcFCnt`` parameters.
+
+        :returns: The ``MulticastGroupRecord`` (also stored internally).
         """
         record = MulticastGroupRecord(
             group_addr=group_addr, nwk_s_key=nwk_s_key, app_s_key=app_s_key,
+            group_id=group_id, min_fcnt=min_fcnt, max_fcnt=max_fcnt,
+            data_rate=data_rate, frequency=frequency,
         )
         self._multicast_groups[group_addr] = record
         return record
+
+    def get_multicast_group(self, group_addr: int) -> MulticastGroupRecord | None:
+        """Look a multicast group record up by its ``McAddr``."""
+        return self._multicast_groups.get(group_addr)
 
     def build_multicast_downlink(
         self, group_addr: int, fport: int, payload: bytes,
@@ -161,6 +234,20 @@ class NetworkServer:
         """
         group = self._multicast_groups[group_addr]
         assert group.fcnt_down <= MAX_FCNT, "Multicast frame counter overflow"
+        assert group.fcnt_down <= group.max_fcnt, (
+            f"Multicast group 0x{group_addr:08X} reached maxMcFCnt {group.max_fcnt}"
+        )
+
+        # Multicast frames carry no FOpts, so the whole FRMPayload budget is the application's.
+        limit = max_frm_payload(
+            group.data_rate if group.data_rate is not None else self._default_data_rate
+        )
+        if len(payload) > limit:
+            raise ValueError(
+                f"Multicast payload of {len(payload)} bytes exceeds the {limit} byte "
+                f"FRMPayload limit at DR"
+                f"{group.data_rate if group.data_rate is not None else self._default_data_rate}"
+            )
 
         encrypted = encrypt_frm_payload(
             group.app_s_key,
@@ -199,7 +286,85 @@ class NetworkServer:
         group.fcnt_down += 1
         return raw
 
+    # ---- Multicast downlink scheduling ----
+
+    def schedule_multicast_downlink(
+        self, group_addr: int, fport: int, payload: bytes,
+        at_time: float | None = None,
+    ) -> ScheduledMulticastDownlink:
+        """Queue a multicast payload for the gateway to transmit.
+
+        The queue is kept in time order; entries scheduled for the same instant (or with no
+        time at all) go out first-in-first-out. The frame is built at transmission time, so
+        the group's ``McFCnt`` follows the order the frames actually leave the gateway.
+
+        :param at_time: Absolute simulation time to transmit at. None means "as soon as the
+            gateway's radio is free".
+        :returns: The queued entry, useful as a handle in tests.
+        """
+        assert group_addr in self._multicast_groups, (
+            f"Unknown multicast group 0x{group_addr:08X}"
+        )
+        entry = ScheduledMulticastDownlink(
+            group_addr=group_addr, fport=fport, payload=payload, at_time=at_time,
+            sequence=self._multicast_sequence,
+        )
+        self._multicast_sequence += 1
+        self._multicast_queue.append(entry)
+        self._multicast_queue.sort(key=ScheduledMulticastDownlink.sort_key)
+
+        logger.debug(
+            f"{sim.current_time():.2f}s  NS  multicast downlink queued  "
+            f"GroupAddr=0x{group_addr:08X}  FPort={fport}  "
+            f"at={'ASAP' if at_time is None else f'{at_time:.2f}s'}"
+        )
+        return entry
+
+    def next_multicast_downlink_time(self) -> float | None:
+        """Time the next queued multicast downlink is due, or None when the queue is empty.
+
+        An entry with no time of its own is due immediately and reports ``-inf``'s practical
+        equivalent: the current simulation time.
+        """
+        if not self._multicast_queue:
+            return None
+        head = self._multicast_queue[0]
+        return head.at_time if head.at_time is not None else sim.current_time()
+
+    def pop_due_multicast_downlinks(self, now: float) -> list[ScheduledMulticastDownlink]:
+        """Remove and return every queued multicast downlink due at or before *now*."""
+        due: list[ScheduledMulticastDownlink] = []
+        remaining: list[ScheduledMulticastDownlink] = []
+        for entry in self._multicast_queue:
+            if entry.at_time is None or entry.at_time <= now:
+                due.append(entry)
+            else:
+                remaining.append(entry)
+        self._multicast_queue = remaining
+        return due
+
+    def pending_multicast_downlinks(self) -> list[ScheduledMulticastDownlink]:
+        """The queue as it stands, in transmission order (read-only snapshot)."""
+        return list(self._multicast_queue)
+
     # ---- Class B ----
+
+    def enable_multicast_class_b(self, group_addr: int, ping_nb: int = 16) -> None:
+        """Schedule a multicast group's downlinks into Class B ping slots.
+
+        The slots are computed from the group's ``McAddr``, which is what the devices in a
+        Class B multicast session listen on (TS005-2.0.0 §2.8).
+
+        :param ping_nb: Ping slots per beacon period, ``128 >> Periodicity``.
+        """
+        group = self._multicast_groups[group_addr]
+        group.class_b_enabled = True
+        group.class_b_ping_nb = ping_nb
+
+    def disable_multicast_class_b(self, group_addr: int) -> None:
+        """Stop scheduling a multicast group's downlinks into ping slots."""
+        self._multicast_groups[group_addr].class_b_enabled = False
+
 
     def enable_class_b(self, dev_addr: int, ping_nb: int = 16) -> None:
         """Mark a device as Class B so the gateway can schedule ping slot downlinks."""
@@ -215,16 +380,21 @@ class NetworkServer:
     async def get_class_b_downlink_schedule(
         self, beacon_time: int,
     ) -> list[tuple[int, bytes, float]]:
-        """Compute pending Class B downlinks with their first ping slot time.
+        """Compute pending Class B downlinks with their ping slot times.
 
-        Called by the gateway after broadcasting a beacon.  For each Class B
-        device that has a pending downlink, the method builds the encrypted
-        frame, computes the first available ping slot, and returns the
-        schedule sorted by time.
+        Called by the gateway after broadcasting a beacon. For each Class B device with a
+        pending downlink the method builds the encrypted frame and takes that device's first
+        ping slot. Multicast groups that were enabled with ``enable_multicast_class_b`` are
+        then served from the multicast queue: one queued payload per ping slot of the group,
+        with the slots computed from the group's ``McAddr`` (TS005-2.0.0 §2.8).
+
+        Multicast frames are built here, in slot order, so ``McFCnt`` matches the order the
+        gateway will put them on the air.
 
         Returns:
-            List of ``(dev_addr, raw_downlink_bytes, slot_time)`` tuples,
-            sorted by ascending *slot_time*.
+            List of ``(addr, raw_downlink_bytes, slot_time)`` tuples sorted by ascending
+            *slot_time*; *addr* is a ``DevAddr`` for unicast entries and an ``McAddr`` for
+            multicast ones.
         """
         schedule: list[tuple[int, bytes, float]] = []
 
@@ -245,8 +415,51 @@ class NetworkServer:
             if slot_times:
                 schedule.append((dev_addr, raw, slot_times[0]))
 
+        schedule.extend(self._class_b_multicast_schedule(beacon_time))
+
         schedule.sort(key=lambda x: x[2])
         return schedule
+
+    def _class_b_multicast_schedule(
+        self, beacon_time: int,
+    ) -> list[tuple[int, bytes, float]]:
+        """Assign queued multicast payloads to their group's ping slots in this period."""
+        schedule: list[tuple[int, bytes, float]] = []
+
+        for group_addr, group in self._multicast_groups.items():
+            if not group.class_b_enabled:
+                continue
+
+            slot_times = compute_ping_slot_times(
+                beacon_time=beacon_time,
+                dev_addr=group_addr,
+                ping_nb=group.class_b_ping_nb,
+            )
+            if not slot_times:
+                continue
+
+            for slot_time in slot_times:
+                entry = self._take_multicast_for(group_addr, slot_time)
+                if entry is None:
+                    break
+                raw = self.build_multicast_downlink(
+                    group_addr, fport=entry.fport, payload=entry.payload,
+                )
+                schedule.append((group_addr, raw, slot_time))
+
+        return schedule
+
+    def _take_multicast_for(
+        self, group_addr: int, slot_time: float,
+    ) -> ScheduledMulticastDownlink | None:
+        """Pull the first queued entry for a group that is due by *slot_time*."""
+        for index, entry in enumerate(self._multicast_queue):
+            if entry.group_addr != group_addr:
+                continue
+            if entry.at_time is not None and entry.at_time > slot_time:
+                continue
+            return self._multicast_queue.pop(index)
+        return None
 
 
     async def handle_uplink(self, raw: bytes) -> bytes | None:
@@ -398,6 +611,35 @@ class NetworkServer:
         return await self._build_downlink(device)
 
 
+    async def has_pending_downlink(self, dev_addr: int) -> bool:
+        """Whether anything is waiting to go out to a device.
+
+        Covers the explicit queue, pending MAC commands and any registered application that
+        reports a downlink for this device. Note that applications are *asked* about it, so
+        an application whose ``get_downlink`` pops its answer must not be probed with this
+        method before the frame is actually built.
+        """
+        if self._downlink_queue.get(dev_addr):
+            return True
+        if self._pending_mac_commands.get(dev_addr):
+            return True
+        for app in self._applications.values():
+            if await app.get_downlink(dev_addr) is not None:
+                return True
+        return False
+
+    def _applications_round_robin(self, dev_addr: int) -> list[Application]:
+        """Registered applications, starting just after the one served last for a device.
+
+        Rotating the start point means several packages with answers pending all get served
+        across successive uplinks instead of the lowest FPort starving the others.
+        """
+        apps = [self._applications[port] for port in sorted(self._applications)]
+        if not apps:
+            return apps
+        start = self._app_cursor.get(dev_addr, 0) % len(apps)
+        return apps[start:] + apps[:start]
+
     async def _build_downlink(self, device: DeviceRecord) -> bytes | None:
         """Build a downlink frame if one is pending for this device."""
         pending: PendingDownlink | None = None
@@ -407,9 +649,11 @@ class NetworkServer:
         if queue:
             pending = queue.popleft()
 
-        # Then check applications for pending data
+        # Then check applications for pending data, round-robin so no package starves.
         if pending is None:
-            for app in self._applications.values():
+            apps = self._applications_round_robin(device.dev_addr)
+            ordered_ports = sorted(self._applications)
+            for app in apps:
                 dl_payload = await app.get_downlink(device.dev_addr)
                 if dl_payload is not None:
                     pending = PendingDownlink(
@@ -417,6 +661,10 @@ class NetworkServer:
                         fport=app.port(),
                         payload=dl_payload,
                     )
+                    # Next uplink starts looking at the application after this one.
+                    self._app_cursor[device.dev_addr] = (
+                        ordered_ports.index(app.port()) + 1
+                    ) % len(ordered_ports)
                     break
 
         if pending is None:
@@ -431,6 +679,14 @@ class NetworkServer:
 
         # Collect pending MAC commands for FOpts
         fopts = self._drain_mac_commands(device.dev_addr)
+
+        limit = max_frm_payload(self._default_data_rate, len(fopts))
+        if len(pending.payload) > limit:
+            raise ValueError(
+                f"Downlink of {len(pending.payload)} bytes for 0x{device.dev_addr:08X} "
+                f"exceeds the {limit} byte FRMPayload limit at "
+                f"DR{self._default_data_rate} with {len(fopts)} FOpts bytes"
+            )
 
         # Encrypt payload
         encrypted = encrypt_frm_payload(

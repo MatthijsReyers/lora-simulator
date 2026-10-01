@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
@@ -32,6 +34,33 @@ EU868_DATA_RATES: dict[int, DataRate] = {
     4: DataRate(SpreadingFactor.SF8,  Bandwidth.KHz125, max_payload=222),
     5: DataRate(SpreadingFactor.SF7,  Bandwidth.KHz125, max_payload=222),
 }
+
+# Fixed overhead, in octets, that a data frame carries in front of its FRMPayload: the MAC header
+# (1), the mandatory part of the frame header (DevAddr 4 + FCtrl 1 + FCnt 2 = 7) and the FPort (1).
+# Any FOpts carried in the frame header come on top of this.
+FRAME_OVERHEAD = 9
+
+
+def max_frm_payload(data_rate: int, fopts_len: int = 0) -> int:
+    """Maximum FRMPayload size, in octets, for a data rate.
+
+    The region table's ``max_payload`` is the largest frame the modulation may carry; the
+    application payload is what is left of it after the fixed frame overhead
+    (``FRAME_OVERHEAD``) and whatever MAC commands ride along in FOpts.
+
+    For EU868 with an empty FOpts this yields 42 octets for DR0–DR2, 106 for DR3 and 213 for
+    DR4–DR5.
+
+    Reference: LoRaWAN Regional Parameters RP002-1.0.4 §2.4.6 (EU863-870 maximum payload size).
+
+    :param data_rate: EU868 data rate index (0–5).
+    :param fopts_len: Number of FOpts octets the frame will carry (0–15).
+    :returns: Maximum number of plaintext FRMPayload octets, never negative.
+    """
+    assert data_rate in EU868_DATA_RATES, f"Unknown data rate DR{data_rate}"
+    assert 0 <= fopts_len <= 15, f"FOpts is at most 15 octets, got {fopts_len}"
+    return max(0, EU868_DATA_RATES[data_rate].max_payload - FRAME_OVERHEAD - fopts_len)
+
 
 # The three default uplink channels every EU868 device and gateway must support, a gateway
 # typically listens to all of these (and usually a few more) simultaneously.

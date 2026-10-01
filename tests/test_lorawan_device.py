@@ -357,3 +357,39 @@ class TestEndToEndFrames:
         for i, (addr, payload) in enumerate(app.uplinks):
             assert addr == DEV_ADDR
             assert payload == payloads[i]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Device — downlink RX configuration and payload limits
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDeviceRxConfigAndLimits:
+    def _device(self, data_rate: int = 5) -> LoRaWanDevice:
+        session = DeviceSession(
+            dev_addr=DEV_ADDR, nwk_s_key=NWK_S_KEY, app_s_key=APP_S_KEY,
+        )
+        return LoRaWanDevice(session=session, data_rate=data_rate)
+
+    def test_rx_config_defaults_to_the_uplink_rate(self):
+        device = self._device(data_rate=4)
+        assert device.rx_data_rate is None
+        assert device.rx_frequency is None
+        assert device.radio.rx_config.spreading_factor.value == 8
+
+    def test_rx_override_leaves_the_transmitter_alone(self):
+        device = self._device(data_rate=5)
+        device.set_rx_config(1, 869_525_000)
+        assert device.radio.rx_config.spreading_factor.value == 11
+        assert device.radio.tx_config.spreading_factor.value == 7
+        assert device.radio.tx_frequency != 869_525_000
+
+    def test_rx_override_rejects_an_unknown_data_rate(self):
+        device = self._device()
+        with pytest.raises(AssertionError):
+            device.set_rx_config(9)
+
+    @pytest.mark.asyncio
+    async def test_oversized_uplink_raises(self):
+        device = self._device(data_rate=0)
+        with pytest.raises(ValueError, match="exceeds the 42 byte"):
+            await device.send_uplink(fport=1, payload=b"\x00" * 60)
