@@ -1,18 +1,13 @@
-#!/usr/bin/env python3
-"""
-LoRaWAN Clock Sync example (TS003-style AppTime over FPort 202).
-
-Demonstrates:
-- Device-side clock sync application sending AppTimeReq
-- Server-side clock sync application replying with AppTimeAns
-- End-to-end encrypted LoRaWAN transport via gateway + network server
-"""
 import logging
+import os
 import sys
 
 sys.path.append(".")
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from plots import plot_power_trace, power_trace_segments
 from simulator.environment import simulation_env as sim
+from simulator.exceptions import SimulationFinishedException
 from simulator.lora.phy_layer import LoraPhyLayer
 from simulator.lorawan.applications.clock_sync import (
     CLOCK_SYNC_FPORT,
@@ -30,6 +25,8 @@ DEV_ADDR = 0x26011234
 NWK_S_KEY = bytes.fromhex("2B7E151628AED2A6ABF7158809CF4F3C")
 APP_S_KEY = bytes.fromhex("3C4F9C098815F7ABA6D2AE281615E72B")
 SYNC_INTERVAL = 30  # seconds
+SIM_LENGTH = 120    # seconds
+POWER_PLOT_PATH = "examples/lorawan_clock_sync/clock_sync_power.png"
 
 
 class ClockSyncSensor(LoRaWanDevice):
@@ -42,17 +39,20 @@ class ClockSyncSensor(LoRaWanDevice):
         sim.create_task(self._run())
 
     async def _run(self) -> None:
-        await sim.sleep(2.0)
-        while True:
-            # Example device timestamp source: simulation time in whole seconds.
-            device_time = int(sim.current_time())
-            req_payload = self.sync_app.build_time_request(device_time)
-            got_downlink = await self.send_uplink(CLOCK_SYNC_FPORT, req_payload)
-            logger.info(
-                f"{sim.current_time():.2f}s  SENSOR  AppTimeReq sent "
-                f"(device={device_time}s, downlink={got_downlink})"
-            )
-            await sim.sleep(SYNC_INTERVAL)
+        try:
+            await sim.sleep(2.0)
+            while True:
+                # Example device timestamp source: simulation time in whole seconds.
+                device_time = int(sim.current_time())
+                req_payload = self.sync_app.build_time_request(device_time)
+                got_downlink = await self.send_uplink(CLOCK_SYNC_FPORT, req_payload)
+                logger.info(
+                    f"{sim.current_time():.2f}s  SENSOR  AppTimeReq sent "
+                    f"(device={device_time}s, downlink={got_downlink})"
+                )
+                await sim.sleep(SYNC_INTERVAL)
+        except SimulationFinishedException:
+            return
 
 
 if __name__ == "__main__":
@@ -80,10 +80,17 @@ if __name__ == "__main__":
     print(f"  Sync Interval: {SYNC_INTERVAL}s")
     print("=" * 70)
 
-    sim.run(simulation_length=120)
+    sim.run(simulation_length=SIM_LENGTH)
+
+    total_energy = sensor.radio.power_consumer.get_total_energy_consumed()
+    segments = power_trace_segments(sensor.radio, SIM_LENGTH)
+    plot_power_trace(sensor.radio, segments, POWER_PLOT_PATH)
 
     print("=" * 70)
     print("Simulation complete.")
     print(f"  Gateway forwarded: {gateway.frames_forwarded} frames")
     print(f"  Clock sync cycles: {server_app.sync_count}")
+    print(f"  Sensor energy consumed:  {total_energy:.3f} J "
+          f"(avg {total_energy / SIM_LENGTH * 1000:.2f} mW)")
+    print(f"  Power trace plotted to:  {POWER_PLOT_PATH}")
     print("=" * 70)
