@@ -43,3 +43,13 @@ class Application(ABC):
             Returns None if no downlink is pending.
         """
         return None
+
+    async def has_downlink(self, dev_addr: int) -> bool:
+        """
+            Whether this application has something queued for a device, without consuming it.
+
+            ``get_downlink`` is allowed to pop, so it must never be used as a probe.
+            Applications that keep a queue override this to inspect it; the default is False,
+            which is the safe answer for an application that produces downlinks on demand.
+        """
+        return False

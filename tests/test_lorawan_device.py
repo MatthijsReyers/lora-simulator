@@ -391,5 +391,5 @@ class TestDeviceRxConfigAndLimits:
     @pytest.mark.asyncio
     async def test_oversized_uplink_raises(self):
         device = self._device(data_rate=0)
-        with pytest.raises(ValueError, match="exceeds the 42 byte"):
+        with pytest.raises(ValueError, match="exceeds the 51 byte"):
             await device.send_uplink(fport=1, payload=b"\x00" * 60)

@@ -29,7 +29,10 @@ Three deliberate decisions, all visible in the constructor:
   multicast session may still be open — a moment at which a Class C device cannot transmit.
   It is therefore driven without a device and its queue is drained by this loop, which only
   ever transmits outside a session window. Set ``self_transmit_answers=True`` to attach it
-  anyway.
+  anyway. The queue is drained **by readiness**, not blindly: an answer the package held
+  back for its TS004 ``BlockAckDelay`` spreading, or a ``FragDataBlockReceivedReq``
+  retransmission that is still inside its retry interval, stays queued until it is due, so
+  ``block_ack_delay`` is an effective knob on this path too.
 - **Uplinks pause while a multicast session is running** (``device.active_session()``), which
   is both what a Class C device has to do and what TS005 §2.7 describes. Override with
   ``uplink_during_session=True``.
@@ -404,16 +407,23 @@ class FuotaDeviceStack:
             return
 
     def _next_uplink(self) -> tuple[int, bytes]:
-        """Pick what this slot's uplink carries, oldest package answer first."""
-        pending = self.multicast_setup.pop_pending_uplink()
+        """Pick what this slot's uplink carries, oldest *ready* package answer first.
+
+        Both queues are drained with the current simulation time, so an answer a package
+        deliberately held back — TS004 ``BlockAckDelay`` spreading (§3.2/§3.3) and the
+        ``FragDataBlockReceivedReq`` retransmission interval (§3.5) — is skipped until its
+        delay has elapsed instead of going out on the first slot after it was produced.
+        """
+        now = sim.current_time()
+
+        pending = self.multicast_setup.pop_pending_uplink(now)
         if pending is not None:
             return MULTICAST_SETUP_FPORT, pending
 
-        pending = self.fragmentation.pop_pending_uplink()
+        pending = self.fragmentation.pop_pending_uplink(now)
         if pending is not None:
             return FRAGMENTATION_FPORT, pending
 
-        now = sim.current_time()
         if self._next_clock_sync is not None and now >= self._next_clock_sync:
             self._next_clock_sync = (
                 now + self.clock_sync_interval

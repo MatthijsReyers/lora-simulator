@@ -543,3 +543,93 @@ class TestUnreachableDevice:
         assert result.completed == 2
         assert result.failed == 1
         assert result.excluded == {DEV_ADDRS[2]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# (f) Spec-conformance regressions in the device stack
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestDeviceStackHonoursAnswerDelays:
+    """The TS004 package runs with ``device=None``, so the stack owns its answer timing.
+
+    Draining "the oldest queued payload" regardless of its ``ready_at`` made
+    ``BlockAckDelay`` (§3.2/§3.3) and the ``FragDataBlockReceivedReq`` retry interval
+    (§3.5) no-ops on the only path a full campaign uses.
+    """
+
+    def test_a_delayed_answer_is_not_transmitted_before_it_is_due(self):
+        ns, gateway, campaign, stacks = _build_network(
+            config=_class_c_config(),
+            firmware=FIRMWARE_2KB,
+            device_count=1,
+            stop_after=SIM_LENGTH_CLEAN - 6,
+        )
+        stack = stacks[0]
+        package = stack.fragmentation
+        drained: list[tuple[float, bytes]] = []
+
+        async def driver() -> None:
+            await sim.sleep(1.0)
+            entry = await package.queue_uplink(b"\x99", delay=40.0)
+            assert entry.ready_at == pytest.approx(41.0)
+            while sim.is_running() and not drained:
+                now = sim.current_time()
+                payload = package.pop_pending_uplink(now)
+                if payload == b"\x99":
+                    drained.append((now, payload))
+                    return
+                await sim.sleep(1.0)
+
+        sim.create_task(driver())
+        sim.run(simulation_length=SIM_LENGTH_CLEAN)
+
+        assert drained, "the delayed payload was never drained"
+        assert drained[0][0] >= 41.0 - 1e-6
+
+    def test_the_stack_drains_only_ready_payloads(self):
+        ns, gateway, campaign, stacks = _build_network(
+            config=_class_c_config(),
+            firmware=FIRMWARE_2KB,
+            device_count=1,
+            stop_after=SIM_LENGTH_CLEAN - 6,
+        )
+        stack = stacks[0]
+        seen: list[tuple[int, bytes]] = []
+
+        async def driver() -> None:
+            await sim.sleep(1.0)
+            await stack.fragmentation.queue_uplink(b"\xEE", delay=10_000.0)
+            # _next_uplink must step over the not-yet-due answer and fall back to the
+            # stack's own application payload rather than transmitting it early.
+            for _ in range(5):
+                seen.append(stack._next_uplink())
+                await sim.sleep(1.0)
+
+        sim.create_task(driver())
+        sim.run(simulation_length=SIM_LENGTH_CLEAN)
+
+        assert seen, "the driver never ran"
+        assert all(payload != b"\xEE" for _fport, payload in seen), seen
+        assert b"\xEE" in stack.fragmentation.pending_uplinks
+
+
+class TestTimeToStartSurvivesTheRealStack:
+    def test_the_server_sees_no_clock_offset(self):
+        """§4.5: TimeToStart is counted from the uplink, so a perfect clock reads as 0."""
+        ns, gateway, campaign, stacks = _build_network(
+            config=_class_c_config(),
+            firmware=FIRMWARE_2KB,
+            device_count=3,
+            stop_after=SIM_LENGTH_CLEAN - 6,
+        )
+        sim.run(simulation_length=SIM_LENGTH_CLEAN)
+
+        offsets = [
+            offset
+            for addr in DEV_ADDRS[:3]
+            for offset in campaign.multicast_setup.state(addr).clock_offset.values()
+        ]
+        assert offsets, "no device reported a session answer"
+        # The devices run on the simulation clock itself, so any non-zero offset here is
+        # queueing latency leaking into the field.
+        assert all(abs(offset) <= 1 for offset in offsets), offsets

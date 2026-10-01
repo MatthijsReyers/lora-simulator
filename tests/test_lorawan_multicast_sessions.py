@@ -11,6 +11,7 @@ Covers the generic infrastructure the TS004/TS005 FUOTA packages build on:
 
 from __future__ import annotations
 
+import logging
 import pytest
 
 from simulator.environment import simulation_env as sim
@@ -61,6 +62,9 @@ class RecordingApp(Application):
 
     async def get_downlink(self, dev_addr: int) -> bytes | None:
         return self._pending
+
+    async def has_downlink(self, dev_addr: int) -> bool:
+        return self._pending is not None
 
 
 def _new_device(**kwargs: object) -> LoRaWanDevice:
@@ -933,11 +937,11 @@ class TestRoundRobinDownlinks:
 
 class TestMaxFrmPayload:
     def test_eu868_values(self):
-        assert [max_frm_payload(dr) for dr in range(6)] == [42, 42, 42, 106, 213, 213]
+        assert [max_frm_payload(dr) for dr in range(6)] == [51, 51, 51, 115, 222, 222]
 
     def test_fopts_eat_into_the_budget(self):
-        assert max_frm_payload(5, fopts_len=15) == 198
-        assert max_frm_payload(0, fopts_len=15) == 27
+        assert max_frm_payload(5, fopts_len=15) == 207
+        assert max_frm_payload(0, fopts_len=15) == 36
 
     def test_unknown_data_rate(self):
         with pytest.raises(AssertionError):
@@ -949,39 +953,119 @@ class TestMaxFrmPayload:
 
     def test_matches_the_region_table(self):
         for dr, entry in EU868_DATA_RATES.items():
-            assert max_frm_payload(dr) == entry.max_payload - 9
+            assert max_frm_payload(dr) == entry.max_payload
 
     @pytest.mark.asyncio
     async def test_uplink_over_the_limit_is_rejected(self):
         device = _new_device(data_rate=5)
-        with pytest.raises(ValueError, match="exceeds the 213 byte"):
-            await device.send_uplink(fport=FPORT, payload=b"\x00" * 214)
+        with pytest.raises(ValueError, match="exceeds the 222 byte"):
+            await device.send_uplink(fport=FPORT, payload=b"\x00" * 223)
 
     @pytest.mark.asyncio
     async def test_uplink_at_the_limit_is_accepted(self):
         """The largest legal payload must not trip the check (it is never transmitted here)."""
         device = _new_device(data_rate=5)
-        assert max_frm_payload(5) == 213
+        assert max_frm_payload(5) == 222
         # Build-time check only; running the radio needs a simulation, so stop at the limit
         # computation itself.
-        assert len(b"\x00" * 213) <= max_frm_payload(5)
+        assert len(b"\x00" * 222) <= max_frm_payload(5)
 
     def test_multicast_payload_over_the_limit_is_rejected(self):
         ns = NetworkServer(default_data_rate=5)
         ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY)
-        with pytest.raises(ValueError, match="exceeds the 213 byte"):
+        with pytest.raises(ValueError, match="exceeds the 222 byte"):
             ns.build_multicast_downlink(MC_ADDR, fport=FPORT, payload=b"\x00" * 300)
 
     def test_multicast_group_data_rate_tightens_the_limit(self):
         ns = NetworkServer(default_data_rate=5)
         ns.create_multicast_group(MC_ADDR, MC_NWK_KEY, MC_APP_KEY, data_rate=0)
-        with pytest.raises(ValueError, match="exceeds the 42 byte"):
-            ns.build_multicast_downlink(MC_ADDR, fport=FPORT, payload=b"\x00" * 43)
+        with pytest.raises(ValueError, match="exceeds the 51 byte"):
+            ns.build_multicast_downlink(MC_ADDR, fport=FPORT, payload=b"\x00" * 52)
 
     @pytest.mark.asyncio
-    async def test_downlink_over_the_limit_is_rejected(self):
+    async def test_downlink_over_the_limit_is_dropped(self, caplog):
+        """The downlink path logs and drops rather than raising (it runs in the gateway task)."""
         ns = NetworkServer(default_data_rate=0)
         ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
         ns.queue_downlink(DEV_ADDR, fport=FPORT, payload=b"\x00" * 100)
-        with pytest.raises(ValueError, match="exceeds the 42 byte"):
-            await ns._build_downlink(ns._devices[DEV_ADDR])
+        with caplog.at_level(logging.ERROR):
+            assert await ns._build_downlink(ns._devices[DEV_ADDR]) is None
+        assert "exceeds the 51 byte" in caplog.text
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# has_pending_downlink is a non-destructive probe
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _PoppingApp(Application):
+    """An application whose ``get_downlink`` consumes its queue, as the FUOTA ones do."""
+
+    def __init__(self, fport: int = 200) -> None:
+        self._port = fport
+        self.queue: list[bytes] = []
+
+    def port(self) -> int:
+        return self._port
+
+    async def on_uplink(self, dev_addr: int, payload: bytes) -> None:
+        return None
+
+    async def get_downlink(self, dev_addr: int) -> bytes | None:
+        return self.queue.pop(0) if self.queue else None
+
+    async def has_downlink(self, dev_addr: int) -> bool:
+        return bool(self.queue)
+
+
+class TestHasPendingDownlinkDoesNotConsume:
+    @pytest.mark.asyncio
+    async def test_probing_leaves_a_queued_command_in_place(self):
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        app = _PoppingApp()
+        ns.register_application(app)
+        app.queue.append(b"\xAA")
+
+        for _ in range(3):
+            assert await ns.has_pending_downlink(DEV_ADDR) is True
+        assert app.queue == [b"\xAA"], "the probe popped the queued command"
+
+        assert await ns._build_downlink(ns._devices[DEV_ADDR]) is not None
+        assert app.queue == []
+        assert await ns.has_pending_downlink(DEV_ADDR) is False
+
+    @pytest.mark.asyncio
+    async def test_an_application_without_an_override_reports_nothing(self):
+        """The default is False: ``get_downlink`` may never be used as a probe."""
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+
+        class _OnDemandApp(_PoppingApp):
+            has_downlink = Application.has_downlink  # type: ignore[assignment]
+
+        app = _OnDemandApp()
+        ns.register_application(app)
+        app.queue.append(b"\xAA")
+
+        assert await ns.has_pending_downlink(DEV_ADDR) is False
+        assert app.queue == [b"\xAA"]
+
+    @pytest.mark.asyncio
+    async def test_the_clock_sync_package_reports_its_queue(self):
+        from simulator.lorawan.applications.clock_sync import (
+            ClockSyncServerApplication,
+            encode_app_time_req,
+        )
+
+        ns = NetworkServer()
+        ns.register_device(DEV_ADDR, NWK_S_KEY, APP_S_KEY)
+        app = ClockSyncServerApplication(time_provider=lambda: 1234)
+        ns.register_application(app)
+
+        assert await app.has_downlink(DEV_ADDR) is False
+        await app.on_uplink(DEV_ADDR, encode_app_time_req(1200, token=3))
+        assert await app.has_downlink(DEV_ADDR) is True
+        assert await ns.has_pending_downlink(DEV_ADDR) is True
+        # Still there: the probe must not have popped the AppTimeAns.
+        assert await app.get_downlink(DEV_ADDR) is not None
+        assert await app.has_downlink(DEV_ADDR) is False

@@ -170,6 +170,10 @@ class FuotaCampaignConfig:
 
     # ---- Repair (TS004 §3.2, §A.3) ----
     max_repair_rounds: int = 2
+    #: Coded fragments sent on top of the fleet's worst ``MissingFrag``. ``MissingFrag`` is
+    #: a *rank deficit* (TS004 §3.2), so it is the exact minimum a repair round must carry;
+    #: the margin covers coded fragments that turn out to be linearly dependent on what a
+    #: device already holds (§A.3).
     repair_extra_fragments: int = 2
     repair_lead_time: float | None = None
     status_participants: bool | None = None
@@ -254,9 +258,9 @@ class _CountingServerApplication(Application):
     """Counts the uplinks and unicast downlinks of one server-side package.
 
     Registered on the network server in place of the package itself. ``get_downlink`` is
-    counted rather than probed, so the campaign must not call
-    :meth:`~simulator.lorawan.network_server.NetworkServer.has_pending_downlink`, which pops
-    a package's answer without transmitting it.
+    counted on the way through; the non-destructive
+    :meth:`~simulator.lorawan.application.Application.has_downlink` probe is forwarded
+    without counting, since nothing is transmitted for it.
     """
 
     def __init__(self, inner: Application, campaign: "FuotaCampaign") -> None:
@@ -275,6 +279,9 @@ class _CountingServerApplication(Application):
         if payload is not None:
             self._campaign._unicast_downlinks += 1
         return payload
+
+    async def has_downlink(self, dev_addr: int) -> bool:
+        return await self._inner.has_downlink(dev_addr)
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +838,7 @@ class FuotaCampaign:
             logger.info(
                 f"{sim.current_time():.2f}s  CAMPAIGN  repair round "
                 f"{self.repair_rounds}/{cfg.max_repair_rounds}: the worst-off device "
-                f"misses {missing} fragment(s), sending {count}"
+                f"needs {missing} more independent fragment(s), sending {count}"
             )
 
             self._transition(FuotaCampaignState.SESSION_SETUP)

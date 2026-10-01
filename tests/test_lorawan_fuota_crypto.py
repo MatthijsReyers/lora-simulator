@@ -350,3 +350,64 @@ class TestFullChain:
                                      session_cnt=1, frag_index=0, descriptor=0)
         assert compute_data_block_mic(data_block_int_key=int_key, data_block=block,
                                       session_cnt=1, frag_index=0, descriptor=0) == mic
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The package's public surface (simulator.lorawan.fuota)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFuotaPackageExports:
+    """``__all__`` must be importable, and the TS004/TS005 name clash must be resolved.
+
+    Both modules define ``PackageVersionReq``/``Ans``, ``encode_commands``,
+    ``parse_downlink_commands``, ``parse_uplink_commands`` and
+    ``PACKAGE_IDENTIFIER``/``PACKAGE_VERSION`` with different meanings, so the package
+    re-exports them only under ``Mc``/``Frag`` prefixed aliases.
+    """
+
+    def test_every_exported_name_exists(self):
+        import simulator.lorawan.fuota as fuota
+
+        missing = [name for name in fuota.__all__ if not hasattr(fuota, name)]
+        assert missing == []
+
+    def test_the_clashing_names_are_not_exported_unprefixed(self):
+        import simulator.lorawan.fuota as fuota
+
+        for name in (
+            "PackageVersionReq",
+            "PackageVersionAns",
+            "encode_commands",
+            "parse_downlink_commands",
+            "parse_uplink_commands",
+            "PACKAGE_IDENTIFIER",
+            "PACKAGE_VERSION",
+        ):
+            assert name not in fuota.__all__
+
+    def test_the_prefixed_aliases_point_at_the_right_package(self):
+        import simulator.lorawan.fuota as fuota
+        from simulator.lorawan.fuota import frag_transport, multicast_setup
+
+        assert fuota.McPackageVersionReq is multicast_setup.PackageVersionReq
+        assert fuota.FragPackageVersionReq is frag_transport.PackageVersionReq
+        assert fuota.McPackageVersionAns is multicast_setup.PackageVersionAns
+        assert fuota.FragPackageVersionAns is frag_transport.PackageVersionAns
+        assert fuota.encode_mc_commands is multicast_setup.encode_commands
+        assert fuota.encode_frag_commands is frag_transport.encode_commands
+        assert fuota.parse_mc_uplink_commands is multicast_setup.parse_uplink_commands
+        assert fuota.parse_frag_uplink_commands is frag_transport.parse_uplink_commands
+        assert (fuota.MC_PACKAGE_IDENTIFIER, fuota.FRAG_PACKAGE_IDENTIFIER) == (2, 3)
+
+    def test_the_previously_missing_names_are_exported(self):
+        import simulator.lorawan.fuota as fuota
+
+        for name in (
+            "MAX_FRAG_SESSIONS",
+            "MAX_MISSING_FRAG",
+            "DATA_FRAGMENT_HEADER_SIZE",
+            "McGroupStatusEntry",
+            "MAX_MULTICAST_GROUPS",
+            "TIME_TO_START_UNSYNCHRONIZED",
+        ):
+            assert name in fuota.__all__

@@ -75,7 +75,7 @@ from simulator.lorawan.fuota.crypto import (
     compute_data_block_mic,
     derive_data_block_int_key,
 )
-from simulator.lorawan.fuota.device_app import FuotaDeviceApplication
+from simulator.lorawan.fuota.device_app import FuotaDeviceApplication, PendingUplink
 from simulator.lorawan.fuota.fragmentation import (
     MAX_NB_FRAG,
     FragmentationDecoder,
@@ -870,8 +870,14 @@ class DataFragment(FragCommand):
 
     @property
     def index_and_n(self) -> int:
-        """The 16-bit ``Index&N`` word (§3.6, Table 24)."""
-        return (self.frag_index << 14) | self.index_n
+        """The 16-bit ``Index&N`` word (§3.6, Table 24).
+
+        Both halves are masked to their field width (2 bits of ``FragIndex``, 14
+        bits of ``N``) so the property can never silently produce a word whose
+        ``N`` has bled into the ``FragIndex`` bits; :meth:`encode_payload`
+        rejects out-of-range values outright.
+        """
+        return ((self.frag_index & 0x03) << 14) | (self.index_n & MAX_NB_FRAG)
 
     def encode_payload(self) -> bytes:
         _check_frag_index(self.frag_index)
@@ -1239,16 +1245,36 @@ class FragSessionState:
         """
         return (self.decoder.nb_received, self.nb_frag)
 
-    def missing_uncoded_count(self) -> int:
+    def missing_frag_count(self) -> int:
         """``MissingFrag`` as reported in ``FragSessionStatusAns`` (§3.2).
 
-        Zero once the block is reassembled; otherwise the number of uncoded
-        fragments neither received directly nor reconstructed, saturated at
-        :data:`MAX_MISSING_FRAG`.
+        §3.2: *"MissingFrag is the number of uncoded fragments still missing…
+        It corresponds to the minimum number of independent coded fragments
+        still required before being able to reconstruct the data block."* The
+        second sentence is the operative one: this is the **rank deficit** of
+        the decoder, not the count of uncoded fragments that happen not to have
+        arrived directly. A device that received 28 uncoded fragments of a
+        32-fragment block plus 2 independent parity fragments needs 2 more, and
+        that is what it reports — reporting 4 would make the server over-size
+        every repair round.
+
+        Zero once the block is reassembled; saturated at :data:`MAX_MISSING_FRAG`.
+
+        See :meth:`lost_uncoded_count` for the §A.4 quantity used for the
+        ``Lmax``/``MemoryError`` decision, which *is* the uncoded-loss count.
         """
         if self.completed:
             return 0
-        return min(len(self.decoder.missing_uncoded()), MAX_MISSING_FRAG)
+        return min(self.decoder.missing_count(), MAX_MISSING_FRAG)
+
+    def lost_uncoded_count(self) -> int:
+        """``L`` of §A.4: uncoded fragments never received directly.
+
+        The quantity a device compares against its ``Lmax`` memory budget. It is
+        **not** what goes on the wire as ``MissingFrag`` — see
+        :meth:`missing_frag_count`.
+        """
+        return len(self.decoder.missing_uncoded())
 
 
 class FragmentationDeviceApplication(FuotaDeviceApplication):
@@ -1287,7 +1313,23 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
       an unknown ``FragIndex`` is always answered with the 1-octet
       "session does not exist" form, including when ``Participants = 0``: a
       device with no session has certainly not received the block, so it belongs
-      to the "still missing fragments" set.
+      to the "still missing fragments" set. This is a reading, not a quotation —
+      §3.2 says only that with ``Participants = 0`` "only the receivers that are
+      still missing fragments SHALL answer", without qualifying what a receiver
+      with no session at all does. The opposite reading (stay silent, since
+      there is nothing to report) would turn a targeted poll into a quieter one
+      in a large group where many devices lost their context; this package does
+      not implement it, and there is no configuration flag for it.
+    - **One uplink per command.** Every handler calls ``queue_uplink`` on its
+      own, so a downlink carrying several TS004 commands is answered with
+      several uplinks. §3 permits concatenating the answers into one message,
+      which is what the TS005 package
+      (:class:`~simulator.lorawan.fuota.multicast_setup.MulticastSetupDeviceApplication`)
+      does. Both are legal. Keeping them separate here is deliberate: TS004
+      answers carry *per command* spreading delays (``BlockAckDelay``), and
+      merging them would force the whole group's answers back into one instant —
+      exactly what §3.2 asks a device to avoid. The cost is extra uplinks when a
+      server batches commands, which a campaign can avoid by not batching.
 
     Reference: LoRaWAN Fragmented Data Block Transport TS004-2.0.0 §3.
     """
@@ -1491,6 +1533,12 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
         if req.frag_index >= self.max_sessions:
             answer.frag_index_unsupported = True
 
+        if req.frag_size == 0:
+            # TS004 gives no status bit for a nonsensical FragSize. A session with
+            # zero-octet fragments cannot carry a data block at all, and accepting it
+            # crashes the decoder, so it is refused with the closest bit the spec has.
+            answer.not_enough_memory = True
+
         if self.max_nb_frag is not None and req.nb_frag > self.max_nb_frag:
             answer.not_enough_memory = True
         if (
@@ -1549,8 +1597,12 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
         session.frames_received += 1
         complete = session.decoder.receive(fragment.index_n, fragment.payload)
 
-        if not complete and self.lmax is not None:
-            lost = len(session.decoder.missing_uncoded())
+        if not complete and self.lmax is not None and fragment.index_n > session.nb_frag:
+            # §A.4: L is the number of uncoded fragments lost *among the first M*. It is
+            # only knowable once the transmitter has moved past N = M — before that an
+            # uncoded fragment that has simply not been sent yet is not a loss, and
+            # evaluating the budget early aborts every session whose Lmax is below NbFrag.
+            lost = len([n for n in session.decoder.missing_uncoded() if n <= session.nb_frag])
             if lost > self.lmax:
                 session.memory_error = True
                 logger.warning(
@@ -1608,11 +1660,15 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
         )
         session.ack_pending = True
 
-        if self.device is not None and sim.is_running():
+        if sim.is_running():
+            # The retransmission loop needs a clock, not a device: without one attached it
+            # re-queues the request for whoever drains the queue (the device stack), which
+            # is the only path a full campaign uses.
             await sim.start_child_task(self._block_received_loop(session))
             return
 
-        # No device attached: queue a single request for pop_pending_uplink().
+        # No simulation to hang a task off (codec-level use): queue a single request for
+        # pop_pending_uplink().
         await self.queue_uplink(session.ack_payload, delay=self._ack_delay(session))
         session.ack_attempts = 1
 
@@ -1620,18 +1676,28 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
         """Send ``FragDataBlockReceivedReq`` until it is answered (§3.5).
 
         The first delay and every retransmission interval follow the
-        ``BlockAckDelay`` rule unless :attr:`ack_retry_interval` overrides it.
-        TS004 leaves the retry count to the application: it is
+        ``BlockAckDelay`` rule unless :attr:`ack_retry_interval` overrides it —
+        §3.5 asks for "the same rules" as §3.3 for the spacing of
+        retransmissions. TS004 leaves the retry count to the application: it is
         :attr:`max_ack_retries` here.
+
+        Each round cancels the previous copy if it is still waiting in the
+        queue, so a slow drain cannot turn ``max_ack_retries`` into a burst of
+        identical uplinks.
         """
         try:
+            queued: PendingUplink | None = None
             for attempt in range(self.max_ack_retries + 1):
                 delay = self._ack_delay(session)
                 if delay > 0:
                     await sim.sleep(delay)
                 if not session.ack_pending:
+                    if queued is not None:
+                        self.cancel_pending(queued)
                     return
-                await self.queue_uplink(session.ack_payload)
+                if queued is not None:
+                    self.cancel_pending(queued)
+                queued = await self.queue_uplink(session.ack_payload)
                 session.ack_attempts = attempt + 1
             logger.warning(
                 f"{sim.current_time():.2f}s  TS004-DEV  session {session.frag_index} "
@@ -1672,7 +1738,7 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
                     f"staying silent"
                 )
                 return
-            missing = session.missing_uncoded_count()
+            missing = session.missing_frag_count()
             answer = FragSessionStatusAns(
                 frag_index=req.frag_index,
                 nb_frag_received=session.frames_received,
@@ -1883,8 +1949,8 @@ class FragmentationServerApplication(Application):
         """Largest ``FragSize`` that still fits one frame at *data_rate* (§3.6).
 
         The region's maximum application payload minus the 3 octets of
-        ``DataFragment`` overhead. For EU868 with empty FOpts this is 39 octets
-        at DR0–DR2, 103 at DR3 and 210 at DR4–DR5.
+        ``DataFragment`` overhead. For EU868 with empty FOpts this is 48 octets
+        at DR0–DR2, 112 at DR3 and 219 at DR4–DR5.
         """
         return max_fragment_payload(max_frm_payload(data_rate, fopts_len))
 
@@ -2133,6 +2199,14 @@ class FragmentationServerApplication(Application):
             return None
         return queue.popleft()
 
+    async def has_downlink(self, dev_addr: int) -> bool:
+        """Non-destructive probe: whether a command is queued for a device.
+
+        ``get_downlink`` pops, so :meth:`~simulator.lorawan.network_server.NetworkServer.has_pending_downlink`
+        asks this instead.
+        """
+        return bool(self._pending.get(dev_addr))
+
     def pending_downlinks(self, dev_addr: int) -> list[bytes]:
         """Queued but unsent commands for a device, oldest first (read-only)."""
         return list(self._pending.get(dev_addr, ()))
@@ -2272,10 +2346,17 @@ class FragmentationServerApplication(Application):
     def max_missing(self, frag_index: int) -> int:
         """Largest ``MissingFrag`` across the latest status answers (§3.2).
 
-        The number of *independent* coded fragments the worst-off device still
-        needs, and therefore the minimum size of a repair round. §A.3 suggests
-        budgeting a couple of fragments on top, since a coded fragment can turn
-        out to be linearly dependent.
+        ``MissingFrag`` is defined by §3.2 as "the minimum number of independent
+        coded fragments still required before being able to reconstruct the data
+        block", i.e. the device's **rank deficit** — not the number of uncoded
+        fragments it failed to hear. The maximum over the fleet is therefore the
+        exact lower bound on the size of a repair round: send fewer and the
+        worst-off device still cannot decode.
+
+        It is a *lower* bound only: §A.3 suggests budgeting a couple of
+        fragments on top, because a freshly generated coded fragment can turn
+        out to be linearly dependent on what a device already holds. See
+        :attr:`~simulator.lorawan.fuota.campaign.FuotaCampaignConfig.repair_extra_fragments`.
         """
         return max(
             (

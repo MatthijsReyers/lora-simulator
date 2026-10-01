@@ -679,7 +679,6 @@ class LoRaWanDevice:
         self._class_c_stop.clear()
         self._class_c_running = True
         await sim.start_child_task(self._class_c_rx_loop())
-        self._class_c_task = True  # type: ignore[assignment]
 
     def _stop_class_c_rx(self) -> None:
         """Stop the Class C continuous RX background task."""

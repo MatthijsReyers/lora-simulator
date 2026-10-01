@@ -153,3 +153,7 @@ class ClockSyncServerApplication(Application):
 
     async def get_downlink(self, dev_addr: int) -> bytes | None:
         return self._pending_responses.pop(dev_addr, None)
+
+    async def has_downlink(self, dev_addr: int) -> bool:
+        """Non-destructive probe: whether an ``AppTimeAns`` is waiting for a device."""
+        return dev_addr in self._pending_responses

@@ -28,8 +28,15 @@ Conventions (normative, TS005-2.0.0 §1.5 "Conventions"):
   ``CID | payload | CID | payload | …`` (§3); they are executed first to last
   and each is individually acknowledged on the same FPort.
 - All TS005 messages SHALL be sent unicast; a device SHALL silently drop them
-  when received on a multicast address (§3).  That rule is enforced by the
-  callers of this module, not by the codecs.
+  when received on a multicast address (§3).  **That rule is not implemented
+  here.** ``Application.on_downlink`` is handed the plaintext only, with no
+  indication of the address the frame was received on, so neither the codecs nor
+  :class:`MulticastSetupDeviceApplication` can tell the two apart; no caller in
+  the simulator enforces it either. Nothing in the simulator ever sends a TS005
+  command on a multicast address, so the rule is moot in practice — it would
+  only matter for a test deliberately modelling a misbehaving server.
+  :mod:`simulator.lorawan.fuota.frag_transport` has the same limitation for the
+  TS004 ``McGroupBitMask`` rule and documents it the same way.
 
 Implementation decisions where TS005-2.0.0 is silent (see also the digest of
 ambiguities):
@@ -1049,9 +1056,21 @@ EU868_MAX_DL_FREQUENCY = 870_000_000
 def _dl_frequency_supported(dl_frequency: int) -> bool:
     """Whether a ``DLFreq`` value is usable by an EU868 device (TS005 §4.5/§4.6).
 
-    ``DLFreq = 0`` is always accepted: for Class C it means "keep the group's
-    own channel" and for Class B it selects the region's default beacon
-    frequency-hopping scheme (§4.6).
+    ``DLFreq = 0`` is always accepted, but only one of the two readings is the
+    specification's:
+
+    - **Class B — normative.** §4.6 defines ``DLFreq = 0`` as "the device uses
+      the frequency-hopping scheme of the beacon", i.e. the region's default.
+    - **Class C — a simulator choice.** §4.5 gives ``DLFreq`` the semantics of
+      the ``NewChannelReq`` MAC command's ``Freq`` field, where 0 means "disable
+      this channel" — not "use a default". TS005 does not say what a device does
+      with ``DLFreq = 0`` in an ``McClassCSessionReq``, and refusing it with
+      ``FreqError`` would be just as defensible. This implementation accepts it
+      and resolves it with :meth:`MulticastSetupDeviceApplication._session_frequency`
+      to the multicast group's own channel, falling back to the region's RX2
+      default. The choice makes a session request usable without repeating the
+      group's channel in it, which is convenient for campaign code; it is
+      documented here precisely because it is *not* in the specification.
     """
     if dl_frequency == 0:
         return True
@@ -1101,6 +1120,26 @@ class MulticastSetupDeviceApplication(FuotaDeviceApplication):
     with ``join_multicast_group`` and sessions with ``start_class_c_session`` /
     ``start_class_b_session``. Without one the package keeps its own dictionary
     of contexts so the state machine can be unit tested without a simulation.
+
+    Simulator choices, where TS005 asks for behaviour this package does not
+    implement:
+
+    - **The unicast-class × multicast-class compatibility table of §4.5/§4.6 is
+      not enforced.** TS005 states that a device operating in unicast Class A+B
+      may not simultaneously run a multicast *Class C* session, and that a
+      device in unicast Class A+C may not simultaneously run a multicast *Class
+      B* session. This package accepts either combination: it schedules the
+      session, and :meth:`~simulator.lorawan.device.LoRaWanDevice` reverts to the
+      previous operating mode when the session window closes. TS005 provides no
+      status bit for the refusal, so declining would have to be local policy
+      expressed as ``McGroupUndefined`` or a silent drop — both worse for a
+      simulation whose point is to measure what such a session costs. A study
+      that needs the restriction should assert on
+      :attr:`session_history` rather than expect the package to refuse.
+    - **``TimeToStart`` is bound at transmission time**, not when the request is
+      handled — see :meth:`_refresh_time_to_start`. That is what §4.5 asks for
+      ("the number of seconds from the ``McClassCSessionAns`` uplink"), and it
+      keeps the server's clock-offset estimate free of queueing latency.
 
     Reference: LoRaWAN Remote Multicast Setup TS005-2.0.0 §3 to §4.6.
     """
@@ -1193,6 +1232,7 @@ class MulticastSetupDeviceApplication(FuotaDeviceApplication):
         if not commands:
             return
 
+        history_start = len(self.session_history)
         answers: list[MulticastSetupCommand] = []
         used = 0
         for command in commands:
@@ -1205,14 +1245,54 @@ class MulticastSetupDeviceApplication(FuotaDeviceApplication):
         if not answers:
             return
 
-        encoded = encode_commands(answers)
+        # §4.5: TimeToStart "encodes the number of seconds from the McClassC/BSessionAns
+        # uplink" to the start of the session — not from the downlink that asked for it.
+        # Any delay between handling the request and getting the answer on the air would
+        # otherwise show up at the server as a device clock offset. The answers that carry a
+        # TimeToStart are therefore re-encoded by a late-binding builder, evaluated the
+        # instant before the uplink goes out (see FuotaDeviceApplication.queue_uplink).
+        timed = [
+            (entry.answer, entry.session_time)
+            for entry in self.session_history[history_start:]
+            if entry.answer.time_to_start is not None
+            and any(entry.answer is answer for answer in answers)
+        ]
+
         logger.info(
             f"{sim.current_time():.2f}s  MC-SETUP  answering "
-            f"{len(commands)} command(s) with {len(answers)} answer(s), {len(encoded)} bytes"
+            f"{len(commands)} command(s) with {len(answers)} answer(s), "
+            f"{len(encode_commands(answers))} bytes"
         )
         # TS005 commands are unicast (§3), so there is no need to spread the answers of a
         # whole group in time the way TS004's BlockAckDelay does.
-        await self.queue_uplink(encoded)
+        if not timed:
+            await self.queue_uplink(encode_commands(answers))
+            return
+
+        def _rebuild() -> bytes:
+            self._refresh_time_to_start(timed)
+            return encode_commands(answers)
+
+        await self.queue_uplink(_rebuild)
+
+    def _refresh_time_to_start(
+        self, timed: Sequence[tuple[_SessionAns, int]],
+    ) -> None:
+        """Re-encode ``TimeToStart`` against the current clock (TS005 §4.5).
+
+        Called from the late-binding uplink builder, i.e. at transmission time. A session
+        whose start has slipped into the past by the time the answer actually goes out is
+        reported as ``StartMissed`` with no ``TimeToStart`` at all, which is the only legal
+        encoding for it (the field is present iff status bits 2..7 are clear).
+        """
+        now = int(self._time_provider())
+        for answer, session_time in timed:
+            remaining = session_time - now
+            if remaining < 0:
+                answer.start_missed = True
+                answer.time_to_start = None
+            else:
+                answer.time_to_start = min(remaining, TIME_TO_START_UNSYNCHRONIZED)
 
     async def _handle_command(
         self, command: MulticastSetupCommandType, *, budget: int,
@@ -1431,11 +1511,13 @@ class MulticastSetupDeviceApplication(FuotaDeviceApplication):
 
         ``SessionTime`` SHALL be an integer multiple of 128 s (one beacon
         period). The specification does not say what a device does with a
-        misaligned value; this implementation **rounds down to the preceding
-        beacon boundary** and logs a warning, so a misaligned request still
-        lines up with a beacon instead of being silently dropped. Rounding down
-        can push the start into the past, in which case ``StartMissed`` is
-        raised exactly as it would be for any other past session.
+        misaligned value; this implementation **rounds up to the next beacon
+        boundary** and logs a warning, so a misaligned request still lines up
+        with a beacon instead of being silently dropped. Rounding *up* never
+        moves the start backwards, so it cannot manufacture a ``StartMissed``
+        that the server did not ask for, and it matches what
+        :class:`~simulator.lorawan.fuota.campaign.FuotaCampaign` does when it
+        aligns a Class B ``SessionTime`` on the server side.
         """
         group, undefined, dr_error, freq_error = self._validate_session(
             req.group_id, req.data_rate, req.dl_frequency,
@@ -1444,11 +1526,11 @@ class MulticastSetupDeviceApplication(FuotaDeviceApplication):
 
         session_time = req.session_time
         if session_time % BEACON_INTERVAL != 0:
-            aligned = session_time - (session_time % BEACON_INTERVAL)
+            aligned = session_time + (BEACON_INTERVAL - session_time % BEACON_INTERVAL)
             logger.warning(
                 f"{sim.current_time():.2f}s  MC-SETUP  McClassBSessionReq SessionTime "
                 f"{session_time} is not a multiple of {BEACON_INTERVAL} s (TS005 §4.6), "
-                f"rounding down to {aligned}"
+                f"rounding up to {aligned}"
             )
             session_time = aligned
 
@@ -1913,6 +1995,15 @@ class MulticastSetupServerApplication(Application):
         return self.network_server._default_data_rate
 
     # ---- Application plumbing ----
+
+    async def has_downlink(self, dev_addr: int) -> bool:
+        """Non-destructive probe: whether a command is queued for a device.
+
+        ``get_downlink`` pops, so
+        :meth:`~simulator.lorawan.network_server.NetworkServer.has_pending_downlink`
+        asks this instead.
+        """
+        return bool(self._pending.get(dev_addr))
 
     async def get_downlink(self, dev_addr: int) -> bytes | None:
         """Hand the network server the next FRMPayload for a device.

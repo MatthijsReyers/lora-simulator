@@ -1092,7 +1092,7 @@ class TestDeviceAppClassBSession:
         assert record.timeout_seconds == 512
 
     @pytest.mark.asyncio
-    async def test_misaligned_session_time_rounds_down_to_a_beacon(self) -> None:
+    async def test_misaligned_session_time_rounds_up_to_a_beacon(self) -> None:
         app = await self._app_with_group()
         await app.on_downlink(encode_commands([McClassBSessionReq(
             group_id=0, session_time=1300, periodicity=4, session_timeout=2,
@@ -1101,19 +1101,34 @@ class TestDeviceAppClassBSession:
         answer = _answers(app)[0]
         record = app.session_history[0]
         assert record.requested_session_time == 1300
-        assert record.session_time == 1280
+        # TS005 §4.6 SessionTime must be a multiple of 128 s; the device rounds *up* so the
+        # start can never move into the past (and so it agrees with FuotaCampaign).
+        assert record.session_time == 1408
         assert record.session_time % 128 == 0
-        assert answer.time_to_start == 280
+        assert answer.time_to_start == 408
 
     @pytest.mark.asyncio
-    async def test_rounding_down_into_the_past_is_start_missed(self) -> None:
+    async def test_rounding_up_never_manufactures_start_missed(self) -> None:
+        """A SessionTime just past "now" rounds forward, so it is not reported as missed."""
         app = await self._app_with_group()
         await app.on_downlink(encode_commands([McClassBSessionReq(
             group_id=0, session_time=1010, periodicity=4, session_timeout=2,
             dl_frequency=0, data_rate=3,
         )]))
         answer = _answers(app)[0]
-        assert app.session_history[0].session_time == 896
+        assert app.session_history[0].session_time == 1024
+        assert answer.start_missed is False
+        assert answer.time_to_start == 24
+
+    @pytest.mark.asyncio
+    async def test_a_session_time_in_the_past_is_still_start_missed(self) -> None:
+        app = await self._app_with_group()
+        await app.on_downlink(encode_commands([McClassBSessionReq(
+            group_id=0, session_time=500, periodicity=4, session_timeout=2,
+            dl_frequency=0, data_rate=3,
+        )]))
+        answer = _answers(app)[0]
+        assert app.session_history[0].session_time == 512
         assert answer.start_missed is True
 
     @pytest.mark.asyncio
@@ -1520,3 +1535,122 @@ class TestRoundTripOverNetworkServer:
         assert server_app.devices_in_session(0) == {DEV_ADDR_A}
         assert server_app.device_state[DEV_ADDR_A].time_to_start == {0: 500}
         assert device_app.session_history[0].data_rate == 3
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TimeToStart is measured from the uplink (TS005 §4.5)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _MovableClock:
+    """A ``time_provider`` a test can advance between handling and transmitting."""
+
+    def __init__(self, now: int = 1000) -> None:
+        self.now = now
+
+    def __call__(self) -> int:
+        return self.now
+
+
+class TestTimeToStartIsBoundAtTransmissionTime:
+    """§4.5: TimeToStart "encodes the number of seconds from the McClassCSessionAns uplink".
+
+    Encoding it when the request is *handled* makes every queueing delay look like a device
+    clock offset to the server, which is the one thing the field exists to detect.
+    """
+
+    @staticmethod
+    async def _app_with_group(clock: _MovableClock) -> MulticastSetupDeviceApplication:
+        app = _device_app(time_provider=clock)
+        await app.on_downlink(encode_commands([_setup_req(group_id=0)]))
+        app.pop_pending_uplink()
+        return app
+
+    @pytest.mark.asyncio
+    async def test_the_transmitted_value_reflects_the_send_time(self) -> None:
+        clock = _MovableClock(1000)
+        app = await self._app_with_group(clock)
+
+        await app.on_downlink(encode_commands([McClassCSessionReq(
+            group_id=0, session_time=1300, session_timeout=8,
+            dl_frequency=869_525_000, data_rate=0,
+        )]))
+
+        # The answer sits in the queue while the device waits for its next uplink slot.
+        clock.now = 1100
+        answer = _answers(app)[0]
+        assert isinstance(answer, McClassCSessionAns)
+        assert answer.has_error is False
+        assert answer.time_to_start == 200  # 1300 - 1100, not 1300 - 1000
+
+    @pytest.mark.asyncio
+    async def test_a_start_that_slips_past_becomes_start_missed(self) -> None:
+        clock = _MovableClock(1000)
+        app = await self._app_with_group(clock)
+
+        await app.on_downlink(encode_commands([McClassCSessionReq(
+            group_id=0, session_time=1050, session_timeout=8,
+            dl_frequency=869_525_000, data_rate=0,
+        )]))
+
+        clock.now = 1200  # the session started while the answer was still queued
+        answer = _answers(app)[0]
+        assert isinstance(answer, McClassCSessionAns)
+        assert answer.start_missed is True
+        assert answer.time_to_start is None
+
+    @pytest.mark.asyncio
+    async def test_class_b_answers_are_rebuilt_too(self) -> None:
+        clock = _MovableClock(1000)
+        app = await self._app_with_group(clock)
+
+        await app.on_downlink(encode_commands([McClassBSessionReq(
+            group_id=0, session_time=1280, periodicity=4, session_timeout=2,
+            dl_frequency=0, data_rate=3,
+        )]))
+
+        clock.now = 1080
+        answer = _answers(app)[0]
+        assert isinstance(answer, McClassBSessionAns)
+        assert answer.time_to_start == 200
+
+    @pytest.mark.asyncio
+    async def test_the_saturation_value_still_applies(self) -> None:
+        clock = _MovableClock(0)
+        app = await self._app_with_group(clock)
+
+        await app.on_downlink(encode_commands([McClassCSessionReq(
+            group_id=0, session_time=0xFFFFFFF, session_timeout=8,
+            dl_frequency=869_525_000, data_rate=0,
+        )]))
+
+        answer = _answers(app)[0]
+        assert answer.time_to_start == TIME_TO_START_UNSYNCHRONIZED
+
+    @pytest.mark.asyncio
+    async def test_an_answer_without_a_session_is_untouched(self) -> None:
+        """A payload with no TimeToStart in it is queued as plain octets."""
+        clock = _MovableClock(1000)
+        app = _device_app(time_provider=clock)
+        await app.on_downlink(encode_commands([PackageVersionReq()]))
+        clock.now = 9999
+        answer = _answers(app)[0]
+        assert isinstance(answer, PackageVersionAns)
+
+
+class TestServerHasDownlinkIsNonDestructive:
+    @pytest.mark.asyncio
+    async def test_probing_does_not_consume_a_queued_command(self) -> None:
+        ns, server = _server()
+        ns.register_application(server)
+        server.setup_group(
+            [DEV_ADDR_A], group_id=0, mc_addr=MC_ADDR, mc_key=MC_KEY,
+        )
+        assert len(server.pending_commands(DEV_ADDR_A)) == 1
+
+        assert await server.has_downlink(DEV_ADDR_A) is True
+        assert await ns.has_pending_downlink(DEV_ADDR_A) is True
+        assert len(server.pending_commands(DEV_ADDR_A)) == 1
+
+        assert await server.get_downlink(DEV_ADDR_A) is not None
+        assert await server.has_downlink(DEV_ADDR_A) is False
+        assert await ns.has_pending_downlink(DEV_ADDR_A) is False

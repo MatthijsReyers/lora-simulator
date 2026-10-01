@@ -151,12 +151,23 @@ class LoRaWanGateway:
     # ---- Shared transmitter ----
 
     async def _transmit(self, raw: bytes) -> float:
-        """Transmit with the current radio configuration, holding the transmitter lock."""
-        if self.duty_cycle is not None:
-            # Book the medium before the frame goes out: anything that checks the budget in
-            # the tick the transmission ends in has to already see the quiet time.
-            self.duty_cycle.reserve(self._estimated_airtime(raw, None))
+        """Transmit with the current radio configuration, holding the transmitter lock.
+
+        **Simulator choice — the duty cycle is a budget, not a gate, on this path.** Only
+        :meth:`_multicast_scheduler` ever calls ``duty_cycle.wait_for_slot()``; RX1 replies
+        and Class B beacons are unmovable in time (a device opens its window once and a
+        beacon paces the whole Class B network), so they are transmitted unconditionally and
+        merely *charged* to the budget. The practical effect is that unicast and beacon
+        traffic can push the multicast scheduler into a longer quiet period, which is the
+        conservative direction for a FUOTA study.
+        """
         async with self._radio_lock:
+            if self.duty_cycle is not None:
+                # Book the medium once the transmitter is actually ours: reserving before
+                # the lock would start the quiet period while the frame is still waiting,
+                # and end it too early. Anything that checks the budget in the tick this
+                # transmission ends in has to already see the quiet time.
+                self.duty_cycle.reserve(self._estimated_airtime(raw, None))
             airtime = await self.radio.transmit_data_blocking(raw)
             await self.radio.receive(continuous=True)
         return float(airtime)
@@ -300,9 +311,19 @@ class LoRaWanGateway:
             )
             return
 
-        raw = self.network_server.build_multicast_downlink(
-            entry.group_addr, fport=entry.fport, payload=entry.payload,
-        )
+        try:
+            raw = self.network_server.build_multicast_downlink(
+                entry.group_addr, fport=entry.fport, payload=entry.payload,
+            )
+        except ValueError as exc:
+            # This runs inside the gateway's multicast task, where an exception is a fatal
+            # simulation error. An oversized or over-counted frame is an application bug:
+            # log it and drop the frame, the way a real concentrator would reject it.
+            logger.error(
+                f"{sim.current_time():.2f}s  GW  dropping multicast for "
+                f"0x{entry.group_addr:08X}: {exc}"
+            )
+            return
 
         logger.debug(
             f"{sim.current_time():.2f}s  GW  multicast TX  "

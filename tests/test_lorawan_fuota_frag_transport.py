@@ -10,6 +10,7 @@ import random
 
 import pytest
 
+from simulator.environment import simulation_env as sim
 from simulator.lorawan.crypto import compute_data_mic, encrypt_frm_payload
 from simulator.lorawan.enums.frame_types import MType
 from simulator.lorawan.frame import FCtrl, FHDR, MACPayload, MHDR, PHYPayload
@@ -1513,9 +1514,9 @@ class TestServerSessionCreation:
             )
 
     def test_fragment_payload_size_for_matches_the_region(self):
-        assert FragmentationServerApplication.fragment_payload_size_for(0) == 39
-        assert FragmentationServerApplication.fragment_payload_size_for(3) == 103
-        assert FragmentationServerApplication.fragment_payload_size_for(5) == 210
+        assert FragmentationServerApplication.fragment_payload_size_for(0) == 48
+        assert FragmentationServerApplication.fragment_payload_size_for(3) == 112
+        assert FragmentationServerApplication.fragment_payload_size_for(5) == 219
         assert FragmentationServerApplication.fragment_payload_size_for(5, 15) == (
             max_frm_payload(5, 15) - DATA_FRAGMENT_HEADER_SIZE
         )
@@ -1877,3 +1878,340 @@ class TestEndToEndOverNetworkServer:
         assert ack_ans is not None
         await device_app.on_downlink(ack_ans)
         assert not device_app.sessions[0].ack_pending
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Spec-conformance regressions (TS004-2.0.0 §3.2, §3.3, §3.5, §3.6, §A.4)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestLmaxIsEvaluatedAfterTheUncodedFragments:
+    """§A.4: ``L`` is the number of fragments lost *among the first M*.
+
+    It is only knowable once the transmitter has moved past ``N = M``. Evaluating the
+    budget on every fragment made every session with ``Lmax < NbFrag`` abort on its very
+    first fragment, because nothing had been transmitted yet.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_small_lmax_does_not_abort_a_healthy_session(self):
+        data = _block(400)
+        encoder = FragmentationEncoder(data, 20)  # NbFrag = 20
+        app = FragmentationDeviceApplication(lmax=4)  # Lmax well below NbFrag
+        await app.on_downlink(_app_setup_req(data, 20).encode())
+        app.pop_pending_uplink()
+
+        # The very first fragment used to trip the budget: 19 uncoded fragments were not
+        # received *yet*, which is not the same as lost.
+        await _feed(app, encoder, [1])
+        assert app.sessions[0].memory_error is False
+
+        await _feed(app, encoder, range(2, encoder.nb_frag + 1))
+        assert app.sessions[0].memory_error is False
+        assert app.is_complete(0)
+        assert app.completed_blocks[0] == data
+
+    @pytest.mark.asyncio
+    async def test_exactly_lmax_losses_are_still_tolerated(self):
+        data = _block(400)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(lmax=4)
+        await app.on_downlink(_app_setup_req(data, 20).encode())
+        app.pop_pending_uplink()
+
+        lost = {3, 6, 9, 12}  # exactly Lmax
+        await _feed(app, encoder, [n for n in range(1, 21) if n not in lost])
+        await _feed(app, encoder, [21])  # first coded fragment: the budget is now checked
+
+        assert app.sessions[0].memory_error is False
+        assert app.sessions[0].lost_uncoded_count() == 4
+
+    @pytest.mark.asyncio
+    async def test_more_than_lmax_losses_abort_once_the_block_is_past_m(self):
+        data = _block(400)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(lmax=4)
+        await app.on_downlink(_app_setup_req(data, 20).encode())
+        app.pop_pending_uplink()
+
+        lost = {3, 6, 9, 12, 15}  # one more than Lmax
+        await _feed(app, encoder, [n for n in range(1, 21) if n not in lost])
+        assert app.sessions[0].memory_error is False, "not knowable before N > M"
+
+        await _feed(app, encoder, [21])
+        assert app.sessions[0].memory_error is True
+        assert app.sessions[0].lost_uncoded_count() == 5
+
+        await app.on_downlink(FragSessionStatusReq().encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.memory_error is True
+
+
+class TestMissingFragIsTheRankDeficit:
+    """§3.2: ``MissingFrag`` is "the minimum number of independent coded fragments still
+    required before being able to reconstruct the data block"."""
+
+    @staticmethod
+    async def _app_with_28_of_32(app_kwargs: dict | None = None):
+        data = _block(320)
+        encoder = FragmentationEncoder(data, 10)  # NbFrag = 32
+        assert encoder.nb_frag == 32
+        app = FragmentationDeviceApplication(**(app_kwargs or {}))
+        await app.on_downlink(_app_setup_req(data, 10).encode())
+        app.pop_pending_uplink()
+        await _feed(app, encoder, range(1, 29))  # 28 uncoded fragments
+        return app, encoder
+
+    @pytest.mark.asyncio
+    async def test_coded_fragments_reduce_missing_frag(self):
+        app, encoder = await self._app_with_28_of_32()
+        decoder = app.sessions[0].decoder
+        assert decoder.nb_received == 28
+        assert app.sessions[0].missing_frag_count() == 4
+
+        # Feed coded fragments until two of them were linearly independent.
+        n = encoder.nb_frag + 1
+        while decoder.nb_received < 30:
+            await _feed(app, encoder, [n])
+            n += 1
+
+        # Four uncoded fragments were never heard directly, but only two more independent
+        # fragments are actually needed — and that is what goes on the wire.
+        assert app.sessions[0].lost_uncoded_count() == 4
+        assert app.sessions[0].missing_frag_count() == 2
+
+        await app.on_downlink(FragSessionStatusReq().encode())
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionStatusAns)
+        assert ans.missing_frag == 2
+
+    @pytest.mark.asyncio
+    async def test_a_complete_block_reports_zero(self):
+        app, encoder = await self._app_with_28_of_32()
+        n = encoder.nb_frag + 1
+        while not app.is_complete(0):
+            await _feed(app, encoder, [n])
+            n += 1
+        assert app.sessions[0].missing_frag_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_the_server_sizes_a_repair_round_from_the_rank_deficit(self):
+        app, encoder = await self._app_with_28_of_32()
+        decoder = app.sessions[0].decoder
+        n = encoder.nb_frag + 1
+        while decoder.nb_received < 30:
+            await _feed(app, encoder, [n])
+            n += 1
+
+        await app.on_downlink(FragSessionStatusReq().encode())
+        answer = app.pop_pending_uplink()
+        assert answer is not None
+
+        ns, server = _server()
+        await server.on_uplink(DEV_ADDR, answer)
+        assert server.max_missing(0) == 2
+
+
+class TestSetupRejectsAZeroFragSize:
+    @pytest.mark.asyncio
+    async def test_frag_size_zero_is_refused_with_not_enough_memory(self):
+        app = FragmentationDeviceApplication()
+        req = FragSessionSetupReq(nb_frag=4, frag_size=0, session_cnt=1)
+        await app.on_downlink(req.encode())
+
+        ans = _single_uplink(app)
+        assert isinstance(ans, FragSessionSetupAns)
+        assert ans.not_enough_memory is True
+        assert ans.accepted is False
+        assert app.sessions == {}
+
+
+class TestDataFragmentIndexMasking:
+    def test_index_and_n_masks_both_fields(self):
+        assert DataFragment(1, 5, b"").index_and_n == (1 << 14) | 5
+        # An out-of-range N can no longer bleed into the FragIndex bits.
+        assert DataFragment(0, MAX_NB_FRAG + 2, b"").index_and_n == 1
+        assert DataFragment(5, 1, b"").index_and_n == (1 << 14) | 1
+
+    def test_encode_payload_still_rejects_out_of_range_values(self):
+        with pytest.raises(ValueError):
+            DataFragment(0, MAX_NB_FRAG + 2, b"").encode_payload()
+
+
+class TestServerHasDownlinkIsNonDestructive:
+    @pytest.mark.asyncio
+    async def test_probing_does_not_consume_a_queued_command(self):
+        ns, server = _server()
+        data = _block(200)
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=data, frag_size=20, session_cnt=1
+        )
+        assert len(server.pending_downlinks(DEV_ADDR)) == 1
+
+        assert await server.has_downlink(DEV_ADDR) is True
+        assert await ns.has_pending_downlink(DEV_ADDR) is True
+        # Neither probe may pop the FragSessionSetupReq.
+        assert len(server.pending_downlinks(DEV_ADDR)) == 1
+
+        assert await server.get_downlink(DEV_ADDR) is not None
+        assert await server.has_downlink(DEV_ADDR) is False
+        assert await ns.has_pending_downlink(DEV_ADDR) is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The shared uplink queue (FuotaDeviceApplication)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _RecordingDevice:
+    """The only part of ``LoRaWanDevice`` a FUOTA package's uplink queue touches."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[float, int, bytes]] = []
+
+    async def send_uplink(self, fport: int, payload: bytes) -> None:
+        self.sent.append((sim.current_time(), fport, payload))
+
+
+class TestUplinkQueueDelays:
+    def test_each_payload_keeps_its_own_delay(self):
+        """A delayed answer must not swap places with an undelayed one queued after it.
+
+        Popping "the queue head" after sleeping sent ``p1`` immediately and held ``p2``
+        back for 10 s — exactly backwards, and enough to defeat the §3.2 ``BlockAckDelay``
+        spreading of a status answer concatenated behind a setup request.
+        """
+        device = _RecordingDevice()
+        app = FragmentationDeviceApplication(device)  # type: ignore[arg-type]
+
+        async def driver() -> None:
+            await app.queue_uplink(b"p1", delay=10.0)
+            await app.queue_uplink(b"p2", delay=0.0)
+
+        sim.create_task(driver())
+        sim.run(simulation_length=30)
+
+        assert [payload for _t, _p, payload in device.sent] == [b"p2", b"p1"]
+        assert device.sent[0][0] == pytest.approx(0.0, abs=1e-6)
+        assert device.sent[1][0] == pytest.approx(10.0, abs=1e-6)
+
+    def test_equal_delays_keep_fifo_order(self):
+        device = _RecordingDevice()
+        app = FragmentationDeviceApplication(device)  # type: ignore[arg-type]
+
+        async def driver() -> None:
+            for index in range(4):
+                await app.queue_uplink(bytes([index]), delay=5.0)
+
+        sim.create_task(driver())
+        sim.run(simulation_length=20)
+
+        assert [payload for _t, _p, payload in device.sent] == [
+            b"\x00", b"\x01", b"\x02", b"\x03"
+        ]
+
+    def test_pop_with_a_timestamp_skips_payloads_that_are_not_due(self):
+        app = FragmentationDeviceApplication()  # no device: the queue is drained by hand
+        results: list[bytes | None] = []
+
+        async def driver() -> None:
+            await app.queue_uplink(b"late", delay=10.0)
+            await app.queue_uplink(b"now")
+            results.append(app.pop_pending_uplink(sim.current_time()))
+            results.append(app.pop_pending_uplink(sim.current_time()))
+            await sim.sleep(11.0)
+            results.append(app.pop_pending_uplink(sim.current_time()))
+
+        sim.create_task(driver())
+        sim.run(simulation_length=20)
+
+        assert results == [b"now", None, b"late"]
+
+    def test_a_late_bound_payload_is_built_at_send_time(self):
+        device = _RecordingDevice()
+        app = FragmentationDeviceApplication(device)  # type: ignore[arg-type]
+
+        async def driver() -> None:
+            await app.queue_uplink(
+                lambda: f"{sim.current_time():.0f}".encode(), delay=7.0
+            )
+
+        sim.create_task(driver())
+        sim.run(simulation_length=20)
+
+        assert [payload for _t, _p, payload in device.sent] == [b"7"]
+
+
+class TestBlockReceivedRetriesWithoutADevice:
+    """§3.5: the application retransmits ``FragDataBlockReceivedReq`` until it is answered.
+
+    The TS004 package in :class:`~simulator.lorawan.fuota.device_stack.FuotaDeviceStack`
+    runs with ``device=None``, so the retry loop has to work on the queue alone.
+    """
+
+    @staticmethod
+    def _complete(app: FragmentationDeviceApplication, data: bytes, encoder):
+        return _feed(app, encoder, range(1, encoder.nb_frag + 1))
+
+    def test_the_request_is_requeued_until_it_is_answered(self):
+        data = _block(200)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(ack_retry_interval=5.0, max_ack_retries=3)
+        drained: list[tuple[float, bytes]] = []
+
+        async def driver() -> None:
+            await app.on_downlink(
+                _app_setup_req(data, 20, ack_reception=True, session_cnt=1).encode()
+            )
+            app.pop_pending_uplink()
+            await self._complete(app, data, encoder)
+            assert app.is_complete(0)
+
+            # A firmware-style drain loop, like the device stack's.
+            for _ in range(60):
+                await sim.sleep(1.0)
+                payload = app.pop_pending_uplink(sim.current_time())
+                if payload is not None:
+                    drained.append((sim.current_time(), payload))
+
+        sim.create_task(driver())
+        sim.run(simulation_length=70)
+
+        assert len(drained) == 4, drained  # first transmission + max_ack_retries
+        assert app.sessions[0].ack_attempts == 4
+        # Nothing goes out before the retry interval has elapsed.
+        assert drained[0][0] >= 5.0
+        for (earlier, _), (later, _) in zip(drained, drained[1:]):
+            assert later - earlier >= 5.0 - 1e-6
+        for _time, payload in drained:
+            command = parse_uplink_commands(payload)[0]
+            assert isinstance(command, FragDataBlockReceivedReq)
+
+    def test_the_answer_stops_the_retransmissions(self):
+        data = _block(200)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(ack_retry_interval=5.0, max_ack_retries=5)
+        drained: list[bytes] = []
+
+        async def driver() -> None:
+            await app.on_downlink(
+                _app_setup_req(data, 20, ack_reception=True, session_cnt=1).encode()
+            )
+            app.pop_pending_uplink()
+            await self._complete(app, data, encoder)
+
+            for _ in range(40):
+                await sim.sleep(1.0)
+                payload = app.pop_pending_uplink(sim.current_time())
+                if payload is None:
+                    continue
+                drained.append(payload)
+                if len(drained) == 2:
+                    await app.on_downlink(
+                        encode_commands([FragDataBlockReceivedAns(frag_index=0)])
+                    )
+
+        sim.create_task(driver())
+        sim.run(simulation_length=50)
+
+        assert len(drained) == 2
+        assert app.sessions[0].ack_pending is False

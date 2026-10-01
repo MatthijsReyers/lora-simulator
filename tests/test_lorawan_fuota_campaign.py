@@ -281,16 +281,16 @@ class TestConfigValidation:
 
     def test_frag_size_beyond_the_frame_is_refused(self):
         with pytest.raises(ValueError, match="does not fit one frame"):
-            self._campaign(frag_size=211, data_rate=5)
+            self._campaign(frag_size=220, data_rate=5)
 
     def test_frag_size_at_the_limit_is_accepted(self):
-        # DR5: MaxAppPl 213 minus the 3-octet DataFragment header.
-        campaign = self._campaign(frag_size=210, data_rate=5)
-        assert campaign.frag_size == 210
+        # DR5: MaxAppPl 222 minus the 3-octet DataFragment header.
+        campaign = self._campaign(frag_size=219, data_rate=5)
+        assert campaign.frag_size == 219
 
     def test_frag_size_defaults_to_the_region_maximum(self):
         campaign = self._campaign(frag_size=None, data_rate=3)
-        assert campaign.frag_size == 103
+        assert campaign.frag_size == 112
 
     def test_both_redundancy_knobs_is_refused(self):
         with pytest.raises(ValueError, match="not both"):

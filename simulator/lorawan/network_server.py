@@ -453,9 +453,18 @@ class NetworkServer:
                 entry = self._take_multicast_for(group_addr, slot_time)
                 if entry is None:
                     break
-                raw = self.build_multicast_downlink(
-                    group_addr, fport=entry.fport, payload=entry.payload,
-                )
+                try:
+                    raw = self.build_multicast_downlink(
+                        group_addr, fport=entry.fport, payload=entry.payload,
+                    )
+                except ValueError as exc:
+                    # Scheduling runs inside the gateway's beacon task; an oversized frame
+                    # is dropped and logged rather than killing the simulation.
+                    logger.error(
+                        f"{sim.current_time():.2f}s  NS  dropping Class B multicast frame "
+                        f"for 0x{group_addr:08X}: {exc}"
+                    )
+                    continue
                 schedule.append((group_addr, raw, slot_time))
 
         return schedule
@@ -626,16 +635,18 @@ class NetworkServer:
         """Whether anything is waiting to go out to a device.
 
         Covers the explicit queue, pending MAC commands and any registered application that
-        reports a downlink for this device. Note that applications are *asked* about it, so
-        an application whose ``get_downlink`` pops its answer must not be probed with this
-        method before the frame is actually built.
+        reports a downlink for this device. The probe is **non-destructive**: applications
+        are asked through :meth:`~simulator.lorawan.application.Application.has_downlink`,
+        which inspects a queue rather than popping from it. An application that generates its
+        downlink on demand and does not override ``has_downlink`` simply reports False here
+        and still gets its turn when the frame is actually built.
         """
         if self._downlink_queue.get(dev_addr):
             return True
         if self._pending_mac_commands.get(dev_addr):
             return True
         for app in self._applications.values():
-            if await app.get_downlink(dev_addr) is not None:
+            if await app.has_downlink(dev_addr):
                 return True
         return False
 
@@ -693,11 +704,19 @@ class NetworkServer:
 
         limit = max_frm_payload(self._default_data_rate, len(fopts))
         if len(pending.payload) > limit:
-            raise ValueError(
-                f"Downlink of {len(pending.payload)} bytes for 0x{device.dev_addr:08X} "
-                f"exceeds the {limit} byte FRMPayload limit at "
-                f"DR{self._default_data_rate} with {len(fopts)} FOpts bytes"
+            # The downlink path runs inside the gateway's receive task, where an exception
+            # tears the whole simulation down. An oversized payload is an application bug,
+            # not a simulator failure, so it is logged and dropped like any other frame the
+            # stack cannot put on the air. The explicit builder APIs
+            # (:meth:`build_multicast_downlink`, ``LoRaWanDevice.send_uplink``) still raise,
+            # because there the caller is the one choosing the payload size.
+            logger.error(
+                f"{sim.current_time():.2f}s  NS  dropping downlink of "
+                f"{len(pending.payload)} bytes for 0x{device.dev_addr:08X}: it exceeds the "
+                f"{limit} byte FRMPayload limit at DR{self._default_data_rate} with "
+                f"{len(fopts)} FOpts bytes"
             )
+            return None
 
         # Encrypt payload
         encrypted = encrypt_frm_payload(

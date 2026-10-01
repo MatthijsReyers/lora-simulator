@@ -241,16 +241,20 @@ def compute_data_block_mic(*, data_block_int_key: bytes, data_block: bytes,
     ``msg`` is the data block itself, defined by TS004 as
     ``[B1 | B2 | ... | Bm]``, "the concatenation of all the uncoded fragments".
 
-    Ambiguity (TS004 §3.3 vs. §A.1): the specification does not state whether
-    ``msg`` includes the padding octets of the last fragment. Table 12 defines
-    the length field as the block length *without* padding, while §A.1 describes
-    ``[B1:B2:...:Bm]`` as including padding. This function resolves the
-    ambiguity by **not** making the choice itself: the caller passes in exactly
-    the octets to be covered, and ``len(data_block)`` is what goes into the
-    length field. The interoperable reading used by existing implementations --
-    and the one callers should use -- is the **un-padded** data block, i.e.
+    Ambiguity (TS004 §3.3 vs. §A.1): the **length field is not in question** --
+    Table 12 states it explicitly as the data-block length "without padding".
+    The one genuinely unstated point is whether the *covered octets* ``msg =
+    [B1|...|Bm]`` include the padding of the last uncoded fragment: §A.1
+    describes ``[B1:B2:...:Bm]`` as the padded fragment sequence, while §3.3's
+    parenthetical "(the data block)" points at the un-padded block. This
+    function resolves it by **not** making the choice itself: the caller passes
+    in exactly the octets to be covered, and ``len(data_block)`` is what goes
+    into the length field -- so passing the un-padded block, as callers should,
+    satisfies Table 12 by construction. The interoperable reading used by
+    existing implementations is that un-padded block, i.e.
     ``NbFrag * FragSize - Padding`` octets. To experiment with the padded
-    variant, simply pass the padded block.
+    variant, pass the padded block; note that the length field then follows it
+    and no longer matches Table 12.
 
     Byte order inside B0 is not restated by TS004; the document-wide
     little-endian convention is applied to SessionCnt, Descriptor and the length.
