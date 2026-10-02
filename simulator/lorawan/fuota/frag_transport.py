@@ -7,7 +7,7 @@ devices, no frames, no scheduling) apart from :mod:`simulator.lorawan.fuota` —
 it only turns dataclasses into octets and back, so that the device-side and
 server-side Applications built on top can be tested independently.
 
-Scope (TS004-2.0.0 §3, Tables 1–24):
+Scope (TS004-2.0.0 §3, Tables 1-24):
 
 ===== ============================== ========== ========== =================
 CID   Command                        Direction  Addressing Payload (octets)
