@@ -94,6 +94,10 @@ class FuotaDeviceMetrics:
         package sent on its own are **not** counted here — see :attr:`package_uplinks`.
     :ivar downlinks_by_fport: Downlinks delivered to an application, per FPort. Multicast
         fragments land on FPort 201 like unicast TS004 commands do.
+    :ivar images_received: Images the device reassembled **and** verified. One that failed
+        its data-block MIC is discarded (TS004 §3.3) and counted in :attr:`mic_failures`
+        instead.
+    :ivar mic_failures: ``FragIndex`` count whose reassembled block failed the MIC check.
     :ivar energy_joules: Total energy the device's radio consumed, or None when the radio
         exposes no power consumer.
     """
@@ -106,6 +110,7 @@ class FuotaDeviceMetrics:
     fragments_received: int = 0
     fragments_dropped: int = 0
     images_received: int = 0
+    mic_failures: int = 0
     image_bytes: int = 0
     completion_time: float | None = None
     clock_offset_seconds: int | None = None
@@ -166,7 +171,9 @@ class FuotaDeviceStack:
         stack.start()
 
     After the run, :attr:`received_images` holds the reconstructed firmware per
-    ``FragIndex`` and :meth:`metrics` summarises the device's share of the campaign.
+    ``FragIndex`` — only the images whose TS004 §3.3 data-block MIC verified, since a block
+    that fails it "SHALL NOT be used" and is discarded — and :meth:`metrics` summarises the
+    device's share of the campaign.
 
     Reference: LoRa Alliance TS003/TS004/TS005.
     """
@@ -229,7 +236,8 @@ class FuotaDeviceStack:
             back to Class A once the multicast session is over restores it.
         :param rng: Random source for the slot jitter.
         :param on_firmware_received: Called ``(frag_index, data, descriptor)`` when a data
-            block is reassembled.
+            block is reassembled *and* its data-block MIC verified. A block that fails the
+            check is discarded without calling it (TS004 §3.3).
         :param fragmentation_factory: Builds the TS004 device package. Used by tests that
             need a lossy variant; it is called with the same keyword arguments the default
             :class:`FragmentationDeviceApplication` gets.
@@ -285,9 +293,11 @@ class FuotaDeviceStack:
         self.uplinks_by_fport: dict[int, int] = {}
         #: Uplinks this loop transmitted in total.
         self.uplinks_sent = 0
-        #: Reconstructed firmware images by ``FragIndex``.
+        #: Reconstructed, MIC-verified firmware images by ``FragIndex``.
         self.received_images: dict[int, bytes] = {}
-        #: Simulation time the first image was reassembled.
+        #: ``FragIndex`` values whose reassembled block failed its data-block MIC.
+        self.mic_failures: set[int] = set()
+        #: Simulation time the first image was reassembled and verified.
         self.completion_time: float | None = None
 
         self._next_clock_sync: float | None = (
@@ -437,6 +447,26 @@ class FuotaDeviceStack:
     # ---- Completion ----
 
     def _on_block_received(self, frag_index: int, data: bytes, descriptor: int) -> None:
+        """Take delivery of a reassembled block, unless its MIC says not to (§3.3).
+
+        TS004 §3.3: a data block whose ``DataBlockIntKey`` MIC does not verify "SHALL NOT
+        be used". The bytes are of the right length but not the firmware that was sent, so
+        the image is dropped instead of stored — the device reports the ``MICError`` bit to
+        the server from the TS004 package, and the campaign counts it as a failure.
+
+        ``mic_ok`` is None when the device holds no ``DataBlockIntKey`` and could not check;
+        there is nothing to act on then, so the block is kept.
+        """
+        session = self.fragmentation.sessions.get(frag_index)
+        if session is not None and session.mic_ok is False:
+            self.mic_failures.add(frag_index)
+            logger.warning(
+                f"{sim.current_time():.2f}s  FUOTA-DEV  0x{self.dev_addr:08X} DISCARDED "
+                f"firmware image {frag_index} ({len(data)} octets, "
+                f"Descriptor=0x{descriptor:08X}): data block MIC check FAILED"
+            )
+            return
+
         self.received_images[frag_index] = data
         if self.completion_time is None:
             self.completion_time = sim.current_time()
@@ -448,7 +478,7 @@ class FuotaDeviceStack:
             self.on_firmware_received(frag_index, data, descriptor)
 
     def is_complete(self, frag_index: int = 0) -> bool:
-        """Whether the device reassembled the image of a ``FragIndex``."""
+        """Whether the device holds a reassembled, MIC-verified image of a ``FragIndex``."""
         return frag_index in self.received_images
 
     @property
@@ -476,6 +506,7 @@ class FuotaDeviceStack:
             fragments_received=self.fragmentation.fragments_received,
             fragments_dropped=self.fragmentation.fragments_dropped,
             images_received=len(self.received_images),
+            mic_failures=len(self.mic_failures),
             image_bytes=len(image),
             completion_time=self.completion_time,
             clock_offset_seconds=self.clock_sync.offset_seconds,

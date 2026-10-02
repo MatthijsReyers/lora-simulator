@@ -75,11 +75,16 @@ the fleet.
    image — it does not matter *which* ones a device missed.
 5. **STATUS** — `FragSessionStatusReq` (§3.2, CID 0x01); the devices answer
    `FragSessionStatusAns` with `NbFragReceived` and `MissingFrag`. A device that already
-   reconstructed and MIC-verified the block announces it with `FragDataBlockReceivedReq`
-   (§3.5, CID 0x04 — the one command the *device* originates). The phase waits for the
-   multicast session window to close before its timeout starts counting — nothing can be
-   answered while a Class C device is mute — and polls a device that stayed silent again
-   (`max_status_rounds`, 2 by default). A device only counts as complete when it *said* so.
+   reconstructed the block announces it with `FragDataBlockReceivedReq` (§3.5, CID 0x04 —
+   the one command the *device* originates), checking the `DataBlockIntKey` MIC of §3.3 as
+   it reassembles and setting the `MICError` bit if it does not verify. Such a block "SHALL
+   NOT be used": the device stack discards the image instead of storing it, and the campaign
+   counts the device as **failed** (`FuotaCampaignResult.mic_errors`), not as complete — no
+   number of repair fragments can mend a block that is already fully defragmented. The phase
+   waits for the multicast session window to close before its timeout starts counting —
+   nothing can be answered while a Class C device is mute — and polls a device that stayed
+   silent again (`max_status_rounds`, 2 by default). A device only counts as complete when it
+   *said* so, MIC included.
 6. **REPAIR** — when the worst-off device still misses *k* fragments the campaign opens a new
    multicast session on the same group and broadcasts `k + 2` further coded fragments,
    continuing the `N` sequence rather than repeating it. Up to `--repair-rounds` times. A

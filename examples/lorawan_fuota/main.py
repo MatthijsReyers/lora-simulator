@@ -492,11 +492,17 @@ def print_summary(
             if metrics.energy_joules is not None
             else f"{'n/a':>8}"
         )
-        ok = stack.received_images.get(0) == firmware
+        if stack.received_images.get(0) == firmware:
+            image = "OK"
+        elif metrics.mic_failures:
+            # Reassembled, but the data block MIC says it is not the firmware (TS004 §3.3).
+            image = "MIC FAIL"
+        else:
+            image = "INCOMPLETE"
         print(
             f"0x{metrics.dev_addr:08X}  {dist:5.0f}m  {metrics.fragments_received:7d}  "
             f"{metrics.fragments_dropped:7d}  {metrics.uplinks_sent:7d}  {completion}  "
-            f"{energy}  {'OK' if ok else 'INCOMPLETE'}"
+            f"{energy}  {image}"
         )
 
     print()
@@ -508,6 +514,9 @@ def print_summary(
         print(f"  Failure reason:       {campaign.failure_reason}")
     print(f"  Devices complete:     {result.completed}/{result.devices} "
           f"({result.participants} participant(s), {len(result.excluded)} excluded)")
+    if result.mic_errors:
+        print(f"  Data block MIC error: {len(result.mic_errors)} device(s) reassembled an "
+              f"unusable block")
     print(f"  NbFrag / FragSize:    {result.nb_frag} x {result.frag_size} octets")
     print(f"  Fragments uncoded:    {result.fragments_uncoded}")
     print(f"  Fragments coded:      {result.fragments_coded}")

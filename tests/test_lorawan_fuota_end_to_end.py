@@ -18,11 +18,14 @@ Covered:
     completes;
 (d) the Class B variant of the same flow (TS005 §4.6), with beacons and ping slots;
 (e) a device the network server does not know: it is dropped after ``setup_timeout`` and
-    the rest of the fleet finishes anyway.
+    the rest of the fleet finishes anyway;
+(f) a device whose block reassembles into the wrong bytes: it reports ``MICError``, throws
+    the image away (TS004 §3.3) and counts as failed.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import random
 
@@ -91,6 +94,41 @@ class LossyFragmentationDeviceApplication(FragmentationDeviceApplication):
         await super()._handle_data_fragment(fragment)
 
 
+class CorruptingFragmentationDeviceApplication(FragmentationDeviceApplication):
+    """A receiver whose memory flips a bit in one fragment before it is decoded.
+
+    This is the failure TS004 §3.3's data-block MIC exists for: every fragment arrived, the
+    defragmenter produced a block of exactly the right length, and that block is not the
+    firmware that was sent. Corrupting the payload on the way in rather than the frame on
+    the air keeps the frame's own CRC intact, which is what makes the error reach the
+    decoder at all.
+    """
+
+    def __init__(self, *args, corrupt_n: int = 1, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.corrupt_n = corrupt_n
+        self.fragments_corrupted = 0
+
+    async def _handle_data_fragment(self, fragment: DataFragment) -> None:
+        if fragment.index_n == self.corrupt_n and fragment.payload:
+            payload = bytearray(fragment.payload)
+            payload[0] ^= 0x01
+            fragment = dataclasses.replace(fragment, payload=bytes(payload))
+            self.fragments_corrupted += 1
+        await super()._handle_data_fragment(fragment)
+
+
+def _corrupting_factory(corrupt_n: int):
+    """A ``fragmentation_factory`` that garbles the payload of fragment ``N``."""
+
+    def factory(device, **kwargs) -> FragmentationDeviceApplication:
+        return CorruptingFragmentationDeviceApplication(
+            device, corrupt_n=corrupt_n, **kwargs
+        )
+
+    return factory
+
+
 def _lossy_factory(loss: float, seed: int):
     """A ``fragmentation_factory`` for :class:`FuotaDeviceStack` with a seeded loss model."""
 
@@ -122,6 +160,7 @@ def _build_network(
     class_b_from: float | None = None,
     class_b_until: float | None = None,
     lossy: dict[int, tuple[float, int]] | None = None,
+    corrupting: dict[int, int] | None = None,
 ) -> tuple[NetworkServer, LoRaWanGateway, FuotaCampaign, list[FuotaDeviceStack]]:
     """Network server, gateway, campaign and N devices, all started but not yet run.
 
@@ -129,10 +168,13 @@ def _build_network(
         their uplinks are dropped and the campaign never hears from them.
     :param lossy: ``index -> (loss probability, seed)`` for devices that should drop
         fragments.
+    :param corrupting: ``index -> N`` for devices that should garble the payload of that
+        fragment, so their block reassembles into the wrong bytes.
     """
     _quiet_logging()
     unregistered = unregistered or set()
     lossy = lossy or {}
+    corrupting = corrupting or {}
 
     addrs = DEV_ADDRS[:device_count]
     ns = NetworkServer(default_data_rate=DATA_RATE)
@@ -175,7 +217,11 @@ def _build_network(
             class_b_until=class_b_until,
             rng=random.Random(1000 + index),
             fragmentation_factory=(
-                _lossy_factory(*lossy[index]) if index in lossy else None
+                _lossy_factory(*lossy[index])
+                if index in lossy
+                else _corrupting_factory(corrupting[index])
+                if index in corrupting
+                else None
             ),
         )
         stack.start()
@@ -633,3 +679,59 @@ class TestTimeToStartSurvivesTheRealStack:
         # The devices run on the simulation clock itself, so any non-zero offset here is
         # queueing latency leaking into the field.
         assert all(abs(offset) <= 1 for offset in offsets), offsets
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# (f) A block that reassembles into the wrong bytes
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestMicErrorIsNotCompletion:
+    """TS004 §3.3: a data block whose ``DataBlockIntKey`` MIC fails SHALL NOT be used."""
+
+    def test_a_corrupted_image_is_discarded_and_the_device_counts_as_failed(self):
+        ns, gateway, campaign, stacks = _build_network(
+            config=_class_c_config(),
+            firmware=FIRMWARE_SMALL,
+            device_count=3,
+            # The third device garbles the first uncoded fragment on the way into its
+            # defragmentation memory.
+            corrupting={2: 1},
+            stop_after=SIM_LENGTH_CLEAN - 6,
+        )
+        sim.run(simulation_length=SIM_LENGTH_CLEAN)
+
+        broken = stacks[2]
+        assert broken.fragmentation.fragments_corrupted == 1
+
+        # The device defragmented a block of exactly the right length, and it is not the
+        # firmware — so the image is thrown away instead of stored.
+        assert broken.fragmentation.completed_blocks[0] != FIRMWARE_SMALL
+        assert len(broken.fragmentation.completed_blocks[0]) == len(FIRMWARE_SMALL)
+        assert broken.received_images == {}
+        assert broken.mic_failures == {0}
+        assert broken.is_complete(0) is False
+        assert broken.completion_time is None
+
+        metrics = broken.metrics()
+        assert metrics.images_received == 0
+        assert metrics.mic_failures == 1
+        assert metrics.completion_time is None
+
+        # The campaign counts it as a failure, not as one of the completed devices.
+        assert campaign.mic_error_devices == {DEV_ADDRS[2]}
+        assert campaign.completed_devices == {DEV_ADDRS[0], DEV_ADDRS[1]}
+        assert campaign.failed_devices == {DEV_ADDRS[2]}
+        assert campaign.state is FuotaCampaignState.FAILED
+        assert campaign.failure_reason is not None
+        assert "MIC" in campaign.failure_reason
+
+        result = campaign.result
+        assert result.success is False
+        assert result.completed == 2
+        assert result.failed == 1
+        assert result.mic_errors == {DEV_ADDRS[2]}
+        assert DEV_ADDRS[2] not in result.completion_time
+
+        # The rest of the fleet is untouched.
+        assert stacks[0].received_images[0] == FIRMWARE_SMALL
+        assert stacks[1].received_images[0] == FIRMWARE_SMALL

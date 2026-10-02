@@ -1386,8 +1386,10 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
             (§3.3), so TS004 defines no criterion of its own.
         :param on_block_received: Called as
             ``(frag_index, data_block, descriptor)`` the moment a block is
-            reassembled, before the MIC result is consulted; inspect
-            :attr:`sessions` for ``mic_ok``.
+            reassembled. The MIC has been checked by then, and §3.3 forbids
+            *using* a block that failed it: read ``sessions[frag_index].mic_ok``
+            and discard the data unless it is True (or None, meaning the device
+            held no key and could not check).
         :param ack_retry_interval: Seconds between ``FragDataBlockReceivedReq``
             retransmissions. None (the default) draws a fresh
             ``BlockAckDelay``-based delay each time, which is what §3.5
@@ -1427,7 +1429,10 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
         self.last_session_cnt: dict[int, int] = {
             i: -1 for i in range(MAX_FRAG_SESSIONS)
         }
-        #: Reconstructed data blocks by ``FragIndex``; survives session deletion.
+        #: Reassembled data blocks by ``FragIndex``; survives session deletion. MIC
+        #: checked or not — this is what the defragmenter produced, and §3.3 forbids
+        #: *using* one whose MIC failed, so a consumer reads
+        #: ``sessions[frag_index].mic_ok`` before trusting an entry here.
         self.completed_blocks: dict[int, bytes] = {}
 
         #: ``DataFragment`` messages fed to a decoder.
@@ -1819,7 +1824,11 @@ class FragServerSession:
         sends by default; more can always be scheduled later with a higher
         ``start_n`` because the encoder generates parity lines on the fly.
     :ivar setup_answers: ``FragSessionSetupAns`` received per device.
-    :ivar completed: Devices that reported ``FragDataBlockReceivedReq``.
+    :ivar completed: Devices that reported ``FragDataBlockReceivedReq``, whether
+        or not they flagged a MIC error.
+    :ivar mic_errors: Devices whose ``FragDataBlockReceivedReq`` carried
+        ``MICError``. Their block is unusable (§3.3), so they are *not* part of
+        :meth:`FragmentationServerApplication.devices_complete`.
     :ivar highest_n_sent: Largest ``N`` scheduled so far, so a repair round
         knows where to continue.
     """
@@ -1914,9 +1923,24 @@ class FragStatusReport:
     time: float
 
     @property
-    def complete(self) -> bool:
-        """Whether the device reported the block as fully reassembled."""
+    def reassembled(self) -> bool:
+        """Whether the device reported every fragment in, MIC aside.
+
+        What the *device* considers a finished session, and therefore the predicate for
+        "does the server still expect an answer from it": §3.2 lets a device that holds the
+        whole block stay silent on a ``Participants = 0`` request whether or not the MIC
+        checked out. Not a measure of success — see :attr:`complete`.
+        """
         return not self.session_does_not_exist and self.missing_frag == 0
+
+    @property
+    def complete(self) -> bool:
+        """Whether the device reported a *usable* data block.
+
+        A block whose ``DataBlockIntKey`` MIC does not verify SHALL NOT be used (§3.3), so
+        a ``MICError`` answer is not completion even though every fragment arrived.
+        """
+        return self.reassembled and not self.mic_error
 
 
 class FragmentationServerApplication(Application):
@@ -2285,12 +2309,15 @@ class FragmentationServerApplication(Application):
 
         A ``FragSessionStatusReq`` with ``Participants = 0`` is deliberately left unanswered
         by a device that already holds the whole block (§3.2), so a device the server already
-        knows is complete retires the command by itself.
+        knows has defragmented it retires the command by itself. That is the *device's* view
+        of the session, so it is :meth:`devices_reassembled` and not
+        :meth:`devices_complete`: a device whose MIC failed also stops answering, and
+        retransmitting to it until the retry budget runs out would be pointless.
         """
         if entry.key is None:
             return False
         cid, frag_index = entry.key
-        if cid == FragCID.FRAG_SESSION_STATUS and dev_addr in self.devices_complete(
+        if cid == FragCID.FRAG_SESSION_STATUS and dev_addr in self.devices_reassembled(
             frag_index
         ):
             return False
@@ -2430,6 +2457,10 @@ class FragmentationServerApplication(Application):
     ) -> None:
         session = self.sessions.get(req.frag_index)
         if session is not None:
+            # :attr:`FragServerSession.completed` records the acknowledgement itself —
+            # the device defragmented the block and will not ask for more fragments. It
+            # is :meth:`devices_complete` that decides who holds a *usable* image, and a
+            # device in ``mic_errors`` is not one of them (§3.3).
             session.completed.add(dev_addr)
             if req.mic_error:
                 session.mic_errors.add(dev_addr)
@@ -2481,21 +2512,51 @@ class FragmentationServerApplication(Application):
             addr for addr, ans in session.setup_answers.items() if ans.accepted
         }
 
-    def devices_complete(self, frag_index: int) -> set[int]:
-        """Devices known to hold the whole data block.
+    def devices_reassembled(self, frag_index: int) -> set[int]:
+        """Devices that reported the block defragmented, MIC aside.
 
-        A device counts as complete when it sent ``FragDataBlockReceivedReq``
-        (§3.5) or when its last ``FragSessionStatusAns`` reported
-        ``MissingFrag == 0`` (§3.2). With ``AckReception = 0`` and no status
-        round the server has no way of knowing, which is exactly why TS004 v2.0.0
-        added CID 0x04.
+        A device counts as reassembled when it sent ``FragDataBlockReceivedReq``
+        (§3.5) — with or without the ``MICError`` bit — or when its last
+        ``FragSessionStatusAns`` reported ``MissingFrag == 0`` (§3.2). With
+        ``AckReception = 0`` and no status round the server has no way of
+        knowing, which is exactly why TS004 v2.0.0 added CID 0x04.
+
+        This is the set that no longer needs fragments, and the set §3.2 allows
+        to stay silent on a ``Participants = 0`` request. For the devices that
+        actually hold a usable image, see :meth:`devices_complete`.
         """
         session = self.sessions.get(frag_index)
-        complete = set(session.completed) if session is not None else set()
+        done = set(session.completed) if session is not None else set()
         for (index, dev_addr), report in self.latest_status.items():
-            if index == frag_index and report.complete:
-                complete.add(dev_addr)
-        return complete
+            if index == frag_index and report.reassembled:
+                done.add(dev_addr)
+        return done
+
+    def devices_mic_error(self, frag_index: int) -> set[int]:
+        """Devices whose reassembled block failed its ``DataBlockIntKey`` MIC (§3.3).
+
+        Reported either in ``FragDataBlockReceivedReq`` (§3.5, latched for the
+        session: the device defragmented once and cannot do better) or in the
+        device's latest ``FragSessionStatusAns`` (§3.2, where ``MICError`` is
+        only meaningful with ``MissingFrag == 0``).
+        """
+        session = self.sessions.get(frag_index)
+        bad = set(session.mic_errors) if session is not None else set()
+        for (index, dev_addr), report in self.latest_status.items():
+            if index == frag_index and report.reassembled and report.mic_error:
+                bad.add(dev_addr)
+        return bad
+
+    def devices_complete(self, frag_index: int) -> set[int]:
+        """Devices known to hold a *usable* data block.
+
+        The devices that reported the block defragmented
+        (:meth:`devices_reassembled`), minus those that reported a MIC error:
+        §3.3 says a data block whose MIC does not verify SHALL NOT be used, so
+        such a device has not received the firmware — it has received garbage of
+        the right length, and the campaign counts it as failed.
+        """
+        return self.devices_reassembled(frag_index) - self.devices_mic_error(frag_index)
 
     def max_missing(self, frag_index: int) -> int:
         """Largest ``MissingFrag`` across the latest status answers (§3.2).

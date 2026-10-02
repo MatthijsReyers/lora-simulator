@@ -254,6 +254,9 @@ class FuotaCampaignResult:
     :ivar multicast_airtime: Their total time on air, in seconds.
     :ivar duty_cycle_quiet_time: Time the gateway's limiter forced the transmitter to stay
         quiet because of those frames, 0 without a duty cycle.
+    :ivar mic_errors: Devices that reassembled the block but whose data-block MIC failed.
+        TS004 §3.3 forbids using such a block, so they are counted in :attr:`failed`, not
+        in :attr:`completed`.
     """
 
     success: bool = False
@@ -268,6 +271,7 @@ class FuotaCampaignResult:
     completed: int = 0
     failed: int = 0
     excluded: set[int] = field(default_factory=set)
+    mic_errors: set[int] = field(default_factory=set)
 
     nb_frag: int = 0
     frag_size: int = 0
@@ -618,12 +622,21 @@ class FuotaCampaign:
 
     @property
     def completed_devices(self) -> set[int]:
-        """Devices known to hold the whole data block (TS004 §3.2/§3.5)."""
+        """Devices known to hold a usable data block (TS004 §3.2/§3.5).
+
+        A device that reported a MIC error is not one of them: §3.3 forbids using a block
+        whose ``DataBlockIntKey`` MIC does not verify, so it did not receive the firmware.
+        """
         return self.fragmentation.devices_complete(self.config.frag_index) & self.devices
 
     @property
+    def mic_error_devices(self) -> set[int]:
+        """Devices that reassembled the block but failed its MIC check (TS004 §3.3)."""
+        return self.fragmentation.devices_mic_error(self.config.frag_index) & self.devices
+
+    @property
     def failed_devices(self) -> set[int]:
-        """Devices the campaign did not finish, dropped or silent ones included."""
+        """Devices the campaign did not finish — dropped, silent and MIC-error ones."""
         return self.devices - self.completed_devices
 
     # ---- State machine ----
@@ -691,10 +704,12 @@ class FuotaCampaign:
 
         await self._repair_rounds()
 
-        if cfg.final_roll_call and self.participants - self.completed_devices:
+        reassembled = self.fragmentation.devices_reassembled(cfg.frag_index)
+        if cfg.final_roll_call and self.participants - reassembled:
             # §3.2 Participants = 1: everyone answers, including the devices that are
             # already done. It is the only way to notice a device whose completion
-            # acknowledgement was lost on the way up.
+            # acknowledgement was lost on the way up. A device that *did* report in — a
+            # MIC error included — has nothing left to tell, so it does not trigger a round.
             self._transition(FuotaCampaignState.STATUS)
             await self._phase_status(participants=True)
 
@@ -705,9 +720,15 @@ class FuotaCampaign:
         if len(complete) >= max(cfg.min_participants, 1) and complete >= self.participants:
             self._transition(FuotaCampaignState.DONE)
         else:
+            mic_errors = self.mic_error_devices & self.participants
+            detail = (
+                f" ({len(mic_errors)} of them with a data block MIC error)"
+                if mic_errors
+                else ""
+            )
             self._fail(
                 f"{len(self.participants - complete)} of {len(self.participants)} "
-                f"participant(s) did not report the complete data block"
+                f"participant(s) did not report a usable data block{detail}"
             )
 
     # ---- Phase 1: multicast group setup (TS005 §4.3) ----
@@ -937,13 +958,19 @@ class FuotaCampaign:
                 )
 
     def _status_silent(self) -> set[int]:
-        """Participants that neither answered the latest round nor are known complete."""
+        """Participants that neither answered the latest round nor are known done.
+
+        "Done" here is TS004's *reassembled*, not the campaign's success criterion: a device
+        whose MIC failed has defragmented the block and stays silent on a ``Participants = 0``
+        request like any other finished device (§3.2). Re-polling it would only time the
+        round out — it is counted as failed at the end, not chased.
+        """
         cfg = self.config
-        complete = self.fragmentation.devices_complete(cfg.frag_index)
+        done = self.fragmentation.devices_reassembled(cfg.frag_index)
         requested_at = self._status_requested_at or 0.0
         silent: set[int] = set()
         for addr in self.participants:
-            if addr in complete:
+            if addr in done:
                 continue
             report = self.fragmentation.latest_status.get((cfg.frag_index, addr))
             if report is None or report.time < requested_at:
@@ -951,7 +978,7 @@ class FuotaCampaign:
         return silent
 
     def _status_round_answered(self) -> bool:
-        """Whether every participant either answered this round or is known complete."""
+        """Whether every participant either answered this round or is known reassembled."""
         return not self._status_silent()
 
     def _status_unknown(self) -> set[int]:
@@ -959,13 +986,16 @@ class FuotaCampaign:
 
         Their state is *unknown*, not "complete": they are what makes a repair round
         worthwhile even when every answer the server did receive said ``MissingFrag = 0``.
+        A device that answered with a MIC error is not unknown — more fragments cannot repair
+        a block it has already defragmented — so this too goes by
+        :meth:`~simulator.lorawan.fuota.frag_transport.FragmentationServerApplication.devices_reassembled`.
         """
         cfg = self.config
-        complete = self.fragmentation.devices_complete(cfg.frag_index)
+        done = self.fragmentation.devices_reassembled(cfg.frag_index)
         return {
             addr
             for addr in self.participants
-            if addr not in complete
+            if addr not in done
             and (cfg.frag_index, addr) not in self.fragmentation.latest_status
         }
 
@@ -1056,15 +1086,22 @@ class FuotaCampaign:
         return None
 
     def _on_frag_answer(self, dev_addr: int, command: FragCommandType) -> None:
+        # A MIC error is not a completion: §3.3 forbids using the block, so the device holds
+        # no firmware and gets no completion time. It still shows up in the campaign's
+        # mic_error_devices and counts towards result.failed.
         complete = False
         match command:
             case FragDataBlockReceivedReq():
-                complete = command.frag_index == self.config.frag_index
+                complete = (
+                    command.frag_index == self.config.frag_index
+                    and not command.mic_error
+                )
             case FragSessionStatusAns():
                 complete = (
                     command.frag_index == self.config.frag_index
                     and not command.session_does_not_exist
                     and command.missing_frag == 0
+                    and not command.mic_error
                 )
             case _:
                 return None
@@ -1162,6 +1199,7 @@ class FuotaCampaign:
         result.completed = len(complete)
         result.failed = len(self.devices - complete)
         result.excluded = set(self.excluded)
+        result.mic_errors = self.mic_error_devices
         result.nb_frag = session.nb_frag if session is not None else 0
         result.frag_size = self.frag_size
         result.repair_rounds = self.repair_rounds
@@ -1202,9 +1240,14 @@ class FuotaCampaign:
                 result.duty_cycle_quiet_time = self.gateway.duty_cycle.quiet_time(airtime)
 
         self._done = True
+        mic_errors = (
+            f", {len(result.mic_errors)} with a data block MIC error"
+            if result.mic_errors
+            else ""
+        )
         logger.info(
             f"{now:.2f}s  CAMPAIGN  finished in state {self.state.value} after "
             f"{result.total_time:.1f}s: {result.completed}/{result.devices} device(s) "
-            f"complete, {result.fragments_scheduled} fragment(s) sent in "
+            f"complete{mic_errors}, {result.fragments_scheduled} fragment(s) sent in "
             f"{result.repair_rounds} repair round(s)"
         )

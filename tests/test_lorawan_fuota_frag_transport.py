@@ -1723,6 +1723,49 @@ class TestServerAnswers:
         assert server.sessions[0].mic_errors == {DEV_ADDR}
 
     @pytest.mark.asyncio
+    async def test_a_reported_mic_error_is_not_completion(self):
+        """§3.3: a block whose MIC fails SHALL NOT be used, so the device is not done."""
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR, DEV_ADDR_B], frag_index=0, data=_block(40), frag_size=10,
+            session_cnt=1, ack_reception=True,
+        )
+        await server.on_uplink(
+            DEV_ADDR, FragDataBlockReceivedReq(frag_index=0, mic_error=True).encode()
+        )
+        await server.on_uplink(
+            DEV_ADDR_B, FragDataBlockReceivedReq(frag_index=0).encode()
+        )
+
+        # It has defragmented the block and will not ask for more fragments...
+        assert server.devices_reassembled(0) == {DEV_ADDR, DEV_ADDR_B}
+        # ...but what it holds is not the firmware.
+        assert server.devices_mic_error(0) == {DEV_ADDR}
+        assert server.devices_complete(0) == {DEV_ADDR_B}
+
+    @pytest.mark.asyncio
+    async def test_a_status_answer_with_a_mic_error_is_not_completion(self):
+        _ns, server = _server()
+        server.create_session(
+            [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10, session_cnt=1
+        )
+        await server.on_uplink(
+            DEV_ADDR,
+            FragSessionStatusAns(
+                frag_index=0, nb_frag_received=4, missing_frag=0, mic_error=True
+            ).encode(),
+        )
+
+        report = server.latest_status[(0, DEV_ADDR)]
+        assert report.reassembled is True
+        assert report.complete is False
+        assert server.devices_reassembled(0) == {DEV_ADDR}
+        assert server.devices_mic_error(0) == {DEV_ADDR}
+        assert server.devices_complete(0) == set()
+        # Repair rounds cannot mend it: the device needs no further fragment.
+        assert server.max_missing(0) == 0
+
+    @pytest.mark.asyncio
     async def test_delete_round_trip(self):
         _ns, server = _server()
         server.create_session(
