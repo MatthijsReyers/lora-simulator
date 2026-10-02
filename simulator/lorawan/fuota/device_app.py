@@ -56,12 +56,24 @@ class PendingUplink:
     :ivar seq: Monotonic insertion counter, so equal delays keep FIFO ordering.
     :ivar cancelled: Set by :meth:`FuotaDeviceApplication.cancel_pending`; a cancelled entry
         is never transmitted.
+    :ivar sent_at: Simulation time at which the payload was handed to the radio (or drained
+        by :meth:`FuotaDeviceApplication.pop_pending_uplink`), None while it is still
+        waiting. A retransmission timer must be measured from *this* instant and not from
+        the moment the entry was queued: a Class C device inside a multicast session cannot
+        transmit at all, and a retry interval that runs anyway only burns attempts against a
+        radio that was never on the air (TS004-2.0.0 §3.5).
     """
 
     ready_at: float
     payload: UplinkPayload
     seq: int = 0
     cancelled: bool = field(default=False, compare=False)
+    sent_at: float | None = field(default=None, compare=False)
+
+    @property
+    def sent(self) -> bool:
+        """Whether this entry has actually left the queue towards the radio."""
+        return self.sent_at is not None
 
     def resolve(self) -> bytes:
         """The octets to transmit, building them now if the payload is late-bound."""
@@ -130,6 +142,7 @@ class FuotaDeviceApplication(Application):
             if now is not None and entry.ready_at > now:
                 continue
             self._remove(entry)
+            entry.sent_at = sim.current_time() if sim.is_running() else (now or 0.0)
             return entry.resolve()
         return None
 
@@ -188,6 +201,7 @@ class FuotaDeviceApplication(Application):
                 # Something else (the device stack, a test) already drained this entry.
                 return
             self._remove(entry)
+            entry.sent_at = sim.current_time()
             payload = entry.resolve()
             logger.debug(
                 f"{sim.current_time():.2f}s  FUOTA-DEV  uplink on FPort {self.port()} "

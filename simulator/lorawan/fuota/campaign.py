@@ -16,7 +16,11 @@ from the two specs' cross-references plus TS003, and runs it as a single simulat
       -> DONE | FAILED
 
 Every phase is bounded by a timeout and the campaign carries on with whichever devices
-answered, so a silent device costs time but never deadlocks the fleet. Timeouts are polled
+answered, so a silent device costs time but never deadlocks the fleet. A phase that waits
+for *answers* only starts counting once the multicast session window it scheduled has
+closed and the devices have had an uplink opportunity: a Class C participant is mute for
+the whole window (TS005 §2.7), and a round that times out against a mute fleet learns
+nothing — which TS004 §3.2 would then make look like a fleet that is already done. Timeouts are polled
 with ``sim.sleep``; a simulation that ends mid-campaign surfaces as
 :class:`~simulator.exceptions.SimulatorException` and leaves the campaign in ``FAILED`` with
 a usable :class:`FuotaCampaignResult`.
@@ -122,6 +126,20 @@ class FuotaCampaignConfig:
         request is only delivered in the RX1 window of a device's own uplink.
     :ivar setup_timeout: How long each unicast setup phase waits for answers before carrying
         on with whoever answered.
+    :ivar status_timeout: How long one status round waits, counted from
+        :meth:`FuotaCampaign.answers_possible_at` rather than from the moment the request was
+        queued.
+    :ivar device_uplink_interval: The fleet's periodic uplink interval. Every unicast command
+        and every answer rides on a device's own uplink, so this is the campaign's clock for
+        "how long before an answer could possibly arrive". It is only used for sizing waits;
+        a value that is too small costs nothing but a tighter timeout.
+    :ivar max_status_rounds: How many times a status phase polls. A device that did not
+        answer a round is re-polled, because "no answer" is not "complete" — a device whose
+        ``FragSessionStatusReq`` was lost in RX1, or that was still mute when the round
+        started, would otherwise be taken for a finished one and never repaired.
+    :ivar command_retries: Retransmissions of an unanswered unicast command, handed to both
+        server-side packages. See
+        :class:`~simulator.lorawan.fuota.frag_transport.FragmentationServerApplication`.
     :ivar status_participants: ``Participants`` of ``FragSessionStatusReq``. None means
         "ask everyone unless the devices acknowledge completion by themselves", i.e.
         ``not ack_reception``.
@@ -167,6 +185,10 @@ class FuotaCampaignConfig:
     status_timeout: float = 120.0
     cleanup_timeout: float = 60.0
     poll_interval: float = 0.5
+    #: The fleet's periodic uplink interval; the unit every "wait for answers" is sized in.
+    device_uplink_interval: float = 30.0
+    #: Retransmissions of an unanswered unicast command, per server package.
+    command_retries: int = 3
 
     # ---- Repair (TS004 §3.2, §A.3) ----
     max_repair_rounds: int = 2
@@ -177,6 +199,9 @@ class FuotaCampaignConfig:
     repair_extra_fragments: int = 2
     repair_lead_time: float | None = None
     status_participants: bool | None = None
+    #: Polls per status phase. The first one asks every participant, each further one only
+    #: the devices that did not answer the previous one.
+    max_status_rounds: int = 2
     #: Close with a ``FragSessionStatusReq(Participants = 1)`` roll call so that a device
     #: whose ``FragDataBlockReceivedReq`` was lost on the way up still gets counted
     #: (TS004 §3.2; the closing step of the LoRa Alliance FUOTA process).
@@ -400,9 +425,12 @@ class FuotaCampaign:
             key_provider=self._mc_ke_keys,
             lorawan_1_1=lorawan_1_1,
             on_answer=self._on_setup_answer,
+            max_command_retries=cfg.command_retries,
         )
         self.fragmentation = FragmentationServerApplication(
-            network_server, key_provider=self._data_block_keys
+            network_server,
+            key_provider=self._data_block_keys,
+            max_command_retries=cfg.command_retries,
         )
         self.fragmentation.on_answer = self._on_frag_answer
 
@@ -432,7 +460,11 @@ class FuotaCampaign:
         self._started_at = 0.0
         self._state_entered_at = 0.0
         self._session_time: float | None = None
+        #: When the multicast session window of the latest session closes. Until then a
+        #: Class C participant is mute, so nothing can be answered.
+        self._session_end: float | None = None
         self._status_requested_at: float | None = None
+        self._status_rounds = 0
         self._completion_time: dict[int, float] = {}
         self._fragments_uncoded = 0
         self._fragments_coded = 0
@@ -468,6 +500,12 @@ class FuotaCampaign:
             raise ValueError("poll_interval must be positive")
         if cfg.max_repair_rounds < 0:
             raise ValueError("max_repair_rounds must not be negative")
+        if cfg.max_status_rounds < 1:
+            raise ValueError("max_status_rounds must be at least 1")
+        if cfg.device_uplink_interval <= 0:
+            raise ValueError("device_uplink_interval must be positive")
+        if cfg.command_retries < 0:
+            raise ValueError("command_retries must not be negative")
 
     @property
     def ping_nb(self) -> int:
@@ -739,6 +777,11 @@ class FuotaCampaign:
             return None
 
         self._session_time = session_time
+        # The window the devices keep open, and therefore the earliest moment a Class C
+        # participant can transmit again (TS005 §2.7). Every phase that waits for answers
+        # counts its timeout from after this.
+        unit = float(BEACON_INTERVAL) if cfg.class_b else 1.0
+        self._session_end = session_time + unit * (1 << timeout_exponent)
         return session_time
 
     # ---- Phase 4: fragment broadcast (TS004 §3.6) ----
@@ -788,6 +831,18 @@ class FuotaCampaign:
     # ---- Phase 5: status round (TS004 §3.2) ----
 
     async def _phase_status(self, participants: bool | None = None) -> None:
+        """Poll the fleet, re-polling whoever stayed silent (TS004 §3.2).
+
+        The timeout only starts once the session window has closed and the devices have had
+        an uplink opportunity (:meth:`answers_possible_at`): a Class C participant is mute
+        for the whole window, and a round that times out against a mute fleet collects
+        nothing, which the repair logic would then read as "everybody is done".
+
+        A device that does not answer a round is polled again, up to
+        :attr:`FuotaCampaignConfig.max_status_rounds` times, because its request may simply
+        have been lost in RX1. Only a device that *said* it holds the block counts as
+        complete.
+        """
         cfg = self.config
         if participants is not None:
             participants_flag = participants
@@ -797,24 +852,65 @@ class FuotaCampaign:
                 if cfg.status_participants is not None
                 else not cfg.ack_reception
             )
-        self._status_requested_at = sim.current_time()
-        self.fragmentation.request_status(
-            sorted(self.participants), cfg.frag_index, participants=participants_flag
-        )
-        await self._wait_until(self._status_round_answered, cfg.status_timeout)
 
-    def _status_round_answered(self) -> bool:
-        """Whether every participant either answered this round or is known complete."""
+        targets = sorted(self.participants)
+        for round_index in range(max(cfg.max_status_rounds, 1)):
+            if not targets:
+                return
+            self._status_requested_at = sim.current_time()
+            self._status_rounds += 1
+            self.fragmentation.request_status(
+                targets, cfg.frag_index, participants=participants_flag
+            )
+            answered = await self._wait_until(
+                self._status_round_answered,
+                cfg.status_timeout,
+                not_before=self.answers_possible_at(),
+            )
+            if answered:
+                return
+            targets = sorted(self._status_silent())
+            if not targets:
+                return
+            if round_index + 1 < max(cfg.max_status_rounds, 1):
+                logger.info(
+                    f"{sim.current_time():.2f}s  CAMPAIGN  {len(targets)} device(s) did "
+                    f"not answer the status round, polling them again "
+                    f"({round_index + 2}/{cfg.max_status_rounds})"
+                )
+
+    def _status_silent(self) -> set[int]:
+        """Participants that neither answered the latest round nor are known complete."""
         cfg = self.config
         complete = self.fragmentation.devices_complete(cfg.frag_index)
         requested_at = self._status_requested_at or 0.0
+        silent: set[int] = set()
         for addr in self.participants:
             if addr in complete:
                 continue
             report = self.fragmentation.latest_status.get((cfg.frag_index, addr))
             if report is None or report.time < requested_at:
-                return False
-        return True
+                silent.add(addr)
+        return silent
+
+    def _status_round_answered(self) -> bool:
+        """Whether every participant either answered this round or is known complete."""
+        return not self._status_silent()
+
+    def _status_unknown(self) -> set[int]:
+        """Participants that have never reported anything and are not known complete.
+
+        Their state is *unknown*, not "complete": they are what makes a repair round
+        worthwhile even when every answer the server did receive said ``MissingFrag = 0``.
+        """
+        cfg = self.config
+        complete = self.fragmentation.devices_complete(cfg.frag_index)
+        return {
+            addr
+            for addr in self.participants
+            if addr not in complete
+            and (cfg.frag_index, addr) not in self.fragmentation.latest_status
+        }
 
     # ---- Phase 6: repair rounds (TS004 §3.2, §A.3) ----
 
@@ -829,17 +925,29 @@ class FuotaCampaign:
 
         while self.repair_rounds < cfg.max_repair_rounds:
             missing = self.fragmentation.max_missing(cfg.frag_index)
-            if missing <= 0:
+            unknown = self._status_unknown()
+            if missing <= 0 and not unknown:
                 break
 
             self.repair_rounds += 1
-            count = missing + cfg.repair_extra_fragments
+            count = max(missing, 0) + cfg.repair_extra_fragments
             self._transition(FuotaCampaignState.REPAIR)
-            logger.info(
-                f"{sim.current_time():.2f}s  CAMPAIGN  repair round "
-                f"{self.repair_rounds}/{cfg.max_repair_rounds}: the worst-off device "
-                f"needs {missing} more independent fragment(s), sending {count}"
-            )
+            if missing > 0:
+                logger.info(
+                    f"{sim.current_time():.2f}s  CAMPAIGN  repair round "
+                    f"{self.repair_rounds}/{cfg.max_repair_rounds}: the worst-off device "
+                    f"needs {missing} more independent fragment(s), sending {count}"
+                )
+            else:
+                # Silence is not completion (TS004 §3.2 only tells the server about the
+                # devices that answered), so a round of spare coded fragments goes out for
+                # the devices nothing is known about.
+                logger.info(
+                    f"{sim.current_time():.2f}s  CAMPAIGN  repair round "
+                    f"{self.repair_rounds}/{cfg.max_repair_rounds}: "
+                    f"{len(unknown)} device(s) never reported their state, sending "
+                    f"{count} spare coded fragment(s)"
+                )
 
             self._transition(FuotaCampaignState.SESSION_SETUP)
             session_time = await self._phase_session_setup(lead, count)
@@ -918,15 +1026,36 @@ class FuotaCampaign:
         if duration > 0:
             await sim.sleep(duration)
 
+    def answers_possible_at(self) -> float:
+        """Earliest time a participant could answer a command queued now.
+
+        While a multicast session window is open a Class C participant does not transmit at
+        all (TS005 §2.7), and a device stack hands the radio back over one further slot, so
+        the first uplink that can *carry* an answer is a couple of uplink intervals after the
+        window closed — and the command itself is only delivered in the RX1 window of one of
+        those uplinks. A timeout that starts counting before that point is not a timeout on
+        the device, it is a timeout on the session window, and with the TS005 ``TimeOut``
+        being a power of two the window can overrun the broadcast by almost as much again.
+
+        :returns: Now, when no session window is pending.
+        """
+        now = sim.current_time()
+        if self._session_end is None:
+            return now
+        return max(now, self._session_end + 2.0 * self.config.device_uplink_interval)
+
     async def _wait_until(
-        self, predicate: Callable[[], bool], timeout: float
+        self, predicate: Callable[[], bool], timeout: float, not_before: float = 0.0
     ) -> bool:
         """Poll *predicate* until it holds or *timeout* seconds elapsed.
 
         Polling rather than waiting on an event keeps a phase from deadlocking when the
         condition can only be satisfied by traffic that never arrives.
+
+        :param not_before: Simulation time from which the timeout starts counting. Used by
+            the phases that wait for device answers; see :meth:`answers_possible_at`.
         """
-        deadline = sim.current_time() + max(timeout, 0.0)
+        deadline = max(sim.current_time(), not_before) + max(timeout, 0.0)
         while True:
             if predicate():
                 return True

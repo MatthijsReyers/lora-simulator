@@ -1334,6 +1334,11 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
     Reference: LoRaWAN Fragmented Data Block Transport TS004-2.0.0 §3.
     """
 
+    #: How often the ``FragDataBlockReceivedReq`` loop looks at the queue while it waits for
+    #: a queued request to actually be transmitted. Short enough not to blur a retry
+    #: interval, long enough not to flood the event queue of a long multicast session.
+    ACK_SEND_POLL_INTERVAL = 1.0
+
     def __init__(
         self,
         device: LoRaWanDevice | None = None,
@@ -1681,24 +1686,49 @@ class FragmentationDeviceApplication(FuotaDeviceApplication):
         retransmissions. TS004 leaves the retry count to the application: it is
         :attr:`max_ack_retries` here.
 
-        Each round cancels the previous copy if it is still waiting in the
-        queue, so a slow drain cannot turn ``max_ack_retries`` into a burst of
-        identical uplinks.
+        **An attempt is only spent on a transmission that actually happened.**
+        A device completes its data block *inside* the multicast session window,
+        and a Class C device does not transmit while that window is open: the
+        queued request sits in the uplink queue until the device is back on its
+        own schedule. Running the retry timer against wall time there would
+        exhaust ``max_ack_retries`` against a radio that was never keyed, and
+        report a failure for an exchange that had not been tried once. The loop
+        therefore waits for the queue entry to be drained
+        (:attr:`~simulator.lorawan.fuota.device_app.PendingUplink.sent_at`) and
+        only then starts measuring the retransmission interval.
+
+        At most one copy is in the queue at a time, so a slow drain cannot turn
+        ``max_ack_retries`` into a burst of identical uplinks.
         """
         try:
             queued: PendingUplink | None = None
             for attempt in range(self.max_ack_retries + 1):
-                delay = self._ack_delay(session)
-                if delay > 0:
-                    await sim.sleep(delay)
+                # Only the first request is spread (§3.3's rule, applied by §3.5); a
+                # retransmission is already spaced by the interval waited below.
+                delay = self._ack_delay(session) if attempt == 0 else 0.0
+                queued = await self.queue_uplink(session.ack_payload, delay=delay)
+
+                # Wait for the radio, not for the clock.
+                while session.ack_pending and not queued.sent:
+                    await sim.sleep(self.ACK_SEND_POLL_INTERVAL)
                 if not session.ack_pending:
-                    if queued is not None:
-                        self.cancel_pending(queued)
-                    return
-                if queued is not None:
                     self.cancel_pending(queued)
-                queued = await self.queue_uplink(session.ack_payload)
+                    return
                 session.ack_attempts = attempt + 1
+
+                # §3.5: space the retransmission the same way the first request was spaced,
+                # counted from the instant it went on the air.
+                assert queued.sent_at is not None
+                retry_at = queued.sent_at + self._ack_delay(session)
+                while session.ack_pending and sim.current_time() < retry_at:
+                    await sim.sleep(
+                        min(
+                            self.ACK_SEND_POLL_INTERVAL,
+                            max(retry_at - sim.current_time(), 1e-6),
+                        )
+                    )
+                if not session.ack_pending:
+                    return
             logger.warning(
                 f"{sim.current_time():.2f}s  TS004-DEV  session {session.frag_index} "
                 f"FragDataBlockReceivedReq unanswered after "
@@ -1854,6 +1884,23 @@ class FragServerSession:
 
 
 @dataclass
+class _PendingCommand:
+    """One queued (or in-flight) unicast command of the server package.
+
+    :ivar key: Identifies the answer that retires this command — ``(CID, FragIndex)`` for
+        everything TS004 asks a device to answer. None marks a command that has no answer at
+        all (``FragDataBlockReceivedAns``, §3.5), which is sent once and forgotten.
+    :ivar attempts: Transmissions so far. The first ``get_downlink`` makes it 1.
+    :ivar sent_at: When the latest transmission was handed to the network server.
+    """
+
+    payload: bytes
+    key: tuple[int, int] | None = None
+    attempts: int = 0
+    sent_at: float | None = None
+
+
+@dataclass
 class FragStatusReport:
     """One ``FragSessionStatusAns`` as received by the server (§3.2)."""
 
@@ -1894,8 +1941,23 @@ class FragmentationServerApplication(Application):
     :meth:`get_downlink`, so they ride on the device's next uplink like any
     other application payload, and several of them may queue up per device.
 
+    **A command stays in flight until its answer arrives.** A downlink is
+    delivered in the RX1 window of a device's own uplink, and that frame is lost
+    whenever the gateway's single transmitter is busy with somebody else's
+    reply. Popping the command in :meth:`get_downlink` would lose it for good
+    and the device would silently drop out of the campaign at the next phase
+    timeout, so the command is kept — keyed by its ``(CID, FragIndex)`` — and
+    retransmitted on the device's next uplink until the matching answer comes
+    back or :attr:`max_command_retries` retransmissions have been spent. The
+    network server processes an uplink's answers *before* it asks for the next
+    downlink, so an answer that arrives late retires the command instead of
+    producing a duplicate.
+
     Reference: LoRaWAN Fragmented Data Block Transport TS004-2.0.0 §3.
     """
+
+    #: Retransmissions of an unanswered unicast command, on top of its first transmission.
+    DEFAULT_COMMAND_RETRIES = 3
 
     def __init__(
         self,
@@ -1903,10 +1965,14 @@ class FragmentationServerApplication(Application):
         *,
         key_provider: Callable[[int], bytes | None] | dict[int, bytes] | None = None,
         time_provider: Callable[[], float] | None = None,
+        max_command_retries: int = DEFAULT_COMMAND_RETRIES,
     ) -> None:
         """
         :param network_server: The server whose downlink queues and multicast
             scheduler this package drives.
+        :param max_command_retries: Retransmissions of an unanswered unicast
+            command, on top of its first transmission. 0 restores the
+            send-once behaviour.
         :param key_provider: Maps a ``DevAddr`` to that device's
             ``DataBlockIntKey`` (§3.3), either as a callable or a dict. A device
             with no key gets a ``FragSessionSetupReq`` with a zero MIC, which the
@@ -1915,6 +1981,7 @@ class FragmentationServerApplication(Application):
             :class:`FragStatusReport`; defaults to the simulation clock.
         """
         self.network_server = network_server
+        self.max_command_retries = max_command_retries
         self.time_provider: Callable[[], float] = (
             time_provider if time_provider is not None else sim.current_time
         )
@@ -1935,8 +2002,13 @@ class FragmentationServerApplication(Application):
         self.latest_status: dict[tuple[int, int], FragStatusReport] = {}
         #: Called as ``(dev_addr, command)`` for every parsed uplink command.
         self.on_answer: Callable[[int, FragCommandType], None] | None = None
+        #: Commands that were transmitted but never answered, per ``DevAddr``.
+        self.commands_abandoned = 0
+        #: Retransmissions this package made, for metrics.
+        self.commands_retransmitted = 0
 
-        self._pending: dict[int, deque[bytes]] = defaultdict(deque)
+        self._pending: dict[int, deque[_PendingCommand]] = defaultdict(deque)
+        self._in_flight: dict[int, _PendingCommand] = {}
 
     def port(self) -> int:
         """FPort 201 (§2.1)."""
@@ -2041,7 +2113,11 @@ class FragmentationServerApplication(Application):
                     f"{self.time_provider():.2f}s  TS004-NS  no DataBlockIntKey for "
                     f"0x{dev_addr:08X}; FragSessionSetupReq goes out with a zero MIC"
                 )
-            self._queue(dev_addr, encode_commands([request]))
+            self._queue(
+                dev_addr,
+                encode_commands([request]),
+                key=(FragCID.FRAG_SESSION_SETUP, frag_index),
+            )
 
         logger.info(
             f"{self.time_provider():.2f}s  TS004-NS  session {frag_index} created: "
@@ -2069,7 +2145,9 @@ class FragmentationServerApplication(Application):
             ]
         )
         for dev_addr in dev_addrs:
-            self._queue(dev_addr, payload)
+            self._queue(
+                dev_addr, payload, key=(FragCID.FRAG_SESSION_STATUS, frag_index)
+            )
         logger.info(
             f"{self.time_provider():.2f}s  TS004-NS  status requested for session "
             f"{frag_index} from {len(dev_addrs)} device(s) "
@@ -2083,7 +2161,9 @@ class FragmentationServerApplication(Application):
             [FragSessionDeleteReq(frag_index=_check_frag_index(frag_index))]
         )
         for dev_addr in dev_addrs:
-            self._queue(dev_addr, payload)
+            self._queue(
+                dev_addr, payload, key=(FragCID.FRAG_SESSION_DELETE, frag_index)
+            )
         logger.info(
             f"{self.time_provider():.2f}s  TS004-NS  session {frag_index} delete "
             f"requested from {len(dev_addrs)} device(s)"
@@ -2094,7 +2174,7 @@ class FragmentationServerApplication(Application):
         """Queue a unicast ``PackageVersionReq`` to each device (§3.1)."""
         payload = encode_commands([PackageVersionReq()])
         for dev_addr in dev_addrs:
-            self._queue(dev_addr, payload)
+            self._queue(dev_addr, payload, key=(FragCID.PACKAGE_VERSION, 0))
         return payload
 
     # -- fragment transmission ---------------------------------------------
@@ -2189,27 +2269,95 @@ class FragmentationServerApplication(Application):
 
     # -- downlink / uplink plumbing ----------------------------------------
 
-    def _queue(self, dev_addr: int, payload: bytes) -> None:
-        self._pending[dev_addr].append(payload)
+    def _queue(
+        self, dev_addr: int, payload: bytes, key: tuple[int, int] | None = None
+    ) -> None:
+        self._pending[dev_addr].append(_PendingCommand(payload=payload, key=key))
+
+    def _retire(self, dev_addr: int, key: tuple[int, int]) -> None:
+        """Drop the in-flight command a device just answered."""
+        entry = self._in_flight.get(dev_addr)
+        if entry is not None and entry.key == key:
+            del self._in_flight[dev_addr]
+
+    def _still_waiting(self, dev_addr: int, entry: _PendingCommand) -> bool:
+        """Whether an in-flight command is still worth retransmitting.
+
+        A ``FragSessionStatusReq`` with ``Participants = 0`` is deliberately left unanswered
+        by a device that already holds the whole block (§3.2), so a device the server already
+        knows is complete retires the command by itself.
+        """
+        if entry.key is None:
+            return False
+        cid, frag_index = entry.key
+        if cid == FragCID.FRAG_SESSION_STATUS and dev_addr in self.devices_complete(
+            frag_index
+        ):
+            return False
+        return True
 
     async def get_downlink(self, dev_addr: int) -> bytes | None:
-        """Hand the network server this package's next command for a device."""
+        """Hand the network server this package's next command for a device.
+
+        An unanswered command from a previous uplink is retransmitted first; see the class
+        docstring for why.
+        """
+        in_flight = self._in_flight.get(dev_addr)
+        if in_flight is not None:
+            if not self._still_waiting(dev_addr, in_flight):
+                del self._in_flight[dev_addr]
+            elif in_flight.attempts <= self.max_command_retries:
+                in_flight.attempts += 1
+                in_flight.sent_at = self.time_provider()
+                self.commands_retransmitted += 1
+                logger.debug(
+                    f"{self.time_provider():.2f}s  TS004-NS  retransmitting an unanswered "
+                    f"command to 0x{dev_addr:08X} (attempt {in_flight.attempts})"
+                )
+                return in_flight.payload
+            else:
+                del self._in_flight[dev_addr]
+                self.commands_abandoned += 1
+                logger.warning(
+                    f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} never "
+                    f"answered a command after {in_flight.attempts} transmission(s), "
+                    f"giving up on it"
+                )
+
         queue = self._pending.get(dev_addr)
         if not queue:
             return None
-        return queue.popleft()
+        entry = queue.popleft()
+        entry.attempts = 1
+        entry.sent_at = self.time_provider()
+        if entry.key is not None:
+            self._in_flight[dev_addr] = entry
+        return entry.payload
 
     async def has_downlink(self, dev_addr: int) -> bool:
         """Non-destructive probe: whether a command is queued for a device.
 
         ``get_downlink`` pops, so :meth:`~simulator.lorawan.network_server.NetworkServer.has_pending_downlink`
-        asks this instead.
+        asks this instead. A command that is in flight and still unanswered counts: it is
+        going out again on the device's next uplink.
         """
-        return bool(self._pending.get(dev_addr))
+        if self._pending.get(dev_addr):
+            return True
+        entry = self._in_flight.get(dev_addr)
+        return (
+            entry is not None
+            and entry.attempts <= self.max_command_retries
+            and self._still_waiting(dev_addr, entry)
+        )
 
     def pending_downlinks(self, dev_addr: int) -> list[bytes]:
         """Queued but unsent commands for a device, oldest first (read-only)."""
-        return list(self._pending.get(dev_addr, ()))
+        return [entry.payload for entry in self._pending.get(dev_addr, ())]
+
+    def in_flight_command(self, dev_addr: int) -> bytes | None:
+        """The command transmitted but not yet answered by a device, if any."""
+        entry = self._in_flight.get(dev_addr)
+        return entry.payload if entry is not None else None
 
     async def on_uplink(self, dev_addr: int, payload: bytes) -> None:
         """Process a FPort 201 uplink from a device (§3)."""
@@ -2224,6 +2372,7 @@ class FragmentationServerApplication(Application):
                 case FragSessionDeleteAns():
                     self._handle_delete_ans(dev_addr, command)
                 case PackageVersionAns():
+                    self._retire(dev_addr, (FragCID.PACKAGE_VERSION, 0))
                     logger.info(
                         f"{self.time_provider():.2f}s  TS004-NS  0x{dev_addr:08X} "
                         f"runs package {command.package_identifier} "
@@ -2238,6 +2387,7 @@ class FragmentationServerApplication(Application):
                 self.on_answer(dev_addr, command)
 
     def _handle_setup_ans(self, dev_addr: int, ans: FragSessionSetupAns) -> None:
+        self._retire(dev_addr, (FragCID.FRAG_SESSION_SETUP, ans.frag_index))
         session = self.sessions.get(ans.frag_index)
         if session is not None:
             session.setup_answers[dev_addr] = ans
@@ -2254,6 +2404,7 @@ class FragmentationServerApplication(Application):
             )
 
     def _handle_status_ans(self, dev_addr: int, ans: FragSessionStatusAns) -> None:
+        self._retire(dev_addr, (FragCID.FRAG_SESSION_STATUS, ans.frag_index))
         report = FragStatusReport(
             dev_addr=dev_addr,
             frag_index=ans.frag_index,
@@ -2294,13 +2445,16 @@ class FragmentationServerApplication(Application):
                 f"session {req.frag_index}, MIC ok"
             )
 
-        # §3.5: the answer SHALL echo the FragIndex of the request.
+        # §3.5: the answer SHALL echo the FragIndex of the request. It is the one
+        # command in TS004 the device does not answer, so it is sent once (key=None)
+        # — the device's own retransmission loop covers a loss here.
         self._queue(
             dev_addr,
             encode_commands([FragDataBlockReceivedAns(frag_index=req.frag_index)]),
         )
 
     def _handle_delete_ans(self, dev_addr: int, ans: FragSessionDeleteAns) -> None:
+        self._retire(dev_addr, (FragCID.FRAG_SESSION_DELETE, ans.frag_index))
         session = self.sessions.get(ans.frag_index)
         if session is not None:
             session.delete_answers[dev_addr] = ans

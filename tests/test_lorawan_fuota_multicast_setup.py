@@ -1280,6 +1280,18 @@ class TestServerApp:
         assert [type(c).__name__ for c in parse_downlink_commands(payload)] == [
             "McGroupSetupReq", "McGroupStatusReq", "PackageVersionReq",
         ]
+        # All three are in flight until the device answers them; once it has, nothing
+        # is left to send.
+        await app.on_uplink(
+            DEV_ADDR_A,
+            encode_commands(
+                [
+                    McGroupSetupAns(group_id=0),
+                    McGroupStatusAns(ans_group_mask=0),
+                    PackageVersionAns(package_identifier=2, package_version=2),
+                ]
+            ),
+        )
         assert await app.get_downlink(DEV_ADDR_A) is None
 
     @pytest.mark.asyncio
@@ -1293,9 +1305,14 @@ class TestServerApp:
         app.request_status([DEV_ADDR_A])
 
         first = await app.get_downlink(DEV_ADDR_A)
+        # The McGroupSetupReq fills the budget on its own, so the McGroupStatusReq waits
+        # for the next downlink — which is the uplink after the device acknowledged the
+        # first command.
+        await app.on_uplink(DEV_ADDR_A, McGroupSetupAns(group_id=0).encode())
         second = await app.get_downlink(DEV_ADDR_A)
         assert first is not None and len(first) == 30
         assert second is not None and len(second) == 2
+        await app.on_uplink(DEV_ADDR_A, McGroupStatusAns(ans_group_mask=0).encode())
         assert await app.get_downlink(DEV_ADDR_A) is None
 
     @pytest.mark.asyncio
@@ -1652,5 +1669,12 @@ class TestServerHasDownlinkIsNonDestructive:
         assert len(server.pending_commands(DEV_ADDR_A)) == 1
 
         assert await server.get_downlink(DEV_ADDR_A) is not None
+        # The queue is empty, but the command is in flight and unanswered, so it still
+        # counts as pending: it goes out again on the device's next uplink.
+        assert server.pending_commands(DEV_ADDR_A) == []
+        assert await server.has_downlink(DEV_ADDR_A) is True
+        assert await ns.has_pending_downlink(DEV_ADDR_A) is True
+
+        await server.on_uplink(DEV_ADDR_A, McGroupSetupAns(group_id=0).encode())
         assert await server.has_downlink(DEV_ADDR_A) is False
         assert await ns.has_pending_downlink(DEV_ADDR_A) is False

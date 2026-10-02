@@ -34,6 +34,7 @@ class PowerConsumer:
             "power": [],
             "energy": []
         }
+        self.events = None
         sim.create_task(self.__on_sim_end(), )
 
 
@@ -49,7 +50,6 @@ class PowerConsumer:
         self.__total_energy_consumed += self.__current_power * elapsed
         self.__last_update_time = now
         self.events = DataFrame(self.__events)
-        del self.__events
 
 
     def set_power_consumption(self, power: float) -> float:

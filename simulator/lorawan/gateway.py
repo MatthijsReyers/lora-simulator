@@ -34,7 +34,7 @@ class DutyCycleLimiter:
     Models the usual sub-band limit the simple way: after a frame of ``airtime`` seconds the
     transmitter stays quiet for ``airtime * (1/duty_cycle - 1)`` seconds, so over any long
     stretch at most ``duty_cycle`` of the time is spent transmitting. Set it to 0.10 for the
-    EU868 869.4–869.65 MHz sub-band or 0.01 for the 1% sub-bands.
+    EU868 869.4-869.65 MHz sub-band or 0.01 for the 1% sub-bands.
 
     Reference: ETSI EN 300 220-2, as applied in RP002-1.0.4 §2.4.3.
     """
@@ -94,6 +94,11 @@ class LoRaWanGateway:
     #: event queue.
     MULTICAST_POLL_INTERVAL = 0.05
 
+    #: How long the uplink loop waits before listening again when it finds the transceiver
+    #: busy transmitting. Nothing can be received during a transmission, so this only costs
+    #: a fraction of the frame that is already on the air.
+    TX_BACKOFF = 0.01
+
     def __init__(
         self,
         network_server: NetworkServer,
@@ -116,6 +121,9 @@ class LoRaWanGateway:
         self.data_rate = data_rate
         self.tx_power = tx_power
         self.frames_forwarded = 0
+        #: RX1 replies dropped because the single transmitter was busy with another
+        #: device's window or with a beacon. The uplink itself was still forwarded.
+        self.downlinks_skipped = 0
         #: Number of scheduled multicast frames put on the air by the scheduler task.
         self.multicast_frames_sent = 0
         #: ``(time, group_addr, fport, len(raw))`` for every multicast frame transmitted.
@@ -217,12 +225,27 @@ class LoRaWanGateway:
         )
 
     async def _run(self) -> None:
-        """Main gateway loop: receive uplinks, forward to NS, send downlinks."""
+        """Main gateway loop: receive uplinks and hand each one to its own task.
+
+        The receiver is never parked: waiting out the ``RECEIVE_DELAY1`` of one device's
+        reply inside this loop would make the gateway deaf for a full second after every
+        uplink, so a fleet transmitting less than ~1.5 s apart would lose uplinks that never
+        even reached the network server. Each uplink therefore gets a child task that
+        forwards it and, a second later, tries its RX1 reply, while this loop goes straight
+        back to listening. The radio itself is still a single transceiver — see
+        :meth:`_reply_in_rx1` for what happens when two RX1 windows collide.
+        """
         while sim.is_running():
             try:
                 result = await self.radio.receive_data_wait()
             except TimeoutError:
                 return
+            except RuntimeError:
+                # The single transceiver is in the middle of a transmission (an RX1 reply
+                # from a sibling task, a beacon, a multicast fragment). Nothing can be
+                # received while it is keyed, so wait for it to finish and listen again.
+                await sim.sleep(self.TX_BACKOFF)
+                continue
 
             assert isinstance(result, LoraPacket)
             # The radio hands the frame over as soon as its last symbol lands, so this is
@@ -235,25 +258,53 @@ class LoRaWanGateway:
                 f"{sim.current_time():.2f}s  GW  received uplink ({len(raw_uplink)} bytes)"
             )
 
-            # Forward to network server and get downlink response (if any)
-            downlink_raw = await self.network_server.handle_uplink(raw_uplink)
+            await sim.start_child_task(self._forward_uplink(raw_uplink, uplink_end))
 
-            if downlink_raw is not None:
-                # Transmit the downlink in the device's RX1 window, which opens exactly
-                # RECEIVE_DELAY1 after the uplink ended. Sending it any earlier only reaches
-                # devices that (incorrectly) leave their receiver on between windows.
-                # The RX1 window is short and unmovable, so the multicast scheduler is told
-                # to stay off the air from now until the reply has gone out.
-                self._priority_tx += 1
-                try:
-                    await sim.sleep_until(uplink_end + RECEIVE_DELAY1)
-                    logger.debug(
-                        f"{sim.current_time():.2f}s  GW  sending downlink "
-                        f"({len(downlink_raw)} bytes)"
-                    )
-                    await self._transmit(downlink_raw)
-                finally:
-                    self._priority_tx -= 1
+    async def _forward_uplink(self, raw_uplink: bytes, uplink_end: float) -> None:
+        """Forward one uplink to the network server and reply in its RX1 window."""
+        try:
+            downlink_raw = await self.network_server.handle_uplink(raw_uplink)
+            if downlink_raw is None:
+                return
+            await self._reply_in_rx1(downlink_raw, uplink_end)
+        except SimulatorException:
+            return
+
+    async def _reply_in_rx1(self, downlink_raw: bytes, uplink_end: float) -> None:
+        """Transmit a downlink in a device's RX1 window, if the transmitter is free.
+
+        The window opens exactly ``RECEIVE_DELAY1`` after the uplink ended and is a few
+        hundred milliseconds long; sending any earlier only reaches devices that
+        (incorrectly) leave their receiver on in between. The window is short and
+        unmovable, so the multicast scheduler is told to stay off the air until the reply
+        has gone out.
+
+        When the transmitter is busy at that instant — another device's RX1 reply, a
+        beacon — the reply is **skipped** rather than transmitted late into a window that
+        has already closed. The uplink has still been forwarded, so the network server's
+        state advanced; the command that was popped for this frame is retransmitted on the
+        device's next uplink by the FUOTA packages, which keep a command in flight until it
+        is answered.
+        """
+        self._priority_tx += 1
+        try:
+            await sim.sleep_until(max(uplink_end + RECEIVE_DELAY1, sim.next_tick()))
+            if not sim.is_running():
+                return
+            if self._radio_lock.locked():
+                self.downlinks_skipped += 1
+                logger.debug(
+                    f"{sim.current_time():.2f}s  GW  skipping an RX1 reply "
+                    f"({len(downlink_raw)} bytes): the transmitter is busy"
+                )
+                return
+            logger.debug(
+                f"{sim.current_time():.2f}s  GW  sending downlink "
+                f"({len(downlink_raw)} bytes)"
+            )
+            await self._transmit(downlink_raw)
+        finally:
+            self._priority_tx -= 1
 
     # ---- Multicast downlink scheduling ----
 

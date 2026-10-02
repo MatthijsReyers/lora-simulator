@@ -72,10 +72,15 @@ the fleet.
 5. **STATUS** — `FragSessionStatusReq` (§3.2, CID 0x01); the devices answer
    `FragSessionStatusAns` with `NbFragReceived` and `MissingFrag`. A device that already
    reconstructed and MIC-verified the block announces it with `FragDataBlockReceivedReq`
-   (§3.5, CID 0x04 — the one command the *device* originates).
+   (§3.5, CID 0x04 — the one command the *device* originates). The phase waits for the
+   multicast session window to close before its timeout starts counting — nothing can be
+   answered while a Class C device is mute — and polls a device that stayed silent again
+   (`max_status_rounds`, 2 by default). A device only counts as complete when it *said* so.
 6. **REPAIR** — when the worst-off device still misses *k* fragments the campaign opens a new
    multicast session on the same group and broadcasts `k + 2` further coded fragments,
-   continuing the `N` sequence rather than repeating it. Up to `--repair-rounds` times.
+   continuing the `N` sequence rather than repeating it. Up to `--repair-rounds` times. A
+   participant that never reported anything at all counts as *unknown*, not as complete, and
+   is worth a round of spare coded fragments on its own.
 7. **CLEANUP** — `FragSessionDeleteReq` (§3.4) and `McGroupDeleteReq` (TS005 §4.4).
 
 ## Command-line flags
@@ -128,8 +133,8 @@ The default run (10 devices, 8 kB, DR5, 10% duty cycle, 20% redundancy, no losse
   Multicast frames:     46
   Multicast airtime:    17.0 s
   Duty-cycle quiet:     152.7 s
-  Unicast downlinks:    80
-  Uplinks received:     70
+  Unicast downlinks:    90
+  Uplinks received:     80
 
   Phase durations
     GROUP_SETUP        25.0 s      FRAG_SETUP     49.0 s     SESSION_SETUP  26.0 s
@@ -142,7 +147,7 @@ The default run (10 devices, 8 kB, DR5, 10% duty cycle, 20% redundancy, no losse
 
 With `--loss 0.2` the 8 coded fragments are no longer enough, two repair rounds add 14 more,
 and all ten devices still finish — 60 fragments scheduled, campaign total 752.5 s. With
-`--class-b` the same image goes out through 32 ping slots per 128 s beacon period: 889.0 s,
+`--class-b` the same image goes out through 32 ping slots per 128 s beacon period: 891.5 s,
 10/10 complete.
 
 The per-device table reports `dropped` fragments as well. In a lossless run these are the
@@ -210,21 +215,24 @@ is 256 s for a 198 s broadcast.
   per-transmitter budget on one sub-band — there is no per-sub-band accounting, and the end
   devices have no duty-cycle limit at all.
 - **One downlink per uplink.** The network server returns at most one downlink per uplink and
-  round-robins between the registered packages. Combined with the gateway being a single
-  transceiver that stops receiving from the moment an uplink lands until its RX1 reply has
-  gone out (~1.2 s later), this means **the fleet has to be staggered**: the example spaces
-  the devices' first uplinks one `--uplink-interval / --devices` apart. Push the fleet size up
-  without raising the uplink interval and devices start costing each other downlinks, and the
-  campaign drops them when a phase times out.
+  round-robins between the registered packages. The gateway is a single transceiver: it keeps
+  *receiving* while it waits out a device's `RECEIVE_DELAY1`, so no uplink is lost, but when
+  two RX1 windows fall on top of each other the later reply is skipped rather than transmitted
+  into a window that has already closed. Both server packages therefore keep a unicast command
+  **in flight** until its answer arrives and retransmit it on the device's next uplink (up to
+  `command_retries`, 3 by default), which is what makes a dense fleet converge. Staggering the
+  fleet — the example spaces the devices' first uplinks one `--uplink-interval / --devices`
+  apart — is no longer required for correctness; it is simply a sensible default that avoids
+  paying for those retransmissions.
 - **Class C uplink blackout.** A device in a Class C multicast session does not transmit, and
   `FuotaDeviceStack` skips one further slot while it hands the radio back. Because the TS005
   `SessionTimeOut` is a power of two, the window can overrun the broadcast by almost as much
   again — in the default run the broadcast ends at ~300 s but the window only closes at 381 s.
-  Nothing can be acknowledged in between, which is why this example sizes `status_timeout`
-  from the planned broadcast duration rather than leaving it at the campaign default. Expect
-  a few `FragDataBlockReceivedReq unanswered after 4 transmission(s)` warnings: the TS004 §3.5
-  retry timer runs while the device is mute, and the queued acknowledgement is transmitted
-  once the window closes.
+  Nothing can be acknowledged in between, which is why the campaign only starts counting a
+  status phase's timeout once the window has closed and the devices have had a couple of
+  uplink opportunities (`FuotaCampaign.answers_possible_at`), and why the TS004 §3.5
+  `FragDataBlockReceivedReq` retry counts *transmissions* rather than elapsed time. A clean
+  run produces no warnings.
 - **Class B caveats** (from `FuotaCampaign`/`FuotaDeviceStack`): `SessionTime` is rounded up
   to a whole beacon period and `TimeOut` counts beacon periods, not seconds. A Class B device
   spends its time waiting for beacons and ping slots, which makes the RX1 window after an

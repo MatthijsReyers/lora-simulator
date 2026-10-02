@@ -42,7 +42,9 @@ from simulator.lorawan.fuota.frag_transport import (
     FRAGMENTATION_FPORT,
     DataFragment,
     FragmentationDeviceApplication,
+    FragSessionStatusAns,
     parse_downlink_commands,
+    parse_uplink_commands,
 )
 from simulator.lorawan.fuota.multicast_setup import (
     MULTICAST_SETUP_FPORT,
@@ -112,6 +114,9 @@ class VirtualDevice:
         self.reachable = True
         #: Drop every n-th fragment to model a weak receiver; 0 disables it.
         self.drop_every = 0
+        #: Throw away this many ``FragSessionStatusAns`` before answering a status round,
+        #: as if the uplink carrying them had been lost.
+        self.swallow_status_answers = 0
         #: Refuse every ``McGroupSetupReq`` with ``IDerror`` (TS005 §4.3).
         self.refuse_group = False
         self.uplinks = 0
@@ -126,6 +131,12 @@ class VirtualDevice:
             return MULTICAST_SETUP_FPORT, pending
         pending = self.fragmentation.pop_pending_uplink()
         if pending is not None:
+            if self.swallow_status_answers and any(
+                isinstance(command, FragSessionStatusAns)
+                for command in parse_uplink_commands(pending)
+            ):
+                self.swallow_status_answers -= 1
+                return FRAGMENTATION_FPORT, b""
             return FRAGMENTATION_FPORT, pending
         return FRAGMENTATION_FPORT, b""
 
@@ -194,6 +205,7 @@ class Fleet:
         firmware: bytes = FIRMWARE,
         device_count: int = 3,
         uplink_interval: float = 1.0,
+        mute_during_session: bool = False,
     ) -> None:
         sim.logger.setLevel(logging.WARNING)
         self.ns = NetworkServer(default_data_rate=DATA_RATE)
@@ -203,6 +215,8 @@ class Fleet:
 
         self.devices = {addr: VirtualDevice(addr) for addr in self.addrs}
         self.uplink_interval = uplink_interval
+        #: Model the Class C blackout: no device transmits while the session window is open.
+        self.mute_during_session = mute_during_session
         self.campaign = FuotaCampaign(
             self.ns,
             key_provider={addr: GEN_APP_KEYS[addr] for addr in self.addrs},
@@ -223,9 +237,21 @@ class Fleet:
             while sim.is_running():
                 for device in self.devices.values():
                     await sim.sleep(self.uplink_interval)
+                    if self.in_session_window():
+                        continue
                     await device.uplink(self.ns)
         except SimulatorException:
             return
+
+    def in_session_window(self) -> bool:
+        """Whether a multicast session window is open and the fleet is therefore mute."""
+        if not self.mute_during_session:
+            return False
+        start = self.campaign._session_time
+        end = self.campaign._session_end
+        if start is None or end is None:
+            return False
+        return start <= sim.current_time() < end
 
     async def _multicast_loop(self) -> None:
         """Stand in for the gateway: transmit due multicast frames to the whole group."""
@@ -595,3 +621,126 @@ class TestSessionParameters:
         for addr in fleet.addrs:
             time_to_start = fleet.campaign.multicast_setup.device_state[addr].time_to_start
             assert 0 < time_to_start[0] <= 15
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Waiting for the session window (TS005 §2.7 meets TS004 §3.2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestStatusWaitsForTheSessionWindow:
+    """A Class C participant is mute for the whole ``2**TimeOut`` session window.
+
+    The window is a power of two and can overrun the broadcast by almost as much again, so a
+    status round that starts counting its timeout when the fragments stop collects nothing,
+    and ``max_missing()`` then reports 0 — "everybody is done" — for a fleet that has not
+    said a word.
+    """
+
+    def _config_with_window(self, **overrides: object) -> FuotaCampaignConfig:
+        defaults: dict[str, object] = dict(
+            # 2**6 = 64 s of window for a ~3 s broadcast: the blackout dominates.
+            session_timeout=6,
+            session_lead_time=10.0,
+            status_timeout=15.0,
+            device_uplink_interval=1.0,
+            cleanup_timeout=20.0,
+        )
+        defaults.update(overrides)
+        return _config(**defaults)
+
+    def test_the_round_is_not_timed_out_against_a_mute_fleet(self):
+        fleet = Fleet(config=self._config_with_window(), mute_during_session=True)
+        fleet.start()
+        sim.run(simulation_length=220)
+
+        campaign = fleet.campaign
+        assert campaign._session_end is not None
+        assert campaign.state is FuotaCampaignState.DONE
+        assert campaign.completed_devices == set(fleet.addrs)
+        # Every answer the server holds was given after the window closed.
+        for report in campaign.fragmentation.status_reports:
+            assert report.time >= campaign._session_end
+
+    def test_answers_possible_at_follows_the_session_window(self):
+        fleet = Fleet(config=self._config_with_window(device_uplink_interval=7.0))
+        campaign = fleet.campaign
+        assert campaign.answers_possible_at() == pytest.approx(sim.current_time())
+
+        campaign._session_end = 500.0
+        # The window plus two uplink opportunities: the device stack skips one slot while
+        # it hands the radio back and needs another to be handed the request in RX1.
+        assert campaign.answers_possible_at() == pytest.approx(500.0 + 14.0)
+
+    def test_a_mute_fleet_is_not_mistaken_for_a_finished_one(self):
+        """Without the wait the campaign used to reach CLEANUP with nothing reported."""
+        fleet = Fleet(
+            config=self._config_with_window(redundancy_fragments=0, max_repair_rounds=1),
+            mute_during_session=True,
+        )
+        fleet.devices[DEV_ADDRS[2]].drop_every = 5
+        fleet.start()
+        sim.run(simulation_length=320)
+
+        campaign = fleet.campaign
+        # The device that lost fragments did get its repair round, which it could only have
+        # asked for after the window closed.
+        assert campaign.repair_rounds == 1
+        assert campaign.completed_devices == set(fleet.addrs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Silence is not completion (TS004 §3.2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestSilentDevices:
+    def test_a_device_that_misses_a_status_round_is_polled_again(self):
+        fleet = Fleet(
+            config=_config(
+                redundancy_fragments=0, max_repair_rounds=1, status_timeout=10.0,
+                device_uplink_interval=1.0,
+                # 2**2 = 4 s of session window for a 2 s broadcast, so the status phase
+                # starts counting almost immediately.
+                session_timeout=2,
+            )
+        )
+        # It will be short of fragments, and its first status answer never arrives.
+        fleet.devices[DEV_ADDRS[2]].drop_every = 5
+        fleet.devices[DEV_ADDRS[2]].swallow_status_answers = 1
+        fleet.start()
+        sim.run(simulation_length=200)
+
+        campaign = fleet.campaign
+        assert campaign._status_rounds >= 2
+        # The second round got the answer, so the repair round was sized from it.
+        report = campaign.fragmentation.latest_status[(0, DEV_ADDRS[2])]
+        assert report.missing_frag == 4
+        assert campaign.repair_rounds == 1
+        assert campaign.completed_devices == set(fleet.addrs)
+
+    def test_a_device_that_never_answers_counts_as_unknown_not_complete(self):
+        fleet = Fleet(
+            config=_config(
+                redundancy_fragments=0,
+                max_repair_rounds=1,
+                status_timeout=8.0,
+                device_uplink_interval=1.0,
+                max_status_rounds=2,
+                repair_extra_fragments=2,
+                session_timeout=2,
+            )
+        )
+        silent = fleet.devices[DEV_ADDRS[2]]
+        silent.drop_every = 5
+        # It never manages to answer a status request at all.
+        silent.swallow_status_answers = 1000
+        fleet.start()
+        sim.run(simulation_length=240)
+
+        campaign = fleet.campaign
+        # Nothing was reported by that device, so max_missing() sees nothing...
+        assert (0, DEV_ADDRS[2]) not in campaign.fragmentation.latest_status
+        assert campaign.fragmentation.max_missing(0) == 0
+        # ... and the campaign still spent a repair round on it rather than calling it done.
+        assert campaign.repair_rounds == 1
+        assert campaign.result.fragments_repair == 2
+        assert DEV_ADDRS[2] not in campaign.completed_devices

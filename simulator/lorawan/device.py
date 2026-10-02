@@ -544,6 +544,12 @@ class LoRaWanDevice:
         wake_at = open_at - self._rx_wakeup_guard()
         if wake_at > sim.current_time():
             await sim.sleep_until(wake_at)
+            if not sim.is_running():
+                # `sleep_until` does not raise at the end of the simulation the way `sleep`
+                # does: the environment simply wakes every sleeper one last time at the final
+                # tick. The radio (and its power consumer) are torn down by then, so touching
+                # them here would raise inside whichever background task owns this window.
+                return None
         # A Class C device is already listening; dropping it into standby first would blind it
         # for the radio's whole startup time.
         if self.radio.get_state() != RadioState.RX:

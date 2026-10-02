@@ -227,12 +227,9 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
     lead_time = max(40.0, 2.0 * args.uplink_interval)
     plan = plan_broadcast(args)
     frag_size = int(plan["frag_size"])
-    # TS005 encodes the session length as a 4-bit exponent, so the window the devices keep
-    # open is the next power of two above the broadcast and can overrun it by almost as much
-    # again. A Class C device does not transmit while that window is open, and
-    # FuotaDeviceStack skips one further slot while it hands the radio back, so the status
-    # round cannot be answered until roughly two uplink intervals after the window closes.
-    status_timeout = plan["broadcast"] + 3.0 * args.uplink_interval + 60.0
+    # The campaign sizes every "wait for an answer" from the uplink interval and from the
+    # session window it scheduled itself, so `status_timeout` is a plain timeout on the
+    # devices again and is left at its default.
     if args.class_b:
         # TS005 §4.6: SessionTime is a multiple of one beacon period and TimeOut counts
         # beacon periods. The devices need beacon lock before it opens, which is why the
@@ -247,11 +244,11 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
             descriptor=0x00010002,
             class_b=True,
             class_b_periodicity=CLASS_B_PERIODICITY,
+            device_uplink_interval=args.uplink_interval,
             session_lead_time=max(3 * BEACON_INTERVAL, lead_time),
             broadcast_offset=0.0,
             fragment_interval=0.0,
             setup_timeout=max(180.0, 3.0 * args.uplink_interval),
-            status_timeout=status_timeout,
             cleanup_timeout=max(120.0, 3.0 * args.uplink_interval),
             broadcast_settle=2.0,
             max_repair_rounds=args.repair_rounds,
@@ -269,8 +266,8 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
         # None: the campaign derives the fragment spacing from the gateway's duty cycle.
         fragment_interval=None,
         session_lead_time=lead_time,
+        device_uplink_interval=args.uplink_interval,
         setup_timeout=max(120.0, 3.0 * args.uplink_interval),
-        status_timeout=status_timeout,
         cleanup_timeout=max(90.0, 3.0 * args.uplink_interval),
         broadcast_settle=2.0,
         max_repair_rounds=args.repair_rounds,
@@ -374,11 +371,12 @@ def build_scenario(args: argparse.Namespace):
             device,
             gen_app_key=gen_app_keys[addr],
             uplink_interval=args.uplink_interval,
-            # Stagger the fleet. The gateway is a single transceiver and stops receiving
-            # from the moment an uplink lands until its RX1 reply has gone out roughly
-            # RECEIVE_DELAY1 + airtime later, so two devices less than ~1.5 s apart cost
-            # each other downlinks. One full interval divided by the fleet size gives every
-            # device its own slot.
+            # Stagger the fleet. The gateway keeps receiving while it waits out a device's
+            # RECEIVE_DELAY1, so nothing is lost without it — but it is a single
+            # transceiver, and two RX1 windows that fall on top of each other cost one of
+            # the two replies, which then has to be retransmitted on the device's next
+            # uplink. One full interval divided by the fleet size gives every device its
+            # own slot and keeps the campaign at one round trip per phase.
             first_uplink=1.0 + index * (args.uplink_interval / max(args.devices, 1)),
             stop_after=sim_length - 8.0,
             class_b_from=class_b_from,
@@ -410,7 +408,14 @@ def estimate_sim_length(args: argparse.Namespace, config: FuotaCampaignConfig) -
     # Setup: three unicast round trips (group, fragmentation session, multicast session),
     # roughly one uplink interval each, plus the session lead time.
     setup = config.session_lead_time + 6.0 * args.uplink_interval + 60.0
-    status = config.status_timeout + config.cleanup_timeout
+    # The status phase only starts counting its timeout once the session window has closed
+    # and the devices have had a couple of uplink opportunities (see
+    # ``FuotaCampaign.answers_possible_at``), and it may poll a silent device again.
+    status = (
+        config.max_status_rounds * config.status_timeout
+        + 2.0 * args.uplink_interval
+        + config.cleanup_timeout
+    )
     # A repair round only sends a handful of fragments, so its own window is small.
     repair = args.repair_rounds * (
         config.session_lead_time + 4.0 * unit + 6.0 * args.uplink_interval + 120.0

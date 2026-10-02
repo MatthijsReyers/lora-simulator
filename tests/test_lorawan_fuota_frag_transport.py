@@ -1607,6 +1607,8 @@ class TestServerFragmentScheduling:
             [DEV_ADDR], frag_index=0, data=data, frag_size=20, session_cnt=1
         )
         await server.get_downlink(DEV_ADDR)  # drain the setup request
+        # ... and answer it, so it is not retransmitted ahead of the fragment.
+        await server.on_uplink(DEV_ADDR, FragSessionSetupAns(frag_index=0).encode())
 
         server.send_fragment_unicast(DEV_ADDR, 0, 25)
 
@@ -1695,6 +1697,7 @@ class TestServerAnswers:
             session_cnt=1, ack_reception=True,
         )
         await server.get_downlink(DEV_ADDR)  # drain the setup request
+        await server.on_uplink(DEV_ADDR, FragSessionSetupAns(frag_index=1).encode())
 
         await server.on_uplink(
             DEV_ADDR, FragDataBlockReceivedReq(frag_index=1).encode()
@@ -1726,6 +1729,7 @@ class TestServerAnswers:
             [DEV_ADDR], frag_index=0, data=_block(40), frag_size=10, session_cnt=1
         )
         await server.get_downlink(DEV_ADDR)
+        await server.on_uplink(DEV_ADDR, FragSessionSetupAns(frag_index=0).encode())
 
         server.delete_session([DEV_ADDR], 0)
         payload = await server.get_downlink(DEV_ADDR)
@@ -1744,8 +1748,9 @@ class TestServerAnswers:
             [DEV_ADDR, DEV_ADDR_B], frag_index=0, data=_block(40),
             frag_size=10, session_cnt=1,
         )
-        await server.get_downlink(DEV_ADDR)
-        await server.get_downlink(DEV_ADDR_B)
+        for addr in (DEV_ADDR, DEV_ADDR_B):
+            await server.get_downlink(addr)
+            await server.on_uplink(addr, FragSessionSetupAns(frag_index=0).encode())
 
         server.request_status([DEV_ADDR, DEV_ADDR_B], 0, participants=True)
 
@@ -2054,6 +2059,13 @@ class TestServerHasDownlinkIsNonDestructive:
         assert len(server.pending_downlinks(DEV_ADDR)) == 1
 
         assert await server.get_downlink(DEV_ADDR) is not None
+        # The queue is empty, but the command is in flight and unanswered, so it is
+        # still "pending": it goes out again on the device's next uplink.
+        assert server.pending_downlinks(DEV_ADDR) == []
+        assert await server.has_downlink(DEV_ADDR) is True
+        assert await ns.has_pending_downlink(DEV_ADDR) is True
+
+        await server.on_uplink(DEV_ADDR, FragSessionSetupAns(frag_index=0).encode())
         assert await server.has_downlink(DEV_ADDR) is False
         assert await ns.has_pending_downlink(DEV_ADDR) is False
 
@@ -2185,6 +2197,68 @@ class TestBlockReceivedRetriesWithoutADevice:
         for _time, payload in drained:
             command = parse_uplink_commands(payload)[0]
             assert isinstance(command, FragDataBlockReceivedReq)
+
+    def test_attempts_are_only_spent_on_actual_transmissions(self):
+        """§3.5 against a radio that cannot transmit: a Class C session window.
+
+        The block is reconstructed *inside* the multicast session, where the device does not
+        uplink at all. Nothing is drained for 40 s — far longer than
+        ``max_ack_retries`` retry intervals — and the retry budget must still be untouched
+        when the device is finally allowed to transmit.
+        """
+        data = _block(200)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(ack_retry_interval=5.0, max_ack_retries=3)
+        drained: list[tuple[float, bytes]] = []
+
+        async def driver() -> None:
+            await app.on_downlink(
+                _app_setup_req(data, 20, ack_reception=True, session_cnt=1).encode()
+            )
+            app.pop_pending_uplink()
+            await self._complete(app, data, encoder)
+
+            # The "session window": the device is mute, so nothing drains the queue.
+            await sim.sleep(40.0)
+            assert app.sessions[0].ack_attempts == 0
+            # One copy of the request is waiting, not four.
+            assert len(app.pending_entries) == 1
+
+            payload = app.pop_pending_uplink(sim.current_time())
+            assert payload is not None
+            drained.append((sim.current_time(), payload))
+            await sim.sleep(1.0)
+            assert app.sessions[0].ack_attempts == 1
+
+        sim.create_task(driver())
+        sim.run(simulation_length=60)
+
+        assert len(drained) == 1
+        command = parse_uplink_commands(drained[0][1])[0]
+        assert isinstance(command, FragDataBlockReceivedReq)
+
+    def test_no_warning_while_the_device_cannot_transmit(self, caplog):
+        data = _block(200)
+        encoder = FragmentationEncoder(data, 20)
+        app = FragmentationDeviceApplication(ack_retry_interval=2.0, max_ack_retries=3)
+
+        async def driver() -> None:
+            await app.on_downlink(
+                _app_setup_req(data, 20, ack_reception=True, session_cnt=1).encode()
+            )
+            app.pop_pending_uplink()
+            await self._complete(app, data, encoder)
+            await sim.sleep(50.0)
+
+        caplog.set_level(
+            logging.WARNING, logger="simulator.lorawan.fuota.frag_transport"
+        )
+        sim.create_task(driver())
+        sim.run(simulation_length=60)
+
+        assert [
+            record.message for record in caplog.records if "unanswered" in record.message
+        ] == []
 
     def test_the_answer_stops_the_retransmissions(self):
         data = _block(200)

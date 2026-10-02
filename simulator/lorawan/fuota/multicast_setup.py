@@ -1662,6 +1662,21 @@ class ServerMulticastGroup:
 
 
 @dataclass
+class _InFlightCommand:
+    """One TS005 command that was transmitted and is waiting for its answer.
+
+    :ivar key: ``(CID, McGroupID)`` of the answer that retires it; ``McGroupID`` is -1 for
+        the two commands that are not tied to a group.
+    :ivar attempts: Transmissions so far, the first one included.
+    """
+
+    command: MulticastSetupCommand
+    key: tuple[int, int]
+    attempts: int = 0
+    sent_at: float | None = None
+
+
+@dataclass
 class DeviceSetupState:
     """What the server has learned about one device's multicast configuration.
 
@@ -1724,6 +1739,7 @@ class MulticastSetupServerApplication(Application):
         time_provider: Callable[[], int] | None = None,
         max_downlink_payload: int | None = None,
         on_answer: Callable[[int, MulticastSetupCommandType], object] | None = None,
+        max_command_retries: int = 3,
     ) -> None:
         """
         :param network_server: The network server the groups are created on.
@@ -1738,6 +1754,12 @@ class MulticastSetupServerApplication(Application):
         :param on_answer: Optional hook invoked as ``on_answer(dev_addr, cmd)``
             for every answer parsed, for orchestrators that drive the next step
             of a FUOTA campaign. May be a coroutine function.
+        :param max_command_retries: Retransmissions of a command a device never
+            answered, on top of its first transmission. A unicast command is only
+            delivered in the RX1 window of a device's own uplink, and that frame is
+            lost whenever the gateway's single transmitter is busy with another
+            device's reply; without a retry the device silently drops out of the
+            campaign. 0 restores the send-once behaviour.
         """
         self.network_server = network_server
         self.lorawan_1_1 = lorawan_1_1
@@ -1752,7 +1774,15 @@ class MulticastSetupServerApplication(Application):
         )
         self.on_answer = on_answer
 
+        self.max_command_retries = max_command_retries
+
         self._pending: dict[int, deque[MulticastSetupCommand]] = defaultdict(deque)
+        #: Commands transmitted but not yet answered, per ``DevAddr``.
+        self._in_flight: dict[int, list[_InFlightCommand]] = {}
+        #: Retransmissions this package made, for metrics.
+        self.commands_retransmitted = 0
+        #: Commands given up on after :attr:`max_command_retries` retransmissions.
+        self.commands_abandoned = 0
         #: Groups created through :meth:`setup_group`, keyed by ``McGroupID``.
         self.groups: dict[int, ServerMulticastGroup] = {}
         #: Per-device view of the multicast configuration, keyed by ``DevAddr``.
@@ -1994,33 +2024,124 @@ class MulticastSetupServerApplication(Application):
             return group.data_rate
         return self.network_server._default_data_rate
 
+    # ---- In-flight commands (retransmission) ----
+
+    @staticmethod
+    def _answer_key(command: MulticastSetupCommand) -> tuple[int, int] | None:
+        """``(CID, McGroupID)`` of the answer that retires a command.
+
+        Every TS005 request has an answer, so this never returns None today; the
+        possibility is kept so a future command without one is simply sent once.
+        """
+        match command:
+            case McGroupSetupReq() | McGroupDeleteReq():
+                return (int(command.cid), command.group_id)
+            case McClassCSessionReq() | McClassBSessionReq():
+                return (int(command.cid), command.group_id)
+            case McGroupStatusReq() | PackageVersionReq():
+                return (int(command.cid), -1)
+            case _:
+                return None
+
+    def _retire(self, dev_addr: int, key: tuple[int, int]) -> None:
+        """Forget the in-flight command a device just answered."""
+        entries = self._in_flight.get(dev_addr)
+        if not entries:
+            return
+        remaining = [entry for entry in entries if entry.key != key]
+        if remaining:
+            self._in_flight[dev_addr] = remaining
+        else:
+            self._in_flight.pop(dev_addr, None)
+
+    def _retransmissions(self, dev_addr: int) -> list[_InFlightCommand]:
+        """In-flight commands due for another transmission, oldest first.
+
+        Entries that have exhausted :attr:`max_command_retries` are dropped here, once,
+        with a warning: the campaign's phase timeout is then the backstop.
+        """
+        entries = self._in_flight.get(dev_addr)
+        if not entries:
+            return []
+        due: list[_InFlightCommand] = []
+        keep: list[_InFlightCommand] = []
+        for entry in entries:
+            if entry.attempts > self.max_command_retries:
+                self.commands_abandoned += 1
+                logger.warning(
+                    f"{sim.current_time():.2f}s  MC-SETUP-NS  0x{dev_addr:08X} never "
+                    f"answered {type(entry.command).__name__} after {entry.attempts} "
+                    f"transmission(s), giving up on it"
+                )
+                continue
+            keep.append(entry)
+            due.append(entry)
+        if keep:
+            self._in_flight[dev_addr] = keep
+        else:
+            self._in_flight.pop(dev_addr, None)
+        return due
+
+    def in_flight_commands(self, dev_addr: int) -> list[MulticastSetupCommand]:
+        """Commands transmitted to a device but not yet answered, in send order."""
+        return [entry.command for entry in self._in_flight.get(dev_addr, ())]
+
     # ---- Application plumbing ----
 
     async def has_downlink(self, dev_addr: int) -> bool:
-        """Non-destructive probe: whether a command is queued for a device.
+        """Non-destructive probe: whether a command is waiting for a device.
 
         ``get_downlink`` pops, so
         :meth:`~simulator.lorawan.network_server.NetworkServer.has_pending_downlink`
-        asks this instead.
+        asks this instead. An unanswered command that is still within its retry budget
+        counts: it goes out again on the device's next uplink.
         """
-        return bool(self._pending.get(dev_addr))
+        if self._pending.get(dev_addr):
+            return True
+        return any(
+            entry.attempts <= self.max_command_retries
+            for entry in self._in_flight.get(dev_addr, ())
+        )
 
     async def get_downlink(self, dev_addr: int) -> bytes | None:
         """Hand the network server the next FRMPayload for a device.
 
-        Consecutive queued commands are concatenated while they fit in
+        Unanswered commands from earlier uplinks go out again first, then the queued ones;
+        consecutive commands are concatenated while they fit in
         :attr:`max_downlink_payload` (§3). A single command that cannot fit at
         all is dropped with a warning rather than blocking the queue forever.
         """
         queue = self._pending.get(dev_addr)
-        if not queue:
+        resend = self._retransmissions(dev_addr)
+        if not queue and not resend:
             return None
 
         buf = bytearray()
-        while queue and len(buf) + queue[0].encoded_size <= self.max_downlink_payload:
-            buf.extend(queue.popleft().encode())
+        for entry in resend:
+            if len(buf) + entry.command.encoded_size > self.max_downlink_payload:
+                break
+            buf.extend(entry.command.encode())
+            entry.attempts += 1
+            entry.sent_at = sim.current_time()
+            self.commands_retransmitted += 1
+            logger.debug(
+                f"{sim.current_time():.2f}s  MC-SETUP-NS  retransmitting "
+                f"{type(entry.command).__name__} to 0x{dev_addr:08X} "
+                f"(attempt {entry.attempts})"
+            )
 
-        if not buf:
+        while queue and len(buf) + queue[0].encoded_size <= self.max_downlink_payload:
+            command = queue.popleft()
+            buf.extend(command.encode())
+            key = self._answer_key(command)
+            if key is not None:
+                self._in_flight.setdefault(dev_addr, []).append(
+                    _InFlightCommand(
+                        command=command, key=key, attempts=1, sent_at=sim.current_time()
+                    )
+                )
+
+        if not buf and queue:
             dropped = queue.popleft()
             logger.warning(
                 f"{sim.current_time():.2f}s  MC-SETUP-NS  dropping "
@@ -2028,10 +2149,12 @@ class MulticastSetupServerApplication(Application):
                 f"bytes exceeds the {self.max_downlink_payload} byte FRMPayload limit"
             )
             return None
+        if not buf:
+            return None
 
         logger.debug(
             f"{sim.current_time():.2f}s  MC-SETUP-NS  downlink for 0x{dev_addr:08X}: "
-            f"{len(buf)} bytes, {len(queue)} command(s) still queued"
+            f"{len(buf)} bytes, {len(queue or ())} command(s) still queued"
         )
         return bytes(buf)
 
@@ -2052,6 +2175,19 @@ class MulticastSetupServerApplication(Application):
         self, state: DeviceSetupState, command: MulticastSetupCommandType,
     ) -> None:
         dev_addr = state.dev_addr
+        # An answer retires the request it belongs to, whatever it reports: a device that
+        # said IDerror has still answered, and resending the request would only get the
+        # same refusal.
+        match command:
+            case McGroupSetupAns() | McGroupDeleteAns():
+                self._retire(dev_addr, (int(command.cid), command.group_id))
+            case McClassCSessionAns() | McClassBSessionAns():
+                self._retire(dev_addr, (int(command.cid), command.group_id))
+            case McGroupStatusAns() | PackageVersionAns():
+                self._retire(dev_addr, (int(command.cid), -1))
+            case _:
+                pass
+
         match command:
             case PackageVersionAns():
                 state.package_identifier = command.package_identifier
