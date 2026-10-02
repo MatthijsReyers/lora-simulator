@@ -6,41 +6,45 @@ class NucleoWL55PowerProfile(RadioPowerProfile):
     """
         Power profile for the STM32WL55 Nucleo development boards built-in radio. These values are
         based on empirical measurements of the board's 3.3V power consumption (JP1 / VDD_MCU rail)
-        performed with two Joulescope JS220s at 500 kHz. See the capture in
+        performed with a Joulescope JS220 at 500 kHz. See the capture in
         measurements/nucleo_wl55jc1_power_profile/ and measurements/extract_power_profile.py to
-        reproduce the extraction. This profile models ONLY the radio part of the MCU.
+        reproduce the extraction. This profile models ONLY the radio part of the MCU, the roughly
+        44 mW of MCU/board components are not modeled in here, add a separate PowerConsumer for those!
     """
-    _SLEEP_POWER_USAGE = 0.017295191064476967
-    _STANDBY_POWER_USAGE = 0.018751682713627815
-    _RX_POWER_USAGE = {  # by bandwidth [kHz]
-        125: 0.03051689825952053,
-        250: 0.03162598796188831,
-        500: 0.032342640683054924,
+    # The radio's own sleep draw is ~140 nA (datasheet), far below what the board-level JP1
+    # measurement can resolve, so it is modeled as zero here.
+    _SLEEP_POWER_USAGE = 0.0
+    _STANDBY_POWER_USAGE = 0.001456  # radio standby-RC delta over sleep
+    _RX_POWER_USAGE = {  # by bandwidth [kHz], delta over sleep
+        125: 0.013222,
+        250: 0.014331,
+        500: 0.015047,
     }
-    _TX_POWER_USAGE = {  # by TX power [dBm]
-        0: 0.053809987381100655,
-        1: 0.05575610138475895,
-        2: 0.05886215902864933,
-        3: 0.06195263750851154,
-        4: 0.06479218043386936,
-        5: 0.06735543347895145,
-        6: 0.07070539332926273,
-        7: 0.07480822689831257,
-        8: 0.0787563044577837,
-        9: 0.08261861838400364,
-        10: 0.08805967308580875,
-        11: 0.09345334209501743,
-        12: 0.0996472705155611,
-        13: 0.10571375675499439,
-        14: 0.11355689354240894,
-        15: 0.12320944853127003,
-        16: 0.32778126187622547,
-        17: 0.3430588562041521,
-        18: 0.36240887828171253,
-        19: 0.38385692425072193,
-        20: 0.4086353797465563,
-        21: 0.437241168692708,
-        22: 0.45126486010849476,
+    _TX_POWER_USAGE = {  # by TX power [dBm], delta over sleep
+        0: 0.036515,
+        1: 0.038461,
+        2: 0.041567,
+        3: 0.044657,
+        4: 0.047497,
+        5: 0.050060,
+        6: 0.053410,
+        7: 0.057513,
+        8: 0.061461,
+        9: 0.065323,
+        10: 0.070764,
+        11: 0.076158,
+        12: 0.082352,
+        13: 0.088419,
+        14: 0.096262,
+        15: 0.105914,
+        # >= 16 dBm switches from the low-power PA to the high-power PA, hence the jump.
+        16: 0.310486,
+        17: 0.325764,
+        18: 0.345114,
+        19: 0.366562,
+        20: 0.391340,
+        21: 0.419946,
+        22: 0.433970,
     }
     _TX_STARTUP_TIME = {  # by TX power [dBm], seconds
         0: 0.0012296694393721522,

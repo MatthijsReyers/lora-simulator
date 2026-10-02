@@ -332,21 +332,24 @@ def main():
         json.dump(result, f, indent=2)
 
     with open(out_dir / 'profile_snippet.py', 'w') as f:
+        # Subtract the radio-initialized-and-asleep level, NOT the pre-init floor. Once the radio
+        # subsystem is up the board draws ~sleep_p regardless of radio activity (MCU + board +
+        # SUBGHZ infrastructure); subtracting it isolates the radio's own contribution and makes
+        # the values agree with the ST datasheet. The radio's true sleep draw (~140 nA) is below
+        # this measurement's resolution, so sleep is modeled as 0.
         f.write('# Extracted from %s (%s), board channel %s.\n'
-                '# All power values in watts. Radio-only: the MCU busy-wait baseline of\n'
-                '# %r W (measured before radio init) has been subtracted, so these values\n'
-                '# represent only the radio part of the MCU (including the persistent\n'
-                '# SUBGHZ-subsystem overhead that appears at radio init). The MCU itself\n'
-                '# must be modeled separately.\n'
-                % (cap_path.name, f'{fs:.0f} Hz', board_name, baseline))
-        f.write('_SLEEP_POWER_USAGE = %r\n' % (sleep_p - baseline))
-        f.write('_STANDBY_POWER_USAGE = %r\n' % (standby_p - baseline))
+                '# All power values in watts, radio-only: the radio-asleep board level of\n'
+                '# %r W (MCU + board + SUBGHZ infrastructure) has been subtracted.\n'
+                '# The MCU and this ~%.0f mW floor must be modeled separately.\n'
+                % (cap_path.name, f'{fs:.0f} Hz', board_name, sleep_p, sleep_p * 1000))
+        f.write('_SLEEP_POWER_USAGE = 0.0\n')
+        f.write('_STANDBY_POWER_USAGE = %r\n' % (standby_p - sleep_p))
         f.write('_RX_POWER_USAGE = {  # by bandwidth [kHz]\n')
         for bw, v in rx_p.items():
-            f.write('    %s: %r,\n' % (bw, v - baseline))
+            f.write('    %s: %r,\n' % (bw, v - sleep_p))
         f.write('}\n_TX_POWER_USAGE = {  # by TX power [dBm]\n')
         for e in tx:
-            f.write('    %d: %r,\n' % (e['dbm'], e['plateau_W'] - baseline))
+            f.write('    %d: %r,\n' % (e['dbm'], e['plateau_W'] - sleep_p))
         f.write('}\n_TX_STARTUP_TIME = {  # by TX power [dBm], seconds\n')
         for e in tx:
             f.write('    %d: %r,\n' % (e['dbm'], e['startup_ms'] / 1000))
