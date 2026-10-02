@@ -305,7 +305,7 @@ class TestCleanCampaign:
 # (b) Losses, redundancy and a repair round
 # ═══════════════════════════════════════════════════════════════════════════
 
-SIM_LENGTH_LOSSY = 420
+SIM_LENGTH_LOSSY = 440
 
 
 class TestLossyCampaign:
@@ -315,7 +315,7 @@ class TestLossyCampaign:
                 redundancy_fragments=4,
                 max_repair_rounds=2,
                 repair_extra_fragments=2,
-                session_lead_time=30.0,
+                session_lead_time=48.0,  # two unicast round trips for five devices at 12 s (TR002 order)
                 setup_timeout=90.0,
             ),
             firmware=FIRMWARE_2KB,

@@ -54,15 +54,19 @@ the fleet.
    under the device's own `McKEKey`, derived from its `GenAppKey`) and the
    `minMcFCnt`/`maxMcFCnt` window. The device derives `McAppSKey`/`McNwkSKey`, creates the
    multicast context and answers `McGroupSetupAns`.
-2. **FRAG_SETUP** — `FragSessionSetupReq` (TS004 §3.3, CID 0x02): `FragSession` index,
-   `NbFrag`, `FragSize`, `Control` (fragmentation algorithm, `BlockAckDelay`,
-   `AckReception`), `Padding`, `Descriptor`, `SessionCnt` and a 4-octet MIC over the data
-   block computed with the per-device `DataBlockIntKey`. The device allocates memory and
-   answers `FragSessionSetupAns`.
-3. **SESSION_SETUP** — `McClassCSessionReq` (TS005 §4.5, CID 0x04) with `SessionTime`,
+2. **SESSION_SETUP** — `McClassCSessionReq` (TS005 §4.5, CID 0x04) with `SessionTime`,
    a 4-bit `SessionTimeOut` exponent, `DLFreq` and `DR`; or `McClassBSessionReq` (§4.6, CID
    0x05) with `TimeToStart` and `Periodicity` when `--class-b` is given. The device answers
    `McClassC/BSessionAns` and schedules the switch.
+3. **FRAG_SETUP** — `FragSessionSetupReq` (TS004 §3.3, CID 0x02): `FragSession` index,
+   `NbFrag`, `FragSize`, `Control` (fragmentation algorithm, `BlockAckDelay`,
+   `AckReception`), `Padding`, `Descriptor`, `SessionCnt` and a 4-octet MIC over the data
+   block computed with the per-device `DataBlockIntKey`. The device allocates memory and
+   answers `FragSessionSetupAns`. This phase runs inside the session lead time and ends at
+   `SessionTime` at the latest: the order of steps 2 and 3 is the one of TR002 "FUOTA
+   Process Summary" Table 3 (rendezvous first, fragmentation session second).
+   `FuotaCampaignConfig.session_before_frag_setup=False` swaps them, which is what
+   ChirpStack and the Semtech reference code do.
 4. **BROADCAST** — at `SessionTime` the devices switch to Class C (continuous RX) or open
    their ping slots, and the gateway transmits `NbFrag + redundancy` `DataFragment` frames
    (TS004 §3.6, CID 0x08) to `McAddr`, paced by its duty cycle. The redundancy frames are
@@ -137,16 +141,16 @@ The default run (10 devices, 8 kB, DR5, 10% duty cycle, 20% redundancy, no losse
   Uplinks received:     80
 
   Phase durations
-    GROUP_SETUP        25.0 s      FRAG_SETUP     49.0 s     SESSION_SETUP  26.0 s
-    BROADCAST         198.0 s      STATUS        131.0 s     CLEANUP        75.0 s
+    GROUP_SETUP        25.0 s      SESSION_SETUP  25.0 s     FRAG_SETUP     49.0 s
+    BROADCAST         205.0 s      STATUS        132.5 s     CLEANUP        75.0 s
 
-  Campaign total time:  504.0 s
-  Last device complete: 428.6 s
+  Campaign total time:  511.5 s
+  Last device complete: 436.1 s
   Success:              True
 ```
 
 With `--loss 0.2` the 8 coded fragments are no longer enough, two repair rounds add 14 more,
-and all ten devices still finish — 60 fragments scheduled, campaign total 752.5 s. With
+and all ten devices still finish — 60 fragments scheduled, campaign total 767.5 s. With
 `--class-b` the same image goes out through 32 ping slots per 128 s beacon period: 891.5 s,
 10/10 complete.
 

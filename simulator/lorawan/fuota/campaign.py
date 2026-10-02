@@ -2,18 +2,27 @@
 Server-side FUOTA campaign orchestration: TS003 + TS005 + TS004, end to end.
 
 Neither TS004 nor TS005 contains a normative end-to-end flow — both describe capabilities
-only. :class:`FuotaCampaign` implements the standard LoRa Alliance FUOTA process assembled
-from the two specs' cross-references plus TS003, and runs it as a single simulation task::
+only. The sequence is the one of LoRa Alliance TR002 "FUOTA Process Summary" Table 3, which
+:class:`FuotaCampaign` runs as a single simulation task::
 
     IDLE
-      -> GROUP_SETUP     McGroupSetupReq to every device          [TS005 §4.3, unicast]
-      -> FRAG_SETUP      FragSessionSetupReq, MIC'd per device    [TS004 §3.3, unicast]
-      -> SESSION_SETUP   McClassC/BSessionReq, SessionTime ahead  [TS005 §4.5/§4.6]
-      -> BROADCAST       DataFragment, N = 1..NbFrag+redundancy   [TS004 §3.6, multicast]
+      -> GROUP_SETUP     McGroupSetupReq to every device          [TR002 step 4, TS005 §4.3]
+      -> SESSION_SETUP   McClassC/BSessionReq, SessionTime ahead  [TR002 step 5, TS005 §4.5/§4.6]
+      -> FRAG_SETUP      FragSessionSetupReq, MIC'd per device    [TR002 step 6, TS004 §3.3]
+      -> BROADCAST       DataFragment, N = 1..NbFrag+redundancy   [TR002 step 8, TS004 §3.6]
       -> STATUS          FragSessionStatusReq / Ans               [TS004 §3.2]
       -> REPAIR*         a new session window and more coded fragments, then STATUS again
       -> CLEANUP         FragSessionDeleteReq (+ McGroupDeleteReq)
       -> DONE | FAILED
+
+TR002 schedules the Class B/C rendezvous (step 5) *before* it sets up the fragmentation
+session (step 6), so ``FragSessionSetupReq`` is delivered inside the lead time before
+``SessionTime`` and the FRAG_SETUP phase is bounded by ``SessionTime`` rather than by
+``setup_timeout``: a device that has not accepted the session by then cannot be fed anyway.
+``session_lead_time`` therefore has to cover one unicast round trip per device on top of the
+margin the session request itself needs. The widespread implementation order — fragmentation
+session first, rendezvous last, which keeps the lead time short — is available with
+:attr:`FuotaCampaignConfig.session_before_frag_setup` set to False.
 
 Every phase is bounded by a timeout and the campaign carries on with whichever devices
 answered, so a silent device costs time but never deadlocks the fleet. A phase that waits
@@ -89,8 +98,8 @@ class FuotaCampaignState(Enum):
 
     IDLE = "IDLE"
     GROUP_SETUP = "GROUP_SETUP"
-    FRAG_SETUP = "FRAG_SETUP"
     SESSION_SETUP = "SESSION_SETUP"
+    FRAG_SETUP = "FRAG_SETUP"
     BROADCAST = "BROADCAST"
     STATUS = "STATUS"
     REPAIR = "REPAIR"
@@ -123,7 +132,15 @@ class FuotaCampaignConfig:
         slots decide the spacing.
     :ivar session_lead_time: Seconds between queueing ``McClassC/BSessionReq`` and
         ``SessionTime``. It must cover at least one uplink interval per device, since the
-        request is only delivered in the RX1 window of a device's own uplink.
+        request is only delivered in the RX1 window of a device's own uplink. In the TR002
+        order (:attr:`session_before_frag_setup`) the whole FRAG_SETUP phase runs inside
+        this lead time as well, so it needs a second round trip per device on top.
+    :ivar session_before_frag_setup: True (the default) follows TR002 Table 3 and schedules
+        the multicast session (step 5) before setting up the fragmentation session (step
+        6); FRAG_SETUP then ends at ``SessionTime`` at the latest. False sets up the
+        fragmentation session first and schedules the rendezvous last, the order ChirpStack
+        and the Semtech reference implementation use, which needs no lead time for the
+        fragmentation setup.
     :ivar setup_timeout: How long each unicast setup phase waits for answers before carrying
         on with whoever answered.
     :ivar status_timeout: How long one status round waits, counted from
@@ -173,6 +190,7 @@ class FuotaCampaignConfig:
     session_lead_time: float = 60.0
     session_answer_margin: float = 2.0
     broadcast_offset: float = 1.0
+    session_before_frag_setup: bool = True
 
     # ---- Fragment pacing (TS004 §3.6) ----
     fragment_interval: float | None = None
@@ -531,6 +549,21 @@ class FuotaCampaign:
             airtime = airtime / self.gateway.duty_cycle.duty_cycle
         return airtime + self.config.fragment_interval_margin
 
+    def planned_fragments(self) -> int:
+        """``NbFrag`` plus the planned redundancy, before the TS004 session exists.
+
+        The TR002 order sizes the session window (``TimeOut``) before FRAG_SETUP has created
+        the server session, so this repeats the arithmetic of
+        :meth:`~simulator.lorawan.fuota.frag_transport.FragmentationServerApplication.create_session`.
+        """
+        cfg = self.config
+        nb_frag = math.ceil(len(self.firmware) / self.frag_size)
+        if cfg.redundancy_ratio is not None:
+            redundancy = math.ceil(nb_frag * max(cfg.redundancy_ratio, 0.0))
+        else:
+            redundancy = cfg.redundancy_fragments or 0
+        return nb_frag + redundancy
+
     def session_timeout_exponent(self, fragments: int) -> int:
         """The TS005 ``TimeOut`` exponent covering a broadcast of *fragments* frames."""
         if self.config.session_timeout is not None:
@@ -623,16 +656,32 @@ class FuotaCampaign:
         if not await self._phase_group_setup():
             return self._fail("no device acknowledged the multicast group")
 
-        self._transition(FuotaCampaignState.FRAG_SETUP)
-        if not await self._phase_frag_setup():
-            return self._fail("no device accepted the fragmentation session")
+        if cfg.session_before_frag_setup:
+            # TR002 Table 3: rendezvous (step 5), then fragmentation session (step 6). The
+            # session window is sized from the planned fragment count, and FRAG_SETUP must
+            # be over before the window opens.
+            self._transition(FuotaCampaignState.SESSION_SETUP)
+            session_time = await self._phase_session_setup(
+                cfg.session_lead_time, self.planned_fragments()
+            )
+            if session_time is None:
+                return self._fail("no device accepted the multicast session")
 
-        self._transition(FuotaCampaignState.SESSION_SETUP)
-        session = self.fragmentation.sessions[cfg.frag_index]
-        planned = session.total_fragments
-        session_time = await self._phase_session_setup(cfg.session_lead_time, planned)
-        if session_time is None:
-            return self._fail("no device accepted the multicast session")
+            self._transition(FuotaCampaignState.FRAG_SETUP)
+            if not await self._phase_frag_setup(
+                deadline=session_time - cfg.session_answer_margin
+            ):
+                return self._fail("no device accepted the fragmentation session")
+        else:
+            self._transition(FuotaCampaignState.FRAG_SETUP)
+            if not await self._phase_frag_setup():
+                return self._fail("no device accepted the fragmentation session")
+
+            self._transition(FuotaCampaignState.SESSION_SETUP)
+            planned = self.fragmentation.sessions[cfg.frag_index].total_fragments
+            session_time = await self._phase_session_setup(cfg.session_lead_time, planned)
+            if session_time is None:
+                return self._fail("no device accepted the multicast session")
 
         self._transition(FuotaCampaignState.BROADCAST)
         await self._phase_broadcast(session_time, start_n=1, count=None)
@@ -690,7 +739,14 @@ class FuotaCampaign:
 
     # ---- Phase 2: fragmentation session setup (TS004 §3.3) ----
 
-    async def _phase_frag_setup(self) -> bool:
+    async def _phase_frag_setup(self, deadline: float | None = None) -> bool:
+        """Set up the TS004 session on every participant and wait for the answers.
+
+        :param deadline: Simulation time by which the phase must be over, whatever
+            ``setup_timeout`` says. The TR002 order passes ``SessionTime`` (less the answer
+            margin): a ``FragSessionSetupReq`` that is still undelivered when the devices
+            go mute for the session window is of no use to anyone.
+        """
         cfg = self.config
         self.fragmentation.create_session(
             sorted(self.participants),
@@ -709,9 +765,10 @@ class FuotaCampaign:
         def acked() -> set[int]:
             return self.fragmentation.devices_acked_setup(cfg.frag_index) & self.participants
 
-        await self._wait_until(
-            lambda: acked() == self.participants, cfg.setup_timeout
-        )
+        timeout = cfg.setup_timeout
+        if deadline is not None:
+            timeout = min(timeout, max(deadline - sim.current_time(), cfg.poll_interval))
+        await self._wait_until(lambda: acked() == self.participants, timeout)
         return self._keep(acked(), FuotaCampaignState.FRAG_SETUP)
 
     # ---- Phase 3: multicast session scheduling (TS005 §4.5/§4.6) ----

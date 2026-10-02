@@ -276,7 +276,7 @@ def _config(**overrides: object) -> FuotaCampaignConfig:
         data_rate=DATA_RATE,
         redundancy_ratio=None,
         redundancy_fragments=3,
-        session_lead_time=12.0,
+        session_lead_time=18.0,
         session_timeout=8,
         fragment_interval=0.1,
         broadcast_settle=1.0,
@@ -370,11 +370,12 @@ class TestCampaignStateMachine:
         assert campaign.state is FuotaCampaignState.DONE
         assert campaign.done is True
 
+        # TR002 Table 3: group (4), rendezvous (5), fragmentation session (6), broadcast.
         states = [state for (_time, state) in campaign.state_history]
         assert states == [
             FuotaCampaignState.GROUP_SETUP,
-            FuotaCampaignState.FRAG_SETUP,
             FuotaCampaignState.SESSION_SETUP,
+            FuotaCampaignState.FRAG_SETUP,
             FuotaCampaignState.BROADCAST,
             FuotaCampaignState.STATUS,
             FuotaCampaignState.CLEANUP,
@@ -383,6 +384,42 @@ class TestCampaignStateMachine:
         # Transitions are recorded with the time they happened, in order.
         times = [time for (time, _state) in campaign.state_history]
         assert times == sorted(times)
+
+    def test_frag_setup_finishes_before_the_session_window_opens(self):
+        """In the TR002 order FRAG_SETUP is bounded by SessionTime, not by setup_timeout."""
+        fleet = Fleet(config=_config(session_lead_time=18.0, setup_timeout=200.0))
+        fleet.start()
+        sim.run(simulation_length=90)
+
+        campaign = fleet.campaign
+        assert campaign.state is FuotaCampaignState.DONE
+        request = campaign.multicast_setup._last_session_request(0)
+        assert request is not None
+        frag_setup_end = next(
+            time
+            for (time, state) in campaign.state_history
+            if state is FuotaCampaignState.BROADCAST
+        )
+        assert frag_setup_end <= request.session_time
+        # The session window was sized from the planned fragment count, not from a
+        # session that did not exist yet: 20 + 3 fragments at 0.1 s fit 2**3 = 8 s.
+        assert campaign.planned_fragments() == 23
+        assert campaign.fragmentation.sessions[0].total_fragments == 23
+
+    def test_the_legacy_order_sets_up_the_fragmentation_session_first(self):
+        fleet = Fleet(config=_config(session_before_frag_setup=False))
+        fleet.start()
+        sim.run(simulation_length=90)
+
+        campaign = fleet.campaign
+        assert campaign.state is FuotaCampaignState.DONE
+        states = [state for (_time, state) in campaign.state_history]
+        assert states[:4] == [
+            FuotaCampaignState.GROUP_SETUP,
+            FuotaCampaignState.FRAG_SETUP,
+            FuotaCampaignState.SESSION_SETUP,
+            FuotaCampaignState.BROADCAST,
+        ]
 
     def test_all_devices_complete_and_hold_the_firmware(self):
         fleet = Fleet()
@@ -517,7 +554,7 @@ class TestRepairRounds:
                 redundancy_fragments=0,
                 max_repair_rounds=1,
                 repair_extra_fragments=2,
-                session_lead_time=10.0,
+                session_lead_time=18.0,
             )
         )
         # One device loses every fifth fragment: 20 sent, 16 received, 4 missing.
@@ -546,7 +583,7 @@ class TestRepairRounds:
     def test_the_repair_round_continues_the_fragment_index(self):
         fleet = Fleet(
             config=_config(
-                redundancy_fragments=0, max_repair_rounds=1, session_lead_time=10.0,
+                redundancy_fragments=0, max_repair_rounds=1, session_lead_time=18.0,
             )
         )
         fleet.devices[DEV_ADDRS[2]].drop_every = 5
@@ -640,7 +677,7 @@ class TestStatusWaitsForTheSessionWindow:
         defaults: dict[str, object] = dict(
             # 2**6 = 64 s of window for a ~3 s broadcast: the blackout dominates.
             session_timeout=6,
-            session_lead_time=10.0,
+            session_lead_time=18.0,
             status_timeout=15.0,
             device_uplink_interval=1.0,
             cleanup_timeout=20.0,

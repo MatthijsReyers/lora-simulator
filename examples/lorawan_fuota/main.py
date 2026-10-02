@@ -220,11 +220,15 @@ def plan_broadcast(args: argparse.Namespace) -> dict[str, float]:
 
 def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
     """The campaign parameters implied by the command line."""
-    # Every unicast setup command is delivered in the RX1 window of a device's own uplink,
-    # so a phase cannot be faster than one uplink interval per device. Scale the session
-    # lead time with it, otherwise the last device in the fleet never gets to accept the
-    # multicast session before SessionTime arrives.
-    lead_time = max(40.0, 2.0 * args.uplink_interval)
+    # Every unicast setup command is delivered in the RX1 window of a device's own uplink
+    # and answered on the next one, so a unicast round trip costs up to two uplink
+    # intervals. In the TR002 order the lead time before SessionTime has to hold two of
+    # them — the session answer and the whole fragmentation session setup — so it is
+    # sized at four intervals plus a margin; otherwise the last device in the fleet is
+    # still waiting for FragSessionSetupReq when the window opens. A repair round only
+    # repeats the session request, so its lead time is half that.
+    lead_time = max(60.0, 4.0 * args.uplink_interval + 5.0)
+    repair_lead_time = max(40.0, 2.0 * args.uplink_interval + 5.0)
     plan = plan_broadcast(args)
     frag_size = int(plan["frag_size"])
     # The campaign sizes every "wait for an answer" from the uplink interval and from the
@@ -252,7 +256,7 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
             cleanup_timeout=max(120.0, 3.0 * args.uplink_interval),
             broadcast_settle=2.0,
             max_repair_rounds=args.repair_rounds,
-            repair_lead_time=max(2 * BEACON_INTERVAL, lead_time),
+            repair_lead_time=max(2 * BEACON_INTERVAL, repair_lead_time),
             repair_extra_fragments=2,
         )
     return FuotaCampaignConfig(
@@ -271,7 +275,7 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
         cleanup_timeout=max(90.0, 3.0 * args.uplink_interval),
         broadcast_settle=2.0,
         max_repair_rounds=args.repair_rounds,
-        repair_lead_time=lead_time,
+        repair_lead_time=repair_lead_time,
         repair_extra_fragments=2,
     )
 
@@ -282,8 +286,9 @@ def estimate_class_b_window(
     """When the devices should hold Class B, for a Class B campaign.
 
     ``FuotaDeviceStack`` takes fixed times, so the example has to predict ``SessionTime``:
-    the campaign queues ``McClassBSessionReq`` once the two unicast setup phases are behind
-    it — roughly three uplink intervals, one round trip each — and TS005 §4.6 then rounds
+    the campaign queues ``McClassBSessionReq`` once the multicast group setup is behind it
+    (TR002 order: the fragmentation session is set up *after* the rendezvous, inside the
+    lead time) — roughly two uplink intervals, one round trip — and TS005 §4.6 then rounds
     ``now + session_lead_time`` up to a whole beacon period.
 
     The devices must *not* already be in Class B while that request is being delivered: a
@@ -294,7 +299,7 @@ def estimate_class_b_window(
     Class A once the window has closed so the status round runs over plain RX1 again.
     """
     plan = plan_broadcast(args)
-    setup_done = 3.0 * args.uplink_interval + 2.0
+    setup_done = 2.0 * args.uplink_interval + 2.0
     session_time = (
         math.ceil((setup_done + config.session_lead_time) / BEACON_INTERVAL)
         * BEACON_INTERVAL
