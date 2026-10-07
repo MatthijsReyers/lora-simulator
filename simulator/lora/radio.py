@@ -294,7 +294,8 @@ class LoraRadio(ABC):
                 if (
                     meta.packet.config.spreading_factor == rx_chain.config.spreading_factor and 
                     meta.packet.config.bandwidth == rx_chain.config.bandwidth and
-                    meta.packet.config.frequency == rx_chain.config.frequency
+                    meta.packet.config.frequency == rx_chain.config.frequency and
+                    meta.packet.config.iq_inverted == rx_chain.config.iq_inverted
                 ):
                     return True
         return False

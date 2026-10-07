@@ -156,7 +156,7 @@ The default run (10 devices, 8 kB, DR5, 10% duty cycle, 20% redundancy, no losse
 
 With `--loss 0.2` the 8 coded fragments are no longer enough, two repair rounds add 14 more,
 and all ten devices still finish — 60 fragments scheduled, campaign total 767.5 s. With
-`--class-b` the same image goes out through 32 ping slots per 128 s beacon period: 891.5 s,
+`--class-b` the same image goes out through 32 ping slots per 128 s beacon period: 866.5 s,
 10/10 complete.
 
 The per-device table reports `dropped` fragments as well. In a lossless run these are the
@@ -206,6 +206,12 @@ is 256 s for a 198 s broadcast.
 
 ## Simplifications and assumptions of this baseline
 
+- **IQ inversion is modelled.** Downlinks (replies, beacons, ping-slot and multicast frames) go
+  out with inverted IQ and uplinks with normal IQ, so a device listening for downlinks never
+  detects another device's uplink on the shared channel, and the gateway never hears its own
+  kind. Receive windows close after a few symbols when no preamble arrives (~15 ms at DR5,
+  ~200 ms at DR0, `rx_window_duration`), which is what sets the receive cost of every empty
+  RX1/RX2 window.
 - **Single channel.** The LoRaWAN layer in this simulator is effectively single-channel.
   `DLFreq` is carried in `McClassC/BSessionReq`, stored and honoured by the device, but it has
   to name the gateway's own channel (868.1 MHz here) or the session would simply never be
@@ -248,7 +254,9 @@ is 256 s for a 198 s broadcast.
   uplink a far less reliable place to deliver a unicast command — so the devices do the whole
   TS005/TS004 handshake in Class A, switch to Class B one and a half beacon periods before
   `SessionTime` (enough to guarantee beacon lock) and drop back to Class A once the window has
-  closed. Class B multicast frames go out through the gateway's ping-slot scheduler, which
+  closed. While it tracks beacons the gateway keeps the beacon guard (3 s before) and the
+  reserved slot (2.12 s after) clear of unicast replies: an RX1 reply that would overlap them
+  is skipped and retried on the next uplink, as a packet forwarder does. Class B multicast frames go out through the gateway's ping-slot scheduler, which
   keeps no `multicast_log`, so `FuotaCampaignResult.multicast_frames` stays 0 there and
   `fragments_scheduled` is the figure to read.
 - **Reproducibility.** Placement, firmware and the loss model are seeded; the channel is

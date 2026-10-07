@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+
+from simulator.lora.airtime import symbol_airtime
 from simulator.lora.enums.bandwidth import Bandwidth
 from simulator.lora.enums.code_rate import CodeRate
 from simulator.lora.enums.spreading_factor import SpreadingFactor
@@ -83,6 +86,13 @@ EU868_DEFAULT_UPLINK_CHANNELS = [
     868_500_000,   # 868.5 MHz
 ]
 
+# Downlinks (RX1/RX2 replies, Class B beacons and ping-slot frames, Class C and multicast
+# traffic) are transmitted with inverted IQ and uplinks with normal IQ. A receiver tuned to one
+# polarity does not even detect the preamble of the other, which is what keeps end devices from
+# hearing each other's uplinks on a shared channel and keeps the gateway from hearing its own
+# kind. Reference: LoRaWAN L2 1.0.4 §3 (and RP002-1.0.4 §2.4.5 for EU868).
+DOWNLINK_IQ_INVERTED = True
+
 # Default RX2 parameters for EU868
 RX2_DEFAULT_DR = 0                    # DR0 (SF12/125kHz)
 RX2_DEFAULT_FREQUENCY = 869_525_000   # 869.525 MHz
@@ -91,16 +101,73 @@ RX2_DEFAULT_FREQUENCY = 869_525_000   # 869.525 MHz
 RECEIVE_DELAY1 = 1   # RX1 opens 1 second after TX end
 RECEIVE_DELAY2 = 2   # RX2 opens 2 seconds after TX end (RECEIVE_DELAY1 + 1)
 
-# Default RX window duration (seconds). Not strictly defined in the spec — the device must keep
-# the window open long enough to detect a preamble. We use the time for 6 symbols at the given DR
-# as the minimum, but in practice a fixed value works for simulation.
-RX_WINDOW_DURATION = 0.5
-
 # How early a device starts listening before a receive window's nominal opening time (seconds).
 # A device that only starts listening at the nominal time would miss a downlink that is exactly
 # on time, because the radio still needs to come out of sleep. Real devices also use this margin
 # to absorb clock drift between themselves and the network.
 RX_WINDOW_GUARD = 0.005
+
+# How long a device keeps a receive window open when nothing arrives.
+#
+# A device only has to listen long enough to find out whether a preamble is coming in; once it
+# has locked onto one it keeps the receiver on until the frame is over. The detection timeout is
+# therefore expressed in *symbols* at the window's data rate, which makes the window longer at
+# the slower data rates: six symbols last 6 ms at SF7/125 kHz and almost 200 ms at SF12/125 kHz.
+# Keeping the receiver on for a fixed half second instead (which is what this used to be) made
+# every empty window -- the vast majority of them -- cost 10-80x the energy it costs on hardware,
+# and empty windows are where a Class A or Class B device spends nearly all of its receive time.
+#
+# The timeout is the larger of a minimum number of symbols and however many symbols it takes to
+# absorb the timing error between the device and the network at both ends of the window. This is
+# the computation LoRaMac-node performs in ``RegionCommonComputeRxWindowParameters``
+# (``RegionCommon.c``) from its ``MinRxSymbols`` and ``SystemMaxRxError`` settings.
+RX_WINDOW_MIN_SYMBOLS = 6
+
+# Worst-case timing error between the device and the network, in seconds, that a window has to
+# absorb. The window is opened this much early (``RX_WINDOW_GUARD``) and the detection timeout
+# is stretched to cover the same amount of lateness.
+RX_WINDOW_MAX_RX_ERROR = RX_WINDOW_GUARD
+
+
+def rx_window_timeout_symbols(
+    spreading_factor: SpreadingFactor | int,
+    bandwidth: Bandwidth | int,
+    min_symbols: int = RX_WINDOW_MIN_SYMBOLS,
+    rx_error: float = RX_WINDOW_MAX_RX_ERROR,
+) -> int:
+    """Number of symbols a receive window waits for a preamble before closing.
+
+    ``max(ceil(((2 * min_symbols - 8) * t_symbol + 2 * rx_error) / t_symbol), min_symbols)``,
+    as in LoRaMac-node: at least ``min_symbols``, and at the fast data rates (where a symbol is
+    much shorter than the timing error) enough extra symbols to still catch a preamble that
+    arrives ``rx_error`` late.
+
+    :param spreading_factor: Spreading factor of the window's data rate.
+    :param bandwidth: Bandwidth of the window's data rate.
+    :param min_symbols: Fewest symbols the demodulator needs to detect a preamble.
+    :param rx_error: Worst-case timing error to absorb, in seconds.
+    """
+    assert min_symbols > 0, "A receive window needs at least one symbol"
+    assert rx_error >= 0.0, "The timing error cannot be negative"
+    t_symbol = symbol_airtime(bandwidth, spreading_factor)
+    symbols = math.ceil(((2 * min_symbols - 8) * t_symbol + 2 * rx_error) / t_symbol)
+    return max(symbols, min_symbols)
+
+
+def rx_window_duration(
+    spreading_factor: SpreadingFactor | int,
+    bandwidth: Bandwidth | int,
+    min_symbols: int = RX_WINDOW_MIN_SYMBOLS,
+    rx_error: float = RX_WINDOW_MAX_RX_ERROR,
+) -> float:
+    """How long, in seconds, a receive window stays open when no preamble arrives.
+
+    See :func:`rx_window_timeout_symbols`; this is that count multiplied by the symbol time of
+    the window's data rate. For EU868 with the defaults: ~14 ms at DR5 (SF7), ~29 ms at DR3
+    (SF9) and ~197 ms at DR0 (SF12).
+    """
+    symbols = rx_window_timeout_symbols(spreading_factor, bandwidth, min_symbols, rx_error)
+    return symbols * symbol_airtime(bandwidth, spreading_factor)
 
 # Join-accept delays
 JOIN_ACCEPT_DELAY1 = 5  # seconds
@@ -114,6 +181,10 @@ MAX_FCNT = 0xFFFFFFFF
 BEACON_INTERVAL = 128          # seconds between beacon broadcasts
 BEACON_RESERVED = 2.120        # seconds reserved for beacon transmission
 BEACON_GUARD = 3.0             # guard time before next beacon window
+# How much later than its nominal time a device still expects a beacon to start. The gateway
+# never *delays* a beacon on purpose, but a frame that was already on the air when the beacon
+# came due (an RX1 reply, a multicast fragment of up to ~2.6 s at DR0) finishes first.
+BEACON_LATE_TOLERANCE = 1.0
 PING_SLOT_LEN = 0.030          # 30 ms per ping slot
 CLASS_B_DEFAULT_PING_NB = 16   # default number of ping slots per beacon period
 MAX_BEACON_LESS_PERIOD = 7200  # 2 hours: max time without beacon before sync loss

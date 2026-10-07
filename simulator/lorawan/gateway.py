@@ -16,6 +16,7 @@ from simulator.lorawan.network_server import NetworkServer, ScheduledMulticastDo
 from simulator.lorawan.region import (
     EU868_DATA_RATES, RECEIVE_DELAY1,
     BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
+    DOWNLINK_IQ_INVERTED,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,11 @@ class LoRaWanGateway:
         # Guards the single transmitter against concurrent use by the uplink loop, the
         # beacon loop and the multicast scheduler.
         self._radio_lock = asyncio.Lock()
+        # Simulation time at which the frame currently holding the transmitter is over; what
+        # a task waits on while the lock is taken (see :meth:`_acquire_transmitter`).
+        self._tx_busy_until = 0.0
+        # When the next beacon goes out, kept by the beacon scheduler; None without Class B.
+        self._next_beacon: float | None = None
         # Non-zero while an RX1 reply or a beacon is pending; the multicast scheduler yields.
         self._priority_tx = 0
         self._multicast_batch: list[ScheduledMulticastDownlink] = []
@@ -154,6 +160,7 @@ class LoRaWanGateway:
             power=self.tx_power,
             spreading_factor=dr.spreading_factor.value,
             bandwidth=dr.bandwidth.to_khz(),
+            iq_inverted=DOWNLINK_IQ_INVERTED,
         )
 
     # ---- Shared transmitter ----
@@ -169,16 +176,36 @@ class LoRaWanGateway:
         traffic can push the multicast scheduler into a longer quiet period, which is the
         conservative direction for a FUOTA study.
         """
-        async with self._radio_lock:
-            if self.duty_cycle is not None:
-                # Book the medium once the transmitter is actually ours: reserving before
-                # the lock would start the quiet period while the frame is still waiting,
-                # and end it too early. Anything that checks the budget in the tick this
-                # transmission ends in has to already see the quiet time.
-                self.duty_cycle.reserve(self._estimated_airtime(raw, None))
-            airtime = await self.radio.transmit_data_blocking(raw)
-            await self.radio.receive(continuous=True)
+        await self._acquire_transmitter(self._estimated_airtime(raw, None))
+        try:
+                if self.duty_cycle is not None:
+                    # Book the medium once the transmitter is actually ours: reserving before
+                    # the lock would start the quiet period while the frame is still waiting,
+                    # and end it too early. Anything that checks the budget in the tick this
+                    # transmission ends in has to already see the quiet time.
+                    self.duty_cycle.reserve(self._estimated_airtime(raw, None))
+                airtime = await self.radio.transmit_data_blocking(raw)
+                await self.radio.receive(continuous=True)
+        finally:
+            self._radio_lock.release()
         return float(airtime)
+
+    async def _acquire_transmitter(self, airtime: float) -> None:
+        """Take the transmitter for a frame of *airtime* seconds, waiting in simulation time.
+
+        Blocking on the ``asyncio.Lock`` directly is a deadlock waiting to happen here: a
+        task that blocks on it keeps the simulation clock from advancing (the environment
+        only lets time move while every task is in a simulated sleep), and the task holding
+        the lock needs that clock to finish the frame it is transmitting. A beacon coming
+        due while an RX1 reply was on the air used to freeze the whole simulation this way.
+        So a waiter sleeps, in simulation time, until the frame holding the transmitter is
+        over and only ever takes the lock when it is free.
+        """
+        while self._radio_lock.locked():
+            # Never earlier than the next tick: the wait must actually let time advance.
+            await sim.sleep_until(max(self._tx_busy_until, sim.next_tick()))
+        await self._radio_lock.acquire()
+        self._tx_busy_until = sim.current_time() + airtime
 
     async def transmit_multicast(
         self, raw: bytes, data_rate: int | None = None, frequency: int | None = None,
@@ -200,18 +227,22 @@ class LoRaWanGateway:
         dr = EU868_DATA_RATES[data_rate if data_rate is not None else self.data_rate]
         if self.duty_cycle is not None:
             self.duty_cycle.reserve(self._estimated_airtime(raw, data_rate))
-        async with self._radio_lock:
-            self.radio.set_tx_config(
-                power=self.tx_power,
-                spreading_factor=dr.spreading_factor.value,
-                bandwidth=dr.bandwidth.to_khz(),
-                frequency=frequency,
-            )
-            try:
-                airtime = await self.radio.transmit_data_blocking(raw)
-                await self.radio.receive(continuous=True)
-            finally:
-                self._configure_radio()
+        await self._acquire_transmitter(self._estimated_airtime(raw, data_rate))
+        try:
+                self.radio.set_tx_config(
+                    power=self.tx_power,
+                    spreading_factor=dr.spreading_factor.value,
+                    bandwidth=dr.bandwidth.to_khz(),
+                    iq_inverted=DOWNLINK_IQ_INVERTED,
+                    frequency=frequency,
+                )
+                try:
+                    airtime = await self.radio.transmit_data_blocking(raw)
+                    await self.radio.receive(continuous=True)
+                finally:
+                    self._configure_radio()
+        finally:
+            self._radio_lock.release()
         return float(airtime)
 
     def _estimated_airtime(self, raw: bytes, data_rate: int | None) -> float:
@@ -273,11 +304,12 @@ class LoRaWanGateway:
     async def _reply_in_rx1(self, downlink_raw: bytes, uplink_end: float) -> None:
         """Transmit a downlink in a device's RX1 window, if the transmitter is free.
 
-        The window opens exactly ``RECEIVE_DELAY1`` after the uplink ended and is a few
-        hundred milliseconds long; sending any earlier only reaches devices that
-        (incorrectly) leave their receiver on in between. The window is short and
-        unmovable, so the multicast scheduler is told to stay off the air until the reply
-        has gone out.
+        The window opens exactly ``RECEIVE_DELAY1`` after the uplink ended and stays open
+        for only a handful of symbols (~15 ms at DR5, see
+        :func:`simulator.lorawan.region.rx_window_duration`) unless a preamble arrives;
+        sending any earlier only reaches devices that (incorrectly) leave their receiver on
+        in between. The window is short and unmovable, so the multicast scheduler is told to
+        stay off the air until the reply has gone out.
 
         When the transmitter is busy at that instant — another device's RX1 reply, a
         beacon — the reply is **skipped** rather than transmitted late into a window that
@@ -298,6 +330,13 @@ class LoRaWanGateway:
                     f"({len(downlink_raw)} bytes): the transmitter is busy"
                 )
                 return
+            if self._collides_with_beacon(self._estimated_airtime(downlink_raw, None)):
+                self.downlinks_skipped += 1
+                logger.debug(
+                    f"{sim.current_time():.2f}s  GW  skipping an RX1 reply "
+                    f"({len(downlink_raw)} bytes): it would overlap the beacon slot"
+                )
+                return
             logger.debug(
                 f"{sim.current_time():.2f}s  GW  sending downlink "
                 f"({len(downlink_raw)} bytes)"
@@ -305,6 +344,24 @@ class LoRaWanGateway:
             await self._transmit(downlink_raw)
         finally:
             self._priority_tx -= 1
+
+    def _collides_with_beacon(self, airtime: float) -> bool:
+        """Would a frame of *airtime* seconds starting now overlap the next beacon's slot?
+
+        A Class B gateway keeps the ``BEACON_GUARD`` before a beacon and the
+        ``BEACON_RESERVED`` interval after it free of any other transmission (LoRaWAN L2
+        1.0.4 §13, "beacon_guard"/"beacon_reserved"), the way the Semtech packet forwarder
+        rejects a downlink that would collide with its beacon. A reply that is on the air
+        when the beacon comes due would otherwise push the beacon late, straight past the
+        receivers that opened for it on time.
+        """
+        if self._next_beacon is None:
+            return False
+        start = sim.current_time()
+        return (
+            start + airtime > self._next_beacon - BEACON_GUARD
+            and start < self._next_beacon + BEACON_RESERVED
+        )
 
     # ---- Multicast downlink scheduling ----
 
@@ -412,6 +469,7 @@ class LoRaWanGateway:
         next_beacon = 0.0
 
         while sim.is_running():
+            self._next_beacon = next_beacon
             if next_beacon > sim.current_time():
                 await sim.sleep_until(next_beacon)
                 # The environment wakes every sleeper once more at the final tick; the
@@ -432,6 +490,7 @@ class LoRaWanGateway:
                 await self._transmit(beacon_data)
             finally:
                 self._priority_tx -= 1
+            self._next_beacon = next_beacon + BEACON_INTERVAL
 
             # Transmit pending Class B downlinks at the correct ping slot times
             await self._send_class_b_downlinks(beacon_time)

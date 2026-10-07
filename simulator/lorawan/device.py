@@ -9,6 +9,7 @@ from simulator.exceptions import SimulatorException
 from simulator.lora.client_radio import LoraClientRadio
 from simulator.lora.enums.radio_state import RadioState
 from simulator.lora.packet import LoraPacket
+from simulator.lora.packet_metadata import PacketMetadata
 from simulator.lorawan.application import Application
 from simulator.lorawan.enums.frame_types import MType
 from simulator.lorawan.enums.operating_mode import OperatingMode
@@ -28,10 +29,11 @@ from simulator.lorawan.mac_commands import (
 )
 from simulator.lorawan.beacon import decode_beacon, compute_ping_slot_times
 from simulator.lorawan.region import (
-    EU868_DATA_RATES, RECEIVE_DELAY1, RECEIVE_DELAY2, RX_WINDOW_DURATION,
-    RX_WINDOW_GUARD, MAX_FCNT, max_frm_payload,
+    EU868_DATA_RATES, RECEIVE_DELAY1, RECEIVE_DELAY2, RX_WINDOW_GUARD, MAX_FCNT,
+    DOWNLINK_IQ_INVERTED, max_frm_payload, rx_window_duration,
     JOIN_ACCEPT_DELAY1, JOIN_ACCEPT_DELAY2,
     BEACON_INTERVAL, BEACON_RESERVED, BEACON_GUARD,
+    BEACON_LATE_TOLERANCE,
     PING_SLOT_LEN, CLASS_B_DEFAULT_PING_NB, MAX_BEACON_LESS_PERIOD,
 )
 
@@ -163,6 +165,15 @@ class LoRaWanDevice:
     #: How long the Class C loop stays off the air after finding the radio transmitting. Only
     #: reached when something other than :meth:`send_uplink` drives the transmitter.
     CLASS_C_TX_BACKOFF = 0.01
+
+    #: Longest single wait inside a receive window, in seconds. A window that is parked on
+    #: the receive queue cannot notice the radio being taken away from it: an uplink puts
+    #: the radio into TX and the Class A windows that follow power it down, after which the
+    #: window would sit "listening" with the receiver off until its deadline. Waking this
+    #: often to re-arm the receiver bounds how long a long window (a beacon search of up to
+    #: a whole beacon period) stays deaf after the device's own uplink. RX1/RX2 windows are
+    #: far shorter than this and are not affected.
+    RX_WINDOW_REARM_INTERVAL = 1.0
 
     def __init__(
         self,
@@ -300,6 +311,7 @@ class LoRaWanDevice:
         self.radio.set_rx_config(
             spreading_factor=dr.spreading_factor.value,
             bandwidth=dr.bandwidth.to_khz(),
+            iq_inverted=DOWNLINK_IQ_INVERTED,
             rx_continuous=self.operating_mode == OperatingMode.CLASS_C,
             # RX1/RX2 live on the channel the uplink went out on, which is the one the
             # transmitter is tuned to.
@@ -348,6 +360,7 @@ class LoRaWanDevice:
         self.radio.set_rx_config(
             spreading_factor=rx_dr.spreading_factor.value,
             bandwidth=rx_dr.bandwidth.to_khz(),
+            iq_inverted=DOWNLINK_IQ_INVERTED,
             # Only Class C devices keep their receiver running between windows. Class A and
             # Class B open short single shot windows instead, so their radio has to drop back
             # out of RX on its own once a packet arrives or a transmission finishes.
@@ -388,7 +401,7 @@ class LoRaWanDevice:
         await self.radio.off()
 
         # RX1 window at JOIN_ACCEPT_DELAY1
-        result = await self._rx_window(tx_end + JOIN_ACCEPT_DELAY1, RX_WINDOW_DURATION)
+        result = await self._rx_window(tx_end + JOIN_ACCEPT_DELAY1, self._rx_window_timeout())
         if result is not None:
             join_result = process_join_accept(
                 result.payload, self._otaa_credentials, dev_nonce,
@@ -398,7 +411,7 @@ class LoRaWanDevice:
                 return True
 
         # RX2 window at JOIN_ACCEPT_DELAY2
-        result = await self._rx_window(tx_end + JOIN_ACCEPT_DELAY2, RX_WINDOW_DURATION)
+        result = await self._rx_window(tx_end + JOIN_ACCEPT_DELAY2, self._rx_window_timeout())
         if result is not None:
             join_result = process_join_accept(
                 result.payload, self._otaa_credentials, dev_nonce,
@@ -561,22 +574,28 @@ class LoRaWanDevice:
         try:
             while True:
                 remaining = deadline - sim.current_time()
-                try:
-                    if remaining <= 0:
-                        raise TimeoutError
-                    result = await self.radio.receive_data_within(remaining, metadata=True)
-                except TimeoutError:
-                    # The window only bounds how long the device waits for a preamble to show
-                    # up. Once it has locked onto one it keeps the receiver on until the frame
-                    # is over, so a downlink that starts just before the window closes still
-                    # gets received.
-                    if not self.radio.carrier_sense_instant():
+                if remaining <= 0:
+                    late = await self._receive_late_frame()
+                    if late is None:
                         return None
-                    await self.radio.wait_for_channel_idle()
-                    pending = await self.radio.receive_data_nowait(metadata=True)
-                    if pending is None:
-                        return None
-                    result = pending
+                    result = late
+                else:
+                    try:
+                        received = await self.radio.receive_data_within(
+                            min(remaining, self.RX_WINDOW_REARM_INTERVAL), metadata=True
+                        )
+                        assert isinstance(received, tuple)
+                        result = received
+                    except TimeoutError:
+                        # Either the window is over (the next pass checks for a frame that
+                        # started inside it) or this was just a re-arm point, see
+                        # RX_WINDOW_REARM_INTERVAL.
+                        continue
+                    except RuntimeError:
+                        # The device is transmitting: nothing can be received until that is
+                        # over, after which the next pass puts the receiver back on.
+                        await sim.sleep(self.CLASS_C_TX_BACKOFF)
+                        continue
                 assert isinstance(result, tuple)
                 (packet, meta) = result
                 if meta.arrival_time is not None and meta.arrival_time < opened_at:
@@ -590,6 +609,35 @@ class LoRaWanDevice:
     def _rx_wakeup_guard(self) -> float:
         """How early the receiver has to be woken for it to be listening on time."""
         return RX_WINDOW_GUARD + self.radio.power_profile.standby_startup_time()
+
+    def _rx_window_timeout(self) -> float:
+        """How long an RX1/RX2 (or join accept) window stays open when nothing arrives.
+
+        Sized from the receiver's *current* parameters, which the caller has already set up
+        for the window (:meth:`_apply_uplink_rx_config` / :meth:`_configure_radio`): a window
+        at DR0 waits the ~200 ms it takes to see six SF12 symbols, one at DR5 is done after
+        ~15 ms. See :func:`simulator.lorawan.region.rx_window_duration`.
+        """
+        chain = next(c for c in self.radio.rx_chains if c.enabled)
+        return rx_window_duration(chain.config.spreading_factor, chain.config.bandwidth)
+
+    async def _receive_late_frame(self) -> tuple[LoraPacket, PacketMetadata] | None:
+        """Finish receiving a frame whose preamble started inside a window that just closed.
+
+        The window only bounds how long the device waits for a preamble to show up. Once it
+        has locked onto one it keeps the receiver on until the frame is over, so a downlink
+        that starts just before the window closes still gets received. Returns None when the
+        channel was idle at the deadline, or when what was on the air never made it into the
+        receive queue (a collision, a frame on other parameters).
+        """
+        if not self.radio.carrier_sense_instant():
+            return None
+        await self.radio.wait_for_channel_idle()
+        pending = await self.radio.receive_data_nowait(metadata=True)
+        if pending is None:
+            return None
+        assert isinstance(pending, tuple)
+        return pending
 
     async def _rest_radio(self) -> None:
         """Put the radio back into the state the device rests in between receive windows.
@@ -631,12 +679,12 @@ class LoRaWanDevice:
         if restore:
             self._apply_uplink_rx_config()
         try:
-            result = await self._rx_window(tx_end + RECEIVE_DELAY1, RX_WINDOW_DURATION)
+            result = await self._rx_window(tx_end + RECEIVE_DELAY1, self._rx_window_timeout())
             if result is not None:
                 await self._process_downlink(result.payload)
                 return True
 
-            result = await self._rx_window(tx_end + RECEIVE_DELAY2, RX_WINDOW_DURATION)
+            result = await self._rx_window(tx_end + RECEIVE_DELAY2, self._rx_window_timeout())
             if result is not None:
                 await self._process_downlink(result.payload)
                 return True
@@ -659,13 +707,17 @@ class LoRaWanDevice:
             self._apply_uplink_rx_config()
         try:
             await sim.sleep(RECEIVE_DELAY1)
+            reply: LoraPacket | None
             try:
-                result = await self.radio.receive_data_within(RX_WINDOW_DURATION)
-                assert isinstance(result, LoraPacket)
-                await self._process_downlink(result.payload)
-                return True
+                received = await self.radio.receive_data_within(self._rx_window_timeout())
+                assert isinstance(received, LoraPacket)
+                reply = received
             except TimeoutError:
-                pass
+                late = await self._receive_late_frame()
+                reply = late[0] if late is not None else None
+            if reply is not None:
+                await self._process_downlink(reply.payload)
+                return True
         finally:
             if restore:
                 self._configure_radio()
@@ -1244,6 +1296,40 @@ class LoRaWanDevice:
         except SimulatorException:
             return
 
+    async def _beacon_window(self, open_at: float, duration: float) -> int | None:
+        """Listen for a beacon in one window; returns its timestamp, or None if none came.
+
+        The window keeps its deadline no matter what else lands in it: a frame that is not a
+        beacon (a downlink to another device, say) is dropped and the receiver stays on for
+        whatever is left of the window. Re-opening a fresh window after every such frame,
+        which is what this used to do, kept the receiver on far longer than the beacon slot.
+
+        A beacon window is a single shot window like any other: ``receive(continuous=True)``
+        would latch the radio into Class C style continuous RX and leave it there for the
+        rest of the simulation. Beacons go out with the network's own parameters, never
+        with a multicast session's, so the receiver is put back on the unicast settings for
+        the window.
+        """
+        deadline = open_at + duration
+        retuned = self._rx_override_active()
+        if retuned:
+            self._apply_uplink_rx_config()
+        try:
+            while True:
+                result = await self._rx_window(open_at, max(0.0, deadline - open_at))
+                if result is None:
+                    return None
+                beacon_time = decode_beacon(result.payload)
+                if beacon_time is not None:
+                    return beacon_time
+                # Not a beacon: keep listening until the window would have closed anyway.
+                open_at = sim.current_time()
+                if open_at >= deadline or not sim.is_running():
+                    return None
+        finally:
+            if retuned:
+                self._configure_radio()
+
     async def _class_b_beacon_scheduler(self) -> None:
         """Beacon acquisition and ping slot loop, one iteration per beacon period.
 
@@ -1260,42 +1346,23 @@ class LoRaWanDevice:
         missed_beacons = 0
 
         while sim.is_running() and not self._class_b_stop.is_set():
-            # If we have timing info, sleep until just before the expected
-            # beacon so we don't time out too early after ping slots.
             if self._beacon_time is not None:
-                expected = float(
-                    self._beacon_time
-                    + (missed_beacons + 1) * BEACON_INTERVAL
-                )
-                wake_at = expected - 1.0
-                if wake_at > sim.current_time():
-                    await sim.sleep_until(wake_at)
-                    # Woken one last time at the final tick: the radio is already gone.
-                    if not sim.is_running():
-                        return
+                # Tracking: the next beacon is due one period after the last one seen (or
+                # after the last one estimated, if some were missed). The receiver opens for
+                # the beacon's reserved slot, plus a margin for a beacon the gateway could not
+                # start on time because its transmitter was still busy with another frame.
+                open_at = float(self._beacon_time + (missed_beacons + 1) * BEACON_INTERVAL)
+                duration = BEACON_RESERVED + BEACON_LATE_TOLERANCE
+            else:
+                # Acquisition: the device knows nothing about the network's timing yet and
+                # has to listen for up to a whole beacon period, as a real device does.
+                open_at = sim.current_time()
+                duration = BEACON_INTERVAL + BEACON_RESERVED
 
             try:
-                # A beacon window is a single shot window like any other: `receive(continuous=
-                # True)` would latch the radio into Class C style continuous RX and leave it
-                # there for the rest of the simulation.
-                # Beacons go out with the network's own parameters, never with a multicast
-                # session's, so the receiver is put back on the unicast settings for the
-                # beacon window.
-                retuned = self._rx_override_active()
-                if retuned:
-                    self._apply_uplink_rx_config()
-                try:
-                    result = await self._rx_window(
-                        sim.current_time(), BEACON_RESERVED + 2.0
-                    )
-                finally:
-                    if retuned:
-                        self._configure_radio()
-                if result is None:
-                    raise TimeoutError
-                beacon_time = decode_beacon(result.payload)
+                beacon_time = await self._beacon_window(open_at, duration)
                 if beacon_time is None:
-                    continue  # Not a beacon frame; keep listening
+                    raise TimeoutError
 
                 self._beacon_time = beacon_time
                 if not self._beacon_locked:
@@ -1423,6 +1490,7 @@ class LoRaWanDevice:
         self.radio.set_rx_config(
             spreading_factor=dr.spreading_factor.value,
             bandwidth=dr.bandwidth.to_khz(),
+            iq_inverted=DOWNLINK_IQ_INVERTED,
             rx_continuous=False,
             frequency=session.frequency,
         )
