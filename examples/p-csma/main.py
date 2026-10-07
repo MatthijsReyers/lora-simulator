@@ -83,6 +83,8 @@ class Node:
     async def run(self):
         self.radio.set_rx_config(spreading_factor=SP, bandwidth=BW, code_rate=CR)
         self.radio.set_tx_config(power=4, spreading_factor=SP, bandwidth=BW, code_rate=CR)
+        # Carrier sensing only sees packets that start while the receiver is on.
+        await self.radio.receive()
         try:
             while sim.is_running():
                 # Wait for a packet to be ready (exponential inter-arrival)

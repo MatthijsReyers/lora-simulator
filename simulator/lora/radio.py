@@ -285,6 +285,11 @@ class LoraRadio(ABC):
             works but it can be useful for testing or implementing idealized protocols that assume
             perfect carrier sensing.
 
+            Note that a radio only knows about the packets that started while it was in receive
+            mode. A packet that was already in the air when the receiver was turned on is
+            invisible to it, so put the radio in receive mode (`receive()`) before relying on
+            carrier sensing.
+
             :param chain: Which receive chain (i.e. which channel) to sense on, when left empty the
                 channel counts as busy if *any* of the radio's chains is busy.
             :returns: True if the channel is busy, False otherwise.
@@ -310,7 +315,9 @@ class LoraRadio(ABC):
 
     async def wait_for_channel_idle(self, chain: int|None = None) -> None:
         """
-            Block until the channel is idle (no matching packets in transit).
+            Block until the channel is idle (no matching packets in transit). Like
+            `carrier_sense_instant` this only considers packets that started while the radio was
+            in receive mode.
 
             This is an event-driven wait — it does NOT poll. When the last
             in-transit packet finishes, all waiters are woken on the same
@@ -581,7 +588,8 @@ class LoraRadio(ABC):
         """
             Called when the radio begins receiving a packet. This is a callback function used by the 
             PHY layer to notify the radio of incoming packets, end users should never be calling
-            this directly.
+            this directly. The PHY layer only calls it on radios that are in receive mode when the
+            packet starts.
         """
         self.logger.debug(f"{sim.current_time():.4f} radio={self._radio_id} _on_receive_start(packet={packet.id}, rssi={packet.rssi})")
 

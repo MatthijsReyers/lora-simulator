@@ -4,6 +4,7 @@ from typing import Callable, Mapping, Optional
 from pandas import DataFrame
 from simulator.environment import simulation_env as sim
 from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
+from simulator.lora.enums.radio_state import RadioState
 from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
@@ -167,6 +168,9 @@ class LoraPhyLayer():
             duration of the packet's airtime. Run this function call within a new child task in the
             simulator if you wish to simulate non-blocking transmissions.
 
+            The packet is only presented to the radios that are in receive mode at the moment the
+            transmission starts, radios that turn their receiver on later never see it.
+
             Returns the airtime of the transmission.
         """
         self.logger.debug(f"transmit_packet_blocking(sender={id(sender) % 1000})")
@@ -176,9 +180,21 @@ class LoraPhyLayer():
         # Log packet for later analysis
         self.__log_packet(packet, sender, sim.current_time())
 
+        # Only radios that are listening when the transmission starts get to see it. A radio
+        # that is off, in standby or transmitting has its receiver disabled, so it never learns
+        # about the packet: it cannot receive it, and it will not count it as a packet in
+        # transit when it turns its receiver on halfway through (see `carrier_sense_instant`).
+        # Besides being how real radios behave, this keeps the cost of a transmission
+        # proportional to the number of listening radios rather than to the total number of
+        # radios in the simulation, which matters a lot with large populations of mostly idle
+        # transmitters.
+        receivers = [
+            radio for radio in self.__subscribers
+            if radio is not sender and radio.get_state() == RadioState.RX
+        ]
+
         # Notify radios about the start of the transmission
-        for radio in self.__subscribers:
-            if radio == sender: continue
+        for radio in receivers:
             p = deepcopy(packet)
             p.rx_location = radio.position
             radio._on_receive_start(p)
@@ -186,15 +202,13 @@ class LoraPhyLayer():
         # Advance simulation time by the preamble airtime
         await sim.sleep(packet.preamble_airtime)
 
-        for radio in self.__subscribers:
-            if radio == sender: continue
+        for radio in receivers:
             await radio._on_receive_preamble(packet.id)
 
         await sim.sleep(packet.payload_airtime)
 
         # Notify radios about the end of the transmission
-        for radio in self.__subscribers:
-            if radio == sender: continue
+        for radio in receivers:
             await radio._on_receive_end(packet.id)
 
         return packet.airtime
