@@ -1,12 +1,18 @@
 import logging
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
 from pandas import DataFrame
 from simulator.environment import simulation_env as sim
 from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
+from simulator.lora.enums.spreading_factor import SpreadingFactor
 from simulator.lora.packet import LoraPacket
 from simulator.lora.radio import LoraRadio
+from simulator.lora.radio_config import LoraConfig
 from copy import deepcopy
+
+# Ways to specify receiver sensitivities, see `LoraPhyLayer.set_sensitivity`.
+SensitivityTable = Mapping[SpreadingFactor | int, float]
+SensitivityModel = Callable[[LoraConfig], float]
 
 class LoraPhyLayer():
     """
@@ -27,6 +33,10 @@ class LoraPhyLayer():
     path_loss_estimator: Callable[[float, float], float]
     noise_floor: float
 
+    # When set, decides the sensitivity of a receive chain instead of the noise floor plus the
+    # per spreading factor SNR requirement. See `set_sensitivity`.
+    sensitivity_override: Optional[SensitivityModel]
+
 
     def __new__(cls, *args, **kwargs):
         if not cls.__instance:
@@ -38,11 +48,24 @@ class LoraPhyLayer():
             self, 
             path_loss: Callable[[float, float], float] | None = None, 
             noise_floor: float | None = None,    
+            sensitivity: SensitivityTable | SensitivityModel | None = None,
         ):
+        """
+            Every argument that is left empty keeps its current value, so configuring the
+            singleton from several places does not undo earlier settings.
+
+            :param path_loss: Path loss estimator `(distance, frequency) -> dB`.
+            :param noise_floor: In dBm, the noise floor the SNR of every packet is computed
+                against. Without a sensitivity override this also sets the receiver sensitivity,
+                which is the noise floor plus the SNR requirement of the spreading factor.
+            :param sensitivity: Receiver sensitivities to use instead of the noise floor based
+                ones, see `set_sensitivity`.
+        """
         if not hasattr(self, 'initialized'):
             self.initialized = True
             self.enable_capture_effect = True
             self.noise_floor = -120.0
+            self.sensitivity_override = None
             self.path_loss_estimator = log_distance_path_loss(
                 exponent=2.0, sigma=0.5
             )
@@ -70,6 +93,48 @@ class LoraPhyLayer():
             self.path_loss_estimator = path_loss
         if noise_floor is not None:
             self.noise_floor = noise_floor
+        if sensitivity is not None:
+            self.set_sensitivity(sensitivity)
+
+
+    def set_sensitivity(self, sensitivity: SensitivityTable | SensitivityModel | None) -> None:
+        """
+            Overrides the receiver sensitivities. By default a packet can be demodulated when its
+            SNR is above the requirement of its spreading factor, i.e. the sensitivity is the noise
+            floor plus `SpreadingFactor.minimum_snr()`, which steps 2.5dB per spreading factor.
+            Datasheets and papers often quote sensitivities that do not follow that pattern (for
+            example -123, -126, -129, -132, -134.5 and -137dBm for SF7 to SF12), this lets you use
+            those values directly.
+
+            :param sensitivity: Either a mapping from spreading factor to sensitivity in dBm, a
+                callable that returns the sensitivity in dBm for a receive chain's `LoraConfig`
+                (for sensitivities that also depend on the bandwidth, say), or None to go back to
+                the noise floor based sensitivities.
+        """
+        if sensitivity is None or callable(sensitivity):
+            self.sensitivity_override = sensitivity
+            return
+        table = {SpreadingFactor(sf): float(dbm) for (sf, dbm) in sensitivity.items()}
+        assert table, "Sensitivity table must not be empty"
+
+        def from_table(config: LoraConfig) -> float:
+            try:
+                return table[config.spreading_factor]
+            except KeyError:
+                raise KeyError(
+                    f"No receiver sensitivity configured for {config.spreading_factor}"
+                ) from None
+        self.sensitivity_override = from_table
+
+
+    def sensitivity(self, config: LoraConfig) -> float:
+        """
+            The receiver sensitivity in dBm of a receive chain with the given configuration: a
+            packet whose received power is below this value is lost in the noise.
+        """
+        if self.sensitivity_override is not None:
+            return self.sensitivity_override(config)
+        return self.noise_floor + config.spreading_factor.minimum_snr()
 
 
     async def __on_sim_end(self):

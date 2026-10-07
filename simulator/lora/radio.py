@@ -602,8 +602,7 @@ class LoraRadio(ABC):
             possible_collisions = rx_chain.packets_in_transit.values()
 
             # Is the radio able to distinguish this packet from the noise floor?
-            required = rx_chain.config.spreading_factor.minimum_snr()
-            demodulate_failure = packet.snr < required
+            demodulate_failure = packet.rssi < self.phy.sensitivity(rx_chain.config)
 
             # Overlapping packets do not have to collide if they use different enough parameters
             found_collision = False
