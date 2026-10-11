@@ -11,3 +11,5 @@ thesis
 *.egg-info
 
 papers/fuota-unicast-broadcast-2024/data/
+
+papers/fuota-sequential-sf-2025/data/
