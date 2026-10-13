@@ -47,10 +47,20 @@ def header_airtime(
     low_data_rate_optimize: bool = False,
 ) -> float:
     """
-        Calculate the explicit header time on air for a LoRa packet (in seconds).
-        
-        The explicit header is 20 bits and contains payload length, coding rate, and CRC presence.
-        In implicit header mode (fixed_payload_len=True), there is no header.
+        Calculate the time on air of the part of a LoRa packet that carries the explicit PHY
+        header (in seconds).
+
+        The header (payload length, coding rate and CRC presence, 20 bits with its own CRC) is
+        not a codeword of its own: it is placed, coded at 4/8, in the first 8 symbols that
+        follow the preamble, sharing them with the first payload bits. Those 8 symbols are the
+        "8 +" term of the Semtech airtime formula and exist in implicit header mode too, when
+        they carry payload bits only. This function returns their duration, which is where the
+        header ends for the purpose of deciding whether an interfering packet hit it.
+
+        Note that this is NOT the extra airtime the explicit header costs over implicit header
+        mode: that is at most one code block, and often nothing at all, because the 20 header
+        bits are folded into the same ceiling as the payload bits. Use `payload_airtime` with
+        `fixed_payload_len` True/False to compare the two.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
@@ -62,16 +72,7 @@ def header_airtime(
     assert isinstance(code_rate, CodeRate)
 
     t_sym = symbol_airtime(bandwidth, spreading_factor)
-
-    sf = spreading_factor.value
-    de = 1 if low_data_rate_optimize else 0
-    cr = code_rate.to_denominator() - 4
-
-    # Header contributes 20 bits to the payload calculation
-    # This is derived from the formula: the -20*h term when h=0 (explicit header)
-    header_symbols = math.ceil(20 / (4 * (sf - 2 * de))) * (cr + 4)
-
-    return header_symbols * t_sym
+    return 8 * t_sym
 
 
 def data_airtime(
@@ -81,11 +82,15 @@ def data_airtime(
     code_rate: CodeRate|int,
     crc_enabled: bool = True,
     low_data_rate_optimize: bool = False,
+    fixed_payload_len: bool = True,
 ) -> float:
     """
-        Calculate the data (without header) time on air for a LoRa packet (in seconds).
-        
-        This calculates the airtime for the payload data portion only, assuming implicit header mode.
+        Calculate the time on air of everything after the preamble of a LoRa packet (in
+        seconds): the payload symbols of the Semtech formula, which include the explicit PHY
+        header when `fixed_payload_len` is False.
+
+        The header bits are part of the same formula as the payload bits, see `header_airtime`
+        for why they must not be added separately.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
@@ -101,15 +106,14 @@ def data_airtime(
 
     t_sym = symbol_airtime(bandwidth, spreading_factor)
 
-    # Variable names taken from the formulas in the LoRa Design Guide
+    # Variable names taken from the formulas in the LoRa Design Guide / SX1276 datasheet
     pl = payload_len
     sf = spreading_factor.value
-    h = 1  # Implicit header (no header in this calculation)
+    h = 1 if fixed_payload_len else 0  # 1 = implicit header (no header on the air)
     de = 1 if low_data_rate_optimize else 0
     cr = code_rate.to_denominator() - 4
     crc = 1 if crc_enabled else 0
 
-    # Formula from SX1276/77/78/79 Semtech datasheet
     payload_symbols = 8 + max(
         0, 
         math.ceil(
@@ -130,31 +134,20 @@ def payload_airtime(
     low_data_rate_optimize: bool = False,
 ) -> float:
     """
-        Calculate the payload (header + data) time on air for a LoRa packet (in seconds).
+        Calculate the payload (header + data) time on air for a LoRa packet (in seconds), i.e.
+        everything after the preamble.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
-    t_data = data_airtime(
+    return data_airtime(
         payload_len=payload_len,
         bandwidth=bandwidth,
         spreading_factor=spreading_factor,
         code_rate=code_rate,
         crc_enabled=crc_enabled,
         low_data_rate_optimize=low_data_rate_optimize,
+        fixed_payload_len=fixed_payload_len,
     )
-    
-    if fixed_payload_len:
-        # Implicit header mode - no header
-        return t_data
-    else:
-        # Explicit header mode - include header
-        t_header = header_airtime(
-            bandwidth=bandwidth,
-            spreading_factor=spreading_factor,
-            code_rate=code_rate,
-            low_data_rate_optimize=low_data_rate_optimize,
-        )
-        return t_header + t_data
 
 
 def estimate_airtime(
