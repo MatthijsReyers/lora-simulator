@@ -57,7 +57,6 @@ class LoraPacket:
                 bandwidth=self.config.bandwidth,
                 spreading_factor=self.config.spreading_factor,
                 code_rate=self.config.code_rate,
-                low_data_rate_optimize=False, # TODO: Determine when to enable this based on SF and BW
             )
         if self.preamble_airtime is None:
             self.preamble_airtime = preamble_airtime(
@@ -73,8 +72,6 @@ class LoraPacket:
                 code_rate=self.config.code_rate,
                 fixed_payload_len=self.config.fixed_payload_len,
                 crc_enabled=self.config.crc_enabled,
-                # TODO: Determine when to enable this based on SF and BW
-                low_data_rate_optimize=False, 
             )
 
     def __repr__(self):
