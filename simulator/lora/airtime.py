@@ -17,6 +17,60 @@ def symbol_airtime(bandwidth: Bandwidth|int, spreading_factor: SpreadingFactor|i
     return (2 ** spreading_factor.value) / (bandwidth.to_hz())
 
 
+def low_data_rate_optimize_required(
+    bandwidth: Bandwidth|int,
+    spreading_factor: SpreadingFactor|int,
+) -> bool:
+    """
+        Whether the radio enables low data rate optimization for this SF/BW combination.
+
+        Semtech recommends it when the symbol time is 16 ms or longer (SF11/SF12 at 125 kHz and
+        SF12 at 250 kHz), and the STM32WL SubGHz_Phy driver enables it automatically in exactly
+        those cases.
+    """
+    return symbol_airtime(bandwidth, spreading_factor) >= 16e-3
+
+
+def _resolve_low_data_rate_optimize(
+    bandwidth: Bandwidth|int,
+    spreading_factor: SpreadingFactor|int,
+    low_data_rate_optimize: bool|None,
+) -> bool:
+    if low_data_rate_optimize is None:
+        return low_data_rate_optimize_required(bandwidth, spreading_factor)
+    return low_data_rate_optimize
+
+
+def _payload_symbols(
+    payload_len: int,
+    spreading_factor: SpreadingFactor,
+    code_rate: CodeRate,
+    explicit_header: bool,
+    crc_enabled: bool,
+    low_data_rate_optimize: bool,
+) -> int:
+    """
+        Number of symbols after the preamble (header + data), from the SX1276 datasheet formula.
+
+        The header and data bits share a single ceil(): rounding them up separately can add a
+        whole extra block of (CR+4) symbols.
+    """
+    # Variable names taken from the formulas in the LoRa Design Guide
+    pl = payload_len
+    sf = spreading_factor.value
+    h = 0 if explicit_header else 1
+    de = 1 if low_data_rate_optimize else 0
+    cr = code_rate.to_denominator() - 4
+    crc = 1 if crc_enabled else 0
+
+    return 8 + max(
+        0,
+        math.ceil(
+            (8*pl - 4*sf + 28 + 16*crc - 20*h) / (4*(sf - 2*de))
+        ) * (cr + 4)
+    )
+
+
 def preamble_airtime(
     bandwidth: Bandwidth|int,
     spreading_factor: SpreadingFactor|int,
@@ -44,7 +98,7 @@ def header_airtime(
     bandwidth: Bandwidth|int,
     spreading_factor: SpreadingFactor|int,
     code_rate: CodeRate|int,
-    low_data_rate_optimize: bool = False,
+    low_data_rate_optimize: bool|None = None,
 ) -> float:
     """
         Calculate the time on air of the part of a LoRa packet that carries the explicit PHY
@@ -61,6 +115,9 @@ def header_airtime(
         mode: that is at most one code block, and often nothing at all, because the 20 header
         bits are folded into the same ceiling as the payload bits. Use `payload_airtime` with
         `fixed_payload_len` True/False to compare the two.
+
+        `code_rate` and `low_data_rate_optimize` do not change the result (the first 8 symbols
+        are always coded at 4/8), they are accepted for symmetry with the other functions.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
@@ -81,7 +138,7 @@ def data_airtime(
     spreading_factor: SpreadingFactor|int,
     code_rate: CodeRate|int,
     crc_enabled: bool = True,
-    low_data_rate_optimize: bool = False,
+    low_data_rate_optimize: bool|None = None,
     fixed_payload_len: bool = True,
 ) -> float:
     """
@@ -91,6 +148,8 @@ def data_airtime(
 
         The header bits are part of the same formula as the payload bits, see `header_airtime`
         for why they must not be added separately.
+
+        low_data_rate_optimize=None picks what the radio would use for this SF/BW.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
@@ -105,22 +164,17 @@ def data_airtime(
     assert type(payload_len) is int, "Payload length must be an integer"
 
     t_sym = symbol_airtime(bandwidth, spreading_factor)
-
-    # Variable names taken from the formulas in the LoRa Design Guide / SX1276 datasheet
-    pl = payload_len
-    sf = spreading_factor.value
-    h = 1 if fixed_payload_len else 0  # 1 = implicit header (no header on the air)
-    de = 1 if low_data_rate_optimize else 0
-    cr = code_rate.to_denominator() - 4
-    crc = 1 if crc_enabled else 0
-
-    payload_symbols = 8 + max(
-        0, 
-        math.ceil(
-            (8*pl - 4*sf + 28 + 16*crc - 20*h) / (4*(sf - 2*de))
-        ) * (cr + 4)
+    payload_symbols = _payload_symbols(
+        payload_len=payload_len,
+        spreading_factor=spreading_factor,
+        code_rate=code_rate,
+        # Implicit header mode (fixed length) has no header on the air
+        explicit_header=not fixed_payload_len,
+        crc_enabled=crc_enabled,
+        low_data_rate_optimize=_resolve_low_data_rate_optimize(
+            bandwidth, spreading_factor, low_data_rate_optimize
+        ),
     )
-
     return payload_symbols * t_sym
 
 
@@ -131,11 +185,13 @@ def payload_airtime(
     code_rate: CodeRate|int,
     fixed_payload_len: bool = False,
     crc_enabled: bool = True,
-    low_data_rate_optimize: bool = False,
+    low_data_rate_optimize: bool|None = None,
 ) -> float:
     """
         Calculate the payload (header + data) time on air for a LoRa packet (in seconds), i.e.
         everything after the preamble.
+
+        low_data_rate_optimize=None picks what the radio would use for this SF/BW.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
     """
@@ -158,10 +214,12 @@ def estimate_airtime(
     preamble_len: int = 8,
     fixed_payload_len: bool = False,
     crc_enabled: bool = True,
-    low_data_rate_optimize: bool = False,
+    low_data_rate_optimize: bool|None = None,
 ) -> float:
     """
         Calculate the time on air for a LoRa packet (in seconds).
+
+        low_data_rate_optimize=None picks what the radio would use for this SF/BW.
 
         See: https://www.openhacks.com/uploadsproductos/loradesignguide_std.pdf
 
@@ -169,6 +227,7 @@ def estimate_airtime(
         - https://www.semtech.com/design-support/lora-calculator
         - https://www.thethingsnetwork.org/airtime-calculator/
         - https://iftnt.github.io/lora-air-time/index.html
+        - Measured TX durations of an STM32WL55 (tests/test_airtime.py)
     """
     t_preamble = preamble_airtime(
         bandwidth=bandwidth,
