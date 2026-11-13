@@ -13,9 +13,8 @@ from pathlib import Path
 from simulator.environment import simulation_env as sim
 from simulator.lora.airtime import estimate_airtime
 from simulator.lora.phy_layer import LoraPhyLayer
-from simulator.lora.radio_config import LoraConfig
-from simulator.lora.radio_power_profile import RadioPowerProfile
 from simulator.path_loss.constant_loss import constant_path_loss
+from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 
 import frames
 
@@ -76,6 +75,11 @@ class Scenario:
     accept_delay: float = 0.010  # ASSUMPTION: radio session close and reopen before the accept
     gateway_turnaround: float = 0.060  # ASSUMPTION: from the sensor's answer to the next burst
 
+    # Where the sensors are, the gateway being at the origin. Without positions every sensor has
+    # the same fixed path loss; with them the loss follows the distance.
+    positions: list[tuple[float, float]] | None = None
+    path_loss_exponent: float = 3.2
+
     # Shares of the frames that are not heard at all, to exercise the repair paths: downlink
     # frames at the sensor they are for, uplink frames at the gateway.
     downlink_loss: float = 0.0
@@ -127,41 +131,17 @@ class Scenario:
         """ What one burst adds to the 100 s channel dwell count on both sides. """
         return packets * self.full_packet_airtime + (packets - 1) * self.packet_gap
 
+    def position(self, net_id: int) -> tuple[float, float]:
+        if self.positions is None:
+            return (100.0, 0.0)
+        return self.positions[net_id - 1]
+
     def setup_phy(self) -> None:
-        # A fixed, comfortable link budget: losses are injected with `downlink_loss` instead.
-        LoraPhyLayer(path_loss=constant_path_loss(100.0))
-
-
-class EwsSensorPowerProfile(RadioPowerProfile):
-    """
-        The radio part of the firmware's own energy model (libs/energy), datasheet estimates at
-        3.6 V. The 18 mW the MCU draws while awake is charged separately by the sensor, so the
-        radio's standby level is zero here.
-    """
-    VDD = 3.6
-    RX_POWER = 17.3e-3
-    PA_CURRENT = {10: 15e-3, 14: 45e-3}  # by output power in dBm
-    MCU_RUN_POWER = 18e-3
-    SLEEP_POWER = 5e-6
-    SESSION_ENERGY = 2 * 376e-6  # opening plus closing the radio once
-
-    def standby_startup_time(self) -> float:
-        return 100e-6
-
-    def standby_power(self) -> float:
-        return 0.0
-
-    def tx_startup_time(self, power: float | int, config: LoraConfig) -> float:
-        return 0.0
-
-    def tx_power(self, power: float | int, config: LoraConfig) -> float:
-        # Linear between the two known points and flat outside of them.
-        share = min(max((power - 10) / 4, 0.0), 1.0)
-        current = self.PA_CURRENT[10] + share * (self.PA_CURRENT[14] - self.PA_CURRENT[10])
-        return current * self.VDD
-
-    def rx_power(self, config: LoraConfig) -> float:
-        return self.RX_POWER
+        if self.positions is None:
+            # A fixed, comfortable link budget: losses are injected with the loss options.
+            LoraPhyLayer(path_loss=constant_path_loss(100.0))
+        else:
+            LoraPhyLayer(path_loss=log_distance_path_loss(self.path_loss_exponent, sigma=0.0))
 
 
 class RadioLog:

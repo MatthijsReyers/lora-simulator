@@ -14,7 +14,9 @@ from simulator.power_consumer import PowerConsumer
 
 import frames
 from frames import Frame
-from scenario import EwsSensorPowerProfile, RadioLog, Scenario
+from simulator.lora.radio_power_profile import EwsSensorPowerProfile
+
+from scenario import RadioLog, Scenario
 
 
 @dataclass
@@ -40,7 +42,9 @@ class Sensor:
         self.rng = random.Random(scenario.seed * 100_003 + net_id)
 
         self.profile = EwsSensorPowerProfile()
-        self.radio = LoraClientRadio(position=(100.0, 0.0), power_profile=self.profile)
+        self.radio = LoraClientRadio(
+            position=scenario.position(net_id), power_profile=self.profile,
+        )
         self.radio.log_packets = False
         modulation = dict(
             bandwidth=scenario.bandwidth,
@@ -57,6 +61,10 @@ class Sensor:
         self.sessions = 0
         self.fragments = 0
         self.timed_out = False  # whether the last receive window ran to its timeout
+        # The update as the protocol comparison counts it: from the wake-up in which the
+        # gateway moved this sensor's ping to the end of the one that completed the download.
+        self.update_started: float | None = None
+        self.update_completed: float | None = None
 
         sim.create_task(self.run())
 
@@ -100,9 +108,14 @@ class Sensor:
             await sim.sleep(self.scenario.accept_delay)
             self.sessions += 1
             outcome = await self.download(reply.u16)
+            if outcome == "complete":
+                await self.radio.off()
+                self.update_completed = sim.current_time()
         elif reply.command == frames.CMD_SET_PING_SCHEDULE:
             # Apply the command, then confirm it in a radio session of its own.
             outcome = "command"
+            if self.update_started is None:
+                self.update_started = start
             self.schedule_start = reply.schedule_start
             await self.radio.off()
             await sim.sleep(self.scenario.accept_delay)

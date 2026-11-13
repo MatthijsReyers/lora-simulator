@@ -14,7 +14,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 
 from simulator.environment import simulation_env as sim
+from simulator.layout import read_layout
 from simulator.lora.phy_layer import LoraPhyLayer
+from simulator.lora.radio_usage import update_cost
 
 from frames import (
     BROADCAST_ADDRESS, GATEWAY_ADDRESS, MiWiFrame, decode_gateway_message, decode_node_message,
@@ -63,6 +65,11 @@ def parse_args() -> argparse.Namespace:
         help="limit each transmitter individually instead of the paper's medium wide quiet time",
     )
     parser.add_argument("--exponent", type=float, default=3.2, help="path loss exponent")
+    parser.add_argument("--no-fading", action="store_true", help="disable the Nakagami fading")
+    parser.add_argument(
+        "--layout-file", default=None,
+        help="read the node positions from this CSV instead of placing them",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--frame-log", action="store_true",
@@ -147,6 +154,7 @@ def main() -> None:
         duty_cycle=args.duty_cycle / 100,
         shared_duty_cycle=not args.per_device_duty_cycle,
         path_loss_exponent=args.exponent,
+        fading=not args.no_fading,
         seed=args.seed,
     )
     rng = random.Random(scenario.seed)
@@ -154,9 +162,13 @@ def main() -> None:
 
     scenario.setup_phy()
     gateway_type, node_type, has_rounds = METHODS[args.method]
-    duty_cycles = make_duty_cycles(scenario, scenario.nodes + 1)
 
-    positions = scenario.node_positions(rng)
+    if args.layout_file:
+        positions = read_layout(args.layout_file)
+        scenario.nodes = len(positions)
+    else:
+        positions = scenario.node_positions(rng)
+    duty_cycles = make_duty_cycles(scenario, scenario.nodes + 1)
     nodes = [
         node_type(address=i + 1, position=pos, scenario=scenario, duty_cycle=duty_cycles[i + 1])
         for (i, pos) in enumerate(positions)
@@ -185,6 +197,7 @@ def main() -> None:
     sim.run(simulation_length=SIMULATION_LENGTH)
     wall_time = time.time() - wall_start
 
+    radios = {node.address: node.radio for node in nodes}
     results = pd.DataFrame([
         {
             "node": r.address,
@@ -202,6 +215,13 @@ def main() -> None:
             "updated": r.updated,
             "missing_after_broadcast": r.missing_after_broadcast,
             "repair_rounds": r.repair_rounds,
+            # For the protocol comparison: the cost up to the moment the node is updated, or up
+            # to the end of the campaign for a node that never was.
+            **update_cost(
+                radios[r.address], start=gateway.start_time,
+                end=r.end if r.updated and r.end is not None else gateway.finish_time,
+                updated=r.updated,
+            ),
         }
         for r in gateway.results.values()
     ])

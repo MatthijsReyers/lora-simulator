@@ -40,6 +40,7 @@ class Scenario:
     tx_power: int = 14                  # dBm
     sensitivity: float = -125.0         # dBm
     path_loss_exponent: float = 3.2     # calibrated, see README
+    fading: bool = True                 # Nakagami fading on top of the path loss, as in the paper
     seed: int = 0
     processing_delay: float = 0.05      # seconds a node takes to answer a frame
     checksum_delay: float = 1.0         # seconds the gateway gives a node to verify the checksum
@@ -99,10 +100,9 @@ class Scenario:
             at `sensitivity` for the used spreading factor.
         """
         sf = SpreadingFactor(self.spreading_factor)
+        path_loss = log_distance_path_loss(exponent=self.path_loss_exponent, sigma=0.0)
         phy = LoraPhyLayer(
-            path_loss=nakagami_path_loss(
-                base=log_distance_path_loss(exponent=self.path_loss_exponent, sigma=0.0),
-            ),
+            path_loss=nakagami_path_loss(base=path_loss) if self.fading else path_loss,
             noise_floor=self.sensitivity - sf.minimum_snr(),
         )
         # Only one device transmits at a time in these protocols, the detailed capture effect

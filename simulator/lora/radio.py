@@ -169,6 +169,14 @@ class LoraRadio(ABC):
         return self._tx_end_time
 
     @property
+    def state_log(self) -> List[Tuple[float, RadioState]]:
+        """
+            Every state change of the radio as `(simulation time, new state)`, oldest first. The
+            radio is off until the first entry.
+        """
+        return list(self.__state_log)
+
+    @property
     def tx_frequency(self) -> int:
         """ The frequency the radio transmits on, in hertz. """
         return self._tx_config.frequency

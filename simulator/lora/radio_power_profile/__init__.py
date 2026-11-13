@@ -82,4 +82,5 @@ class RadioPowerProfile(ABC):
 # Imported at the bottom so the submodules can import RadioPowerProfile from this package.
 from simulator.lora.radio_power_profile.stm32wl55 import Stm32WL55PowerProfile
 from simulator.lora.radio_power_profile.nucleowl55 import NucleoWL55PowerProfile
+from simulator.lora.radio_power_profile.ews import EwsSensorPowerProfile
 

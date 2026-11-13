@@ -8,6 +8,7 @@
     "RuntimeError: Event loop is closed" when a later test constructs a radio or device.
 """
 import asyncio
+import gc
 import pytest
 
 import simulator.environment
@@ -18,6 +19,11 @@ from simulator.lora.phy_layer import LoraPhyLayer
 @pytest.fixture(autouse=True)
 def reset_simulator_singletons():
     """Give every test a fresh simulation environment and PHY layer."""
+
+    # Collect what the previous test left behind now. A finished simulation leaves tasks that
+    # never ran to completion, and asyncio logs an error for each one when it is garbage
+    # collected: that must not happen in the middle of a test that asserts on the log.
+    gc.collect()
 
     # Re-initialize the global simulation environment in place. We cannot simply replace the
     # object because most modules bind it at import time via

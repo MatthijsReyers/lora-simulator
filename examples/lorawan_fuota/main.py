@@ -13,6 +13,7 @@ Run from the repository root. See README.md for the flow, the flags and the cave
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import math
 import os
@@ -43,6 +44,8 @@ from simulator.lorawan.fuota.frag_transport import (
 from simulator.lorawan.gateway import LoRaWanGateway
 from simulator.lorawan.network_server import NetworkServer
 from simulator.lorawan.region import BEACON_INTERVAL, EU868_DATA_RATES
+from simulator.layout import read_layout
+from simulator.lora.radio_usage import update_cost
 from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 
 logger = logging.getLogger("fuota.example")
@@ -148,7 +151,22 @@ def parse_args() -> argparse.Namespace:
         "--class-b", action="store_true",
         help="run a TS005 Class B multicast session (ping slots) instead of Class C",
     )
+    parser.add_argument(
+        "--class-b-periodicity", type=int, default=CLASS_B_PERIODICITY,
+        help="Class B ping periodicity, 0-7: 2**(7 - periodicity) ping slots per beacon period",
+    )
     parser.add_argument("--radius", type=float, default=600.0, help="placement radius in m")
+    parser.add_argument(
+        "--layout-file", default=None,
+        help="CSV with a position per device; sets the number of devices",
+    )
+    parser.add_argument(
+        "--exponent", type=float, default=PATH_LOSS_EXPONENT, help="path loss exponent",
+    )
+    parser.add_argument(
+        "--nodes-csv", default=None,
+        help="write one row per device with its update cost to this file",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--sim-length", type=float, default=None,
@@ -160,7 +178,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--plots", action="store_true", help="write the PNG figures")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.layout_file:
+        args.devices = len(read_layout(args.layout_file))
+    return args
 
 
 def make_firmware(size: int, rng: random.Random) -> bytes:
@@ -200,7 +221,7 @@ def plan_broadcast(args: argparse.Namespace) -> dict[str, float]:
     nb_frag = math.ceil(args.image_size / frag_size)
     planned = nb_frag + math.ceil(nb_frag * max(args.redundancy, 0.0))
     if args.class_b:
-        ping_nb = 128 >> CLASS_B_PERIODICITY
+        ping_nb = 128 >> args.class_b_periodicity
         interval = 0.0
         broadcast = math.ceil(planned / ping_nb) * float(BEACON_INTERVAL)
     else:
@@ -247,7 +268,7 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
             redundancy_ratio=args.redundancy,
             descriptor=0x00010002,
             class_b=True,
-            class_b_periodicity=CLASS_B_PERIODICITY,
+            class_b_periodicity=args.class_b_periodicity,
             device_uplink_interval=args.uplink_interval,
             session_lead_time=max(3 * BEACON_INTERVAL, lead_time),
             broadcast_offset=0.0,
@@ -317,7 +338,7 @@ def build_scenario(args: argparse.Namespace):
     rng = random.Random(args.seed)
 
     phy = LoraPhyLayer(
-        path_loss=log_distance_path_loss(exponent=PATH_LOSS_EXPONENT, sigma=0.0),
+        path_loss=log_distance_path_loss(exponent=args.exponent, sigma=0.0),
         noise_floor=NOISE_FLOOR,
     )
     phy.logger.setLevel(logging.WARNING)
@@ -361,7 +382,10 @@ def build_scenario(args: argparse.Namespace):
         estimate_class_b_window(args, config) if args.class_b else (None, None)
     )
 
-    positions = place_devices(args.devices, args.radius, rng)
+    if args.layout_file:
+        positions = read_layout(args.layout_file)
+    else:
+        positions = place_devices(args.devices, args.radius, rng)
     stacks: list[FuotaDeviceStack] = []
     for index, addr in enumerate(addrs):
         device = LoRaWanDevice(
@@ -575,6 +599,29 @@ def main() -> int:
     wall_time = time.time() - wall_start
 
     print_summary(args, campaign, gateway, stacks, positions, firmware, wall_time)
+
+    if args.nodes_csv:
+        # For the protocol comparison: the cost up to the moment a device holds the verified
+        # image, or up to the end of the simulation for one that never does.
+        rows = []
+        for index, stack in enumerate(stacks):
+            completed = stack.completion_time
+            updated = completed is not None and stack.received_images.get(0) == firmware
+            rows.append({
+                "node": index,
+                "x": positions[index][0],
+                "y": positions[index][1],
+                "distance": distance(positions[index], (0.0, 0.0)),
+                **update_cost(
+                    stack.device.radio, start=0.0,
+                    end=completed if updated and completed is not None else float(sim_length),
+                    updated=updated,
+                ),
+            })
+        with open(args.nodes_csv, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
 
     if args.plots:
         from plots import plot_campaign

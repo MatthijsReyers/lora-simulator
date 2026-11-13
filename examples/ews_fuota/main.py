@@ -22,6 +22,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 
 from simulator.environment import simulation_env as sim
+from simulator.layout import read_layout
+from simulator.lora.radio_usage import update_cost
 
 from gateway import Gateway
 from scenario import Scenario
@@ -47,19 +49,26 @@ def parse_args() -> tuple[Scenario, Path]:
                         help="share of downlink frames a sensor does not hear")
     parser.add_argument("--uplink-loss", type=float, default=defaults.uplink_loss,
                         help="share of uplink frames the gateway does not hear")
+    parser.add_argument("--layout-file", type=Path, default=None,
+                        help="CSV with a position per sensor; sets the number of sensors and "
+                             "replaces the fixed path loss by a distance based one")
+    parser.add_argument("--exponent", type=float, default=defaults.path_loss_exponent,
+                        help="path loss exponent used with --layout-file")
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--out", type=Path, default=None,
                         help="output directory, default: data/<run name> next to this script")
     args = parser.parse_args()
 
+    positions = read_layout(args.layout_file) if args.layout_file else None
     scenario = Scenario(
-        sensors=args.sensors, hours=args.hours, image_bytes=args.image_bytes,
+        positions=positions, path_loss_exponent=args.exponent,
+        sensors=len(positions) if positions else args.sensors, hours=args.hours, image_bytes=args.image_bytes,
         ping_interval=args.ping_interval, ping_slot=args.ping_slot,
         fuota_offset=args.fuota_offset, burst_packets=args.burst_packets,
         spreading_factor=args.sf, downlink_loss=args.downlink_loss,
         uplink_loss=args.uplink_loss, seed=args.seed,
     )
-    name = f"n{args.sensors}_h{args.hours:g}_img{args.image_bytes}_sf{args.sf}_seed{args.seed}"
+    name = f"n{scenario.sensors}_h{args.hours:g}_img{args.image_bytes}_sf{args.sf}_seed{args.seed}"
     if args.burst_packets:
         name += f"_burst{args.burst_packets}"
     if args.downlink_loss:
@@ -115,8 +124,20 @@ def main() -> None:
     for sensor in sensors:
         (tx_j, rx_j, tx_s, rx_s) = radio_energy(sensor, float(length))
         mine = cycles[cycles["sensor"] == sensor.name]
+        # A sensor that never got the update is charged until the end of the run.
+        updated = sensor.update_completed is not None
+        cost = update_cost(
+            sensor.radio, start=sensor.update_started or 0.0,
+            end=sensor.update_completed if updated else float(length), updated=updated,
+        )
+        (x, y) = sensor.radio.position
         rows.append({
             "sensor": sensor.name,
+            "x": x,
+            "y": y,
+            "distance": math.hypot(x, y),
+            "completed_at_s": sensor.update_completed if updated else math.nan,
+            **cost,
             "updated_at_s": gateway.updated.get(sensor.net_id, math.nan),
             "pings": int((mine["kind"] == "ping").sum()),
             "pings_without_ack": int((mine["outcome"] == "no_ack").sum()),

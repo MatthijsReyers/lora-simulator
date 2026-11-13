@@ -26,6 +26,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 
 from simulator.environment import simulation_env as sim
+from simulator.lora.radio_usage import update_cost
 
 import analytical
 from gateway import Gateway
@@ -67,6 +68,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--control-airtime", type=float, default=defaults.control_airtime, help="l_c in seconds")
     parser.add_argument("--max-hours", type=float, default=500.0, help="stop the session after this much simulated time")
     parser.add_argument("--analytical", action="store_true", help="also compute the analytical prediction per node (proposed and FSF)")
+    parser.add_argument("--listen-always", action="store_true", help="comparison columns: charge the receiver for all the time it was on in the simulation instead of the paper's per-frame receive time")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "data")
     parser.add_argument("--tag", default="", help="extra text for the run name")
@@ -166,7 +168,23 @@ def main(argv: list[str] | None = None) -> None:
     sim.run(simulation_length=int((args.max_hours + 24) * 3600))
     wall_time = time.time() - wall_start
 
-    nodes = pd.DataFrame([r.row() for r in recipients])
+    # For the protocol comparison: the cost up to the acknowledgement of a recipient that
+    # decoded the image, or up to the end of the session for one that never did. The simulated
+    # radios listen without pause, but the scheme has a recipient wake up for the frames only
+    # (it knows the gateway's schedule), so the receiver time charged is that of the paper's
+    # energy model unless `--listen-always` asks for the simulated one.
+    session_end = session.end_time or sim.current_time()
+    rows = []
+    for recipient in recipients:
+        decoded_at = recipient.decode_time
+        end = session_end
+        if decoded_at is not None:
+            end = session.start_time + decoded_at + recipient.ack_airtime + 0.01
+        rows.append({**recipient.row(), **update_cost(
+            recipient.radio, start=session.start_time, end=end, updated=decoded_at is not None,
+            rx_seconds=None if args.listen_always else recipient.stats.rx_time,
+        )})
+    nodes = pd.DataFrame(rows)
     if args.analytical and scenario.scheme in ("proposed", "fsf"):
         predictions = [analytical.predict(scenario, max(r.distance, 1.0), fast=True) for r in recipients]
         nodes["analytical_ec"] = [p.energy for p in predictions]
