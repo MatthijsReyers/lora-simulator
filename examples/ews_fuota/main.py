@@ -49,11 +49,20 @@ def parse_args() -> tuple[Scenario, Path]:
                         help="share of downlink frames a sensor does not hear")
     parser.add_argument("--uplink-loss", type=float, default=defaults.uplink_loss,
                         help="share of uplink frames the gateway does not hear")
+    parser.add_argument("--frame-loss", type=float, default=defaults.frame_loss,
+                        help="share of all frames a receiver does not hear, in both directions: "
+                             "the loss of the protocol comparison, applied by the radio channel")
     parser.add_argument("--layout-file", type=Path, default=None,
                         help="CSV with a position per sensor; sets the number of sensors and "
                              "replaces the fixed path loss by a distance based one")
     parser.add_argument("--exponent", type=float, default=defaults.path_loss_exponent,
                         help="path loss exponent used with --layout-file")
+    parser.add_argument("--shadowing", type=float, default=defaults.shadowing,
+                        help="standard deviation in dB of the shadowing used with --layout-file")
+    parser.add_argument("--sensor-tx-power", type=int, default=defaults.sensor_tx_power,
+                        help="transmit power of the sensors in dBm")
+    parser.add_argument("--sensitivity", type=float, default=defaults.sensitivity,
+                        help="receiver sensitivity in dBm at SF7 for every radio, 2.5 dB better per spreading factor up")
     parser.add_argument("--seed", type=int, default=defaults.seed)
     parser.add_argument("--out", type=Path, default=None,
                         help="output directory, default: data/<run name> next to this script")
@@ -61,12 +70,13 @@ def parse_args() -> tuple[Scenario, Path]:
 
     positions = read_layout(args.layout_file) if args.layout_file else None
     scenario = Scenario(
-        positions=positions, path_loss_exponent=args.exponent,
+        positions=positions, path_loss_exponent=args.exponent, shadowing=args.shadowing,
+        sensitivity=args.sensitivity, sensor_tx_power=args.sensor_tx_power,
         sensors=len(positions) if positions else args.sensors, hours=args.hours, image_bytes=args.image_bytes,
         ping_interval=args.ping_interval, ping_slot=args.ping_slot,
         fuota_offset=args.fuota_offset, burst_packets=args.burst_packets,
         spreading_factor=args.sf, downlink_loss=args.downlink_loss,
-        uplink_loss=args.uplink_loss, seed=args.seed,
+        uplink_loss=args.uplink_loss, frame_loss=args.frame_loss, seed=args.seed,
     )
     name = f"n{scenario.sensors}_h{args.hours:g}_img{args.image_bytes}_sf{args.sf}_seed{args.seed}"
     if args.burst_packets:
@@ -75,6 +85,8 @@ def parse_args() -> tuple[Scenario, Path]:
         name += f"_loss{args.downlink_loss:g}"
     if args.uplink_loss:
         name += f"_uploss{args.uplink_loss:g}"
+    if args.frame_loss:
+        name += f"_frameloss{args.frame_loss:g}"
     out = args.out or Path(os.path.dirname(os.path.abspath(__file__))) / "data" / name
     return (scenario, out)
 

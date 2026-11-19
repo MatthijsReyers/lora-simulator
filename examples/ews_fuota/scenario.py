@@ -12,7 +12,7 @@ from pathlib import Path
 
 from simulator.environment import simulation_env as sim
 from simulator.lora.airtime import estimate_airtime
-from simulator.lora.phy_layer import LoraPhyLayer
+from simulator.lora.phy_layer import LoraPhyLayer, sensitivity_from_sf7
 from simulator.path_loss.constant_loss import constant_path_loss
 from simulator.path_loss.log_distance_path_loss import log_distance_path_loss
 
@@ -79,11 +79,19 @@ class Scenario:
     # the same fixed path loss; with them the loss follows the distance.
     positions: list[tuple[float, float]] | None = None
     path_loss_exponent: float = 3.2
+    # Standard deviation in dB of the log-normal shadowing, drawn anew for every frame.
+    shadowing: float = 0.0
+    # Receiver sensitivity in dBm at SF7 of every radio; the simulator's default when empty.
+    sensitivity: float | None = None
 
     # Shares of the frames that are not heard at all, to exercise the repair paths: downlink
     # frames at the sensor they are for, uplink frames at the gateway.
     downlink_loss: float = 0.0
     uplink_loss: float = 0.0
+    # Share of all frames that any receiver does not hear, applied by the radio channel instead
+    # of by the sensor and the gateway. This is the loss every protocol of the comparison
+    # (`papers/fuota-comparison`) can be given.
+    frame_loss: float = 0.0
 
     def slot_start(self, net_id: int, late: bool = False) -> float:
         """
@@ -141,7 +149,10 @@ class Scenario:
             # A fixed, comfortable link budget: losses are injected with the loss options.
             LoraPhyLayer(path_loss=constant_path_loss(100.0))
         else:
-            LoraPhyLayer(path_loss=log_distance_path_loss(self.path_loss_exponent, sigma=0.0))
+            LoraPhyLayer(path_loss=log_distance_path_loss(self.path_loss_exponent, sigma=self.shadowing))
+        LoraPhyLayer(frame_loss=self.frame_loss, frame_loss_seed=self.seed)
+        if self.sensitivity is not None:
+            LoraPhyLayer(sensitivity=sensitivity_from_sf7(self.sensitivity))
 
 
 class RadioLog:

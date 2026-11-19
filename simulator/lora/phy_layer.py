@@ -1,4 +1,5 @@
 import logging
+import random
 from typing import Callable, Mapping, Optional
 
 from pandas import DataFrame
@@ -14,6 +15,15 @@ from copy import deepcopy
 # Ways to specify receiver sensitivities, see `LoraPhyLayer.set_sensitivity`.
 SensitivityTable = Mapping[SpreadingFactor | int, float]
 SensitivityModel = Callable[[LoraConfig], float]
+
+def sensitivity_from_sf7(sf7: float) -> dict[SpreadingFactor, float]:
+    """
+        A sensitivity table for `LoraPhyLayer.set_sensitivity` from the sensitivity in dBm at
+        SF7 alone: every spreading factor up gains the 2.5dB that its SNR requirement drops
+        (`SpreadingFactor.minimum_snr`).
+    """
+    return {sf: sf7 - 2.5 * (sf.value - 7) for sf in SpreadingFactor}
+
 
 class LoraPhyLayer():
     """
@@ -38,6 +48,11 @@ class LoraPhyLayer():
     # per spreading factor SNR requirement. See `set_sensitivity`.
     sensitivity_override: Optional[SensitivityModel]
 
+    # Share of the frames a receiver does not hear at all, whatever the link budget. Every
+    # receiver draws for itself, from a generator of its own so that it does not disturb the
+    # other random choices of a scenario. See `frame_lost`.
+    frame_loss: float
+
 
     def __new__(cls, *args, **kwargs):
         if not cls.__instance:
@@ -50,6 +65,8 @@ class LoraPhyLayer():
             path_loss: Callable[[float, float], float] | None = None, 
             noise_floor: float | None = None,    
             sensitivity: SensitivityTable | SensitivityModel | None = None,
+            frame_loss: float | None = None,
+            frame_loss_seed: int | None = None,
         ):
         """
             Every argument that is left empty keeps its current value, so configuring the
@@ -61,12 +78,19 @@ class LoraPhyLayer():
                 which is the noise floor plus the SNR requirement of the spreading factor.
             :param sensitivity: Receiver sensitivities to use instead of the noise floor based
                 ones, see `set_sensitivity`.
+            :param frame_loss: Share of the frames (0 to 1) that a receiver does not hear at
+                all, on top of what the link budget and collisions cost. Every listening radio
+                loses frames independently of the others, in both directions, so that scenarios
+                with different protocols can be given one and the same packet loss ratio.
+            :param frame_loss_seed: Seed of the generator that decides which frames are lost.
         """
         if not hasattr(self, 'initialized'):
             self.initialized = True
             self.enable_capture_effect = True
             self.noise_floor = -120.0
             self.sensitivity_override = None
+            self.frame_loss = 0.0
+            self.__frame_loss_rng = random.Random(0)
             self.path_loss_estimator = log_distance_path_loss(
                 exponent=2.0, sigma=0.5
             )
@@ -96,6 +120,19 @@ class LoraPhyLayer():
             self.noise_floor = noise_floor
         if sensitivity is not None:
             self.set_sensitivity(sensitivity)
+        if frame_loss is not None:
+            assert 0.0 <= frame_loss <= 1.0, "Frame loss is a share between 0 and 1"
+            self.frame_loss = frame_loss
+        if frame_loss_seed is not None:
+            self.__frame_loss_rng = random.Random(frame_loss_seed)
+
+
+    def frame_lost(self) -> bool:
+        """
+            Whether a receiver loses the frame that is starting now to the configured frame
+            loss. Radios ask once per frame they could otherwise have heard.
+        """
+        return self.frame_loss > 0.0 and self.__frame_loss_rng.random() < self.frame_loss
 
 
     def set_sensitivity(self, sensitivity: SensitivityTable | SensitivityModel | None) -> None:

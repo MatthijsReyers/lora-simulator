@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from simulator.environment import simulation_env as sim
@@ -109,8 +109,14 @@ class LoRaWanGateway:
         class_b_enabled: bool = False,
         duty_cycle: float | None = None,
         on_multicast_transmitted: MulticastCallback | None = None,
+        uplink_data_rates: Iterable[int] | None = None,
     ):
         """
+            :param uplink_data_rates: Data rates the gateway demodulates uplinks with, each on
+                a receive chain of its own next to the one for `data_rate`, the way a
+                concentrator listens for every spreading factor at once. An RX1 reply then goes
+                out with the data rate of the uplink it answers (RX1DROffset 0). None (the
+                default) keeps the gateway on `data_rate` alone, for uplinks and replies.
             :param duty_cycle: Transmit duty cycle as a fraction, e.g. ``0.10`` for a 10%
                 sub-band. None (the default) leaves the transmitter unlimited, which is how
                 the gateway behaved before this parameter existed.
@@ -144,6 +150,19 @@ class LoRaWanGateway:
         self._priority_tx = 0
         self._multicast_batch: list[ScheduledMulticastDownlink] = []
         self._configure_radio()
+        self._uplink_data_rates: dict[tuple[int, int], int] = {}
+        if uplink_data_rates is not None:
+            frequency = self.radio.rx_chains[0].config.frequency
+            for index in sorted(set(uplink_data_rates) | {data_rate}):
+                dr = EU868_DATA_RATES[index]
+                key = (int(dr.spreading_factor.value), int(dr.bandwidth.to_khz()))
+                self._uplink_data_rates[key] = index
+                if index != data_rate:
+                    self.radio.add_rx_chain(
+                        frequency=frequency,
+                        spreading_factor=dr.spreading_factor.value,
+                        bandwidth=dr.bandwidth.to_khz(),
+                    )
         sim.create_task(self._run())
         sim.create_task(self._multicast_loop())
         if class_b_enabled:
@@ -165,8 +184,11 @@ class LoRaWanGateway:
 
     # ---- Shared transmitter ----
 
-    async def _transmit(self, raw: bytes) -> float:
-        """Transmit with the current radio configuration, holding the transmitter lock.
+    async def _transmit(self, raw: bytes, data_rate: int | None = None) -> float:
+        """Transmit with the gateway's own data rate, holding the transmitter lock.
+
+        :param data_rate: Data rate for this frame alone, for an RX1 reply to a device that
+            sent its uplink with another one than the gateway's (see ``uplink_data_rates``).
 
         **Simulator choice — the duty cycle is a budget, not a gate, on this path.** Only
         :meth:`_multicast_scheduler` ever calls ``duty_cycle.wait_for_slot()``; RX1 replies
@@ -176,16 +198,30 @@ class LoRaWanGateway:
         traffic can push the multicast scheduler into a longer quiet period, which is the
         conservative direction for a FUOTA study.
         """
-        await self._acquire_transmitter(self._estimated_airtime(raw, None))
+        if data_rate == self.data_rate:
+            data_rate = None
+        await self._acquire_transmitter(self._estimated_airtime(raw, data_rate))
         try:
                 if self.duty_cycle is not None:
                     # Book the medium once the transmitter is actually ours: reserving before
                     # the lock would start the quiet period while the frame is still waiting,
                     # and end it too early. Anything that checks the budget in the tick this
                     # transmission ends in has to already see the quiet time.
-                    self.duty_cycle.reserve(self._estimated_airtime(raw, None))
-                airtime = await self.radio.transmit_data_blocking(raw)
-                await self.radio.receive(continuous=True)
+                    self.duty_cycle.reserve(self._estimated_airtime(raw, data_rate))
+                if data_rate is not None:
+                    dr = EU868_DATA_RATES[data_rate]
+                    self.radio.set_tx_config(
+                        power=self.tx_power,
+                        spreading_factor=dr.spreading_factor.value,
+                        bandwidth=dr.bandwidth.to_khz(),
+                        iq_inverted=DOWNLINK_IQ_INVERTED,
+                    )
+                try:
+                    airtime = await self.radio.transmit_data_blocking(raw)
+                    await self.radio.receive(continuous=True)
+                finally:
+                    if data_rate is not None:
+                        self._configure_radio()
         finally:
             self._radio_lock.release()
         return float(airtime)
@@ -289,19 +325,27 @@ class LoRaWanGateway:
                 f"{sim.current_time():.2f}s  GW  received uplink ({len(raw_uplink)} bytes)"
             )
 
-            await sim.start_child_task(self._forward_uplink(raw_uplink, uplink_end))
+            # None unless the gateway was set up for several uplink data rates.
+            data_rate = self._uplink_data_rates.get((
+                int(result.config.spreading_factor), int(result.config.bandwidth.to_khz()),
+            ))
+            await sim.start_child_task(self._forward_uplink(raw_uplink, uplink_end, data_rate))
 
-    async def _forward_uplink(self, raw_uplink: bytes, uplink_end: float) -> None:
+    async def _forward_uplink(
+        self, raw_uplink: bytes, uplink_end: float, data_rate: int | None = None,
+    ) -> None:
         """Forward one uplink to the network server and reply in its RX1 window."""
         try:
             downlink_raw = await self.network_server.handle_uplink(raw_uplink)
             if downlink_raw is None:
                 return
-            await self._reply_in_rx1(downlink_raw, uplink_end)
+            await self._reply_in_rx1(downlink_raw, uplink_end, data_rate)
         except SimulatorException:
             return
 
-    async def _reply_in_rx1(self, downlink_raw: bytes, uplink_end: float) -> None:
+    async def _reply_in_rx1(
+        self, downlink_raw: bytes, uplink_end: float, data_rate: int | None = None,
+    ) -> None:
         """Transmit a downlink in a device's RX1 window, if the transmitter is free.
 
         The window opens exactly ``RECEIVE_DELAY1`` after the uplink ended and stays open
@@ -330,7 +374,7 @@ class LoRaWanGateway:
                     f"({len(downlink_raw)} bytes): the transmitter is busy"
                 )
                 return
-            if self._collides_with_beacon(self._estimated_airtime(downlink_raw, None)):
+            if self._collides_with_beacon(self._estimated_airtime(downlink_raw, data_rate)):
                 self.downlinks_skipped += 1
                 logger.debug(
                     f"{sim.current_time():.2f}s  GW  skipping an RX1 reply "
@@ -341,7 +385,7 @@ class LoRaWanGateway:
                 f"{sim.current_time():.2f}s  GW  sending downlink "
                 f"({len(downlink_raw)} bytes)"
             )
-            await self._transmit(downlink_raw)
+            await self._transmit(downlink_raw, data_rate)
         finally:
             self._priority_tx -= 1
 

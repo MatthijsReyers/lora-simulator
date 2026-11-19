@@ -63,6 +63,8 @@ class NodeMessageType(IntEnum):
     BROADCAST_START_CONFIRMATION = 0x0D
     BITMAP = 0x0E
     ALL_CHUNKS_RECEIVED = 0x0F
+    # Not part of the update protocols: a node's own periodic data, our own number.
+    APPLICATION_DATA = 0x10
 
 
 @dataclass
@@ -384,10 +386,27 @@ class AllChunksReceived:
         return bytes([NodeMessageType.ALL_CHUNKS_RECEIVED])
 
 
+@dataclass
+class ApplicationData:
+    """
+        The periodic uplink a node sends for its application, whether or not an update is
+        running. Not in the paper; see `Scenario.uplink_interval`.
+    """
+    value: int = 0
+    LENGTH = 2
+
+    def to_bytes(self) -> bytes:
+        return bytes([NodeMessageType.APPLICATION_DATA, self.value])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'ApplicationData':
+        return cls(value=data[1])
+
+
 NodeMessage = (
     WaitingForBinaryFragment | WaitingForChecksumFragment | StatusResponse | ResetConfirmed |
     HandshakeResponse | BinaryFragmentAck | BroadcastStartConfirmation | Bitmap |
-    AllChunksReceived
+    AllChunksReceived | ApplicationData
 )
 
 
@@ -411,6 +430,8 @@ def decode_node_message(payload: bytes) -> NodeMessage:
         return Bitmap.from_bytes(payload)
     if kind == NodeMessageType.ALL_CHUNKS_RECEIVED:
         return AllChunksReceived()
+    if kind == NodeMessageType.APPLICATION_DATA:
+        return ApplicationData.from_bytes(payload)
     raise ValueError(f"Unknown node message type {kind}")
 
 

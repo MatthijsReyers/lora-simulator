@@ -24,6 +24,21 @@ def state_durations(radio: LoraRadio, start: float, end: float) -> dict[RadioSta
     return seconds
 
 
+def exchange_start(radio: LoraRadio, moment: float) -> float:
+    """
+        When the radio started the transmission that came last before `moment`, or `moment`
+        itself without one. For a device that receives its downlinks in the windows after an
+        uplink, this is where the exchange that delivered the downlink of `moment` began.
+    """
+    start = moment
+    for (since, state) in radio.state_log:
+        if since > moment:
+            break
+        if state == RadioState.TX:
+            start = since
+    return start
+
+
 def update_cost(
         radio: LoraRadio,
         start: float,

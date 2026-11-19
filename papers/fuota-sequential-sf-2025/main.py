@@ -26,6 +26,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 
 from simulator.environment import simulation_env as sim
+from simulator.lora.phy_layer import LoraPhyLayer, sensitivity_from_sf7
 from simulator.lora.radio_usage import update_cost
 
 import analytical
@@ -59,6 +60,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exponent", type=float, default=defaults.path_loss_exponent, help="path loss exponent α")
     parser.add_argument("--reference-loss", type=float, default=defaults.reference_loss_db, help="path loss at 1 m in dB (see README)")
     parser.add_argument("--no-fading", action="store_true", help="disable the Rayleigh fading")
+    parser.add_argument("--sensitivity", type=float, default=None, help="receiver sensitivity in dBm at SF7 for every radio, 2.5 dB better per spreading factor up; the paper's table by default")
+    parser.add_argument("--shadowing", type=float, default=0.0, help="standard deviation in dB of a log-normal shadowing per frame (not in the paper)")
+    parser.add_argument("--frame-loss", type=float, default=0.0, help="share of the frames a receiver does not hear at all, on top of the channel model; the loss of the protocol comparison")
     parser.add_argument("--interference", choices=["model", "simulated", "none"], default=defaults.interference)
     parser.add_argument("--interferer-density", type=float, default=defaults.interferer_density, help="λ_I, interferers per m²")
     parser.add_argument("--interferer-period", type=float, default=1 / defaults.interferer_frame_rate, help="mean seconds between an interferer's frames")
@@ -93,6 +97,9 @@ def scenario_from_args(args: argparse.Namespace) -> Scenario:
         path_loss_exponent=args.exponent,
         reference_loss_db=args.reference_loss,
         rayleigh_fading=not args.no_fading,
+        shadowing_db=args.shadowing,
+        **({"sensitivity": {int(sf): dbm for (sf, dbm) in sensitivity_from_sf7(args.sensitivity).items() if sf >= 7}}
+           if args.sensitivity is not None else {}),
         interference=args.interference,
         interferer_density=args.interferer_density,
         interferer_frame_rate=1 / args.interferer_period,
@@ -134,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
     random.seed(scenario.seed)  # the channel model (fading) draws from the global generator
 
     scenario.setup_phy()
+    LoraPhyLayer(frame_loss=args.frame_loss, frame_loss_seed=scenario.seed)
     positions = read_layout(args.layout_file) if args.layout_file else scenario.node_positions(rng)
     scenario.nodes = len(positions)
 

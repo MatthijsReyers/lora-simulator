@@ -37,6 +37,11 @@ REPEATS=5 METHOD=broadcast_unicast ./papers/fuota-unicast-broadcast-2024/run.sh
 400 m, 100 kB firmware, 215 byte frames, SF7, 125 kHz, 1% duty cycle, -125 dBm sensitivity, one
 broadcast round).
 
+`--uplink-interval 3600` is not from the paper: it has every node send a small data frame of
+its own to the gateway once per interval, each at its own moment, as the devices of the other
+protocols in `papers/fuota-comparison` do. A node that is transmitting misses the fragment
+that is on the air at that moment.
+
 Every run writes three files to `data/`, named after the method, node count, radius, frame
 length and seed:
 

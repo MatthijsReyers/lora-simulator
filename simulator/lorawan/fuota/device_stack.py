@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 
 from simulator.environment import simulation_env as sim
 from simulator.exceptions import SimulatorException
+from simulator.lora.radio_usage import exchange_start
 from simulator.lorawan.application import Application
 from simulator.lorawan.applications.clock_sync import (
     CLOCK_SYNC_FPORT,
@@ -476,6 +477,21 @@ class FuotaDeviceStack:
         )
         if self.on_firmware_received is not None:
             self.on_firmware_received(frag_index, data, descriptor)
+
+    def fuota_started_at(self, fports: tuple[int, ...] | None = None) -> float | None:
+        """When the update began for this device: the start of the uplink whose receive
+        window delivered its first FUOTA downlink, or None when it never got one.
+
+        :param fports: The FPorts that count as FUOTA traffic; the three packages by default.
+        """
+        fports = fports or (MULTICAST_SETUP_FPORT, FRAGMENTATION_FPORT, CLOCK_SYNC_FPORT)
+        first = min(
+            (moment for (moment, fport, _) in self.downlink_log if fport in fports),
+            default=None,
+        )
+        if first is None:
+            return None
+        return exchange_start(self.device.radio, first)
 
     def is_complete(self, frag_index: int = 0) -> bool:
         """Whether the device holds a reassembled, MIC-verified image of a ``FragIndex``."""

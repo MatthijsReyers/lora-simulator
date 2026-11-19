@@ -513,6 +513,27 @@ class TestPartialFleet:
         assert campaign.result.devices == 3
         assert campaign.result.participants == 2
 
+    def test_a_device_silent_in_session_setup_does_not_cost_the_others_their_frag_setup(self):
+        fleet = Fleet()
+        silent = fleet.devices[DEV_ADDRS[2]]
+
+        async def go_silent():
+            while fleet.campaign.state is not FuotaCampaignState.SESSION_SETUP:
+                await sim.sleep(0.05)
+            silent.reachable = False
+
+        sim.create_task(go_silent())
+        fleet.start()
+        sim.run(simulation_length=120)
+
+        campaign = fleet.campaign
+        # The campaign stops waiting for the session answer while there is still lead time
+        # left for the fragmentation session setup of the devices that did answer.
+        assert campaign.excluded == {DEV_ADDRS[2]: FuotaCampaignState.SESSION_SETUP}
+        assert campaign.participants == {DEV_ADDRS[0], DEV_ADDRS[1]}
+        assert campaign.completed_devices == {DEV_ADDRS[0], DEV_ADDRS[1]}
+        assert campaign.state is FuotaCampaignState.DONE
+
     def test_an_error_answer_drops_the_device_in_group_setup(self):
         fleet = Fleet(config=_config(setup_timeout=8.0))
         refusing = fleet.devices[DEV_ADDRS[1]]

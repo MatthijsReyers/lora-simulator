@@ -601,6 +601,9 @@ class LoraRadio(ABC):
         """
         self.logger.debug(f"{sim.current_time():.4f} radio={self._radio_id} _on_receive_start(packet={packet.id}, rssi={packet.rssi})")
 
+        # Decided once per frame and radio, the first time a chain could have heard it.
+        lost: Optional[bool] = None
+
         for rx_chain in self._rx_chains:
 
             if not rx_chain.enabled:
@@ -611,6 +614,9 @@ class LoraRadio(ABC):
             if not rx_chain.config.overlaps(packet.config):
                 continue
 
+            if lost is None:
+                lost = self.phy.frame_lost()
+
             # Is the radio turned on and able to receive the packets?
             missed_start = not self.__can_receive(packet, rx_chain)
 
@@ -618,7 +624,8 @@ class LoraRadio(ABC):
             possible_collisions = rx_chain.packets_in_transit.values()
 
             # Is the radio able to distinguish this packet from the noise floor?
-            demodulate_failure = packet.rssi < self.phy.sensitivity(rx_chain.config)
+            # A frame lost to the configured frame loss is one the radio never acquires either.
+            demodulate_failure = lost or packet.rssi < self.phy.sensitivity(rx_chain.config)
 
             # Overlapping packets do not have to collide if they use different enough parameters
             found_collision = False

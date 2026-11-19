@@ -67,8 +67,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exponent", type=float, default=3.2, help="path loss exponent")
     parser.add_argument("--no-fading", action="store_true", help="disable the Nakagami fading")
     parser.add_argument(
+        "--sensitivity", type=float, default=None,
+        help="receiver sensitivity in dBm at SF7 for every radio, 2.5 dB better per spreading factor up; the paper's -125 dBm by default",
+    )
+    parser.add_argument(
+        "--shadowing", type=float, default=0.0,
+        help="standard deviation in dB of the log-normal shadowing, drawn for every frame",
+    )
+    parser.add_argument(
+        "--frame-loss", type=float, default=0.0,
+        help="share of the frames a receiver does not hear at all, on top of the channel "
+             "model; the loss of the protocol comparison",
+    )
+    parser.add_argument(
         "--layout-file", default=None,
         help="read the node positions from this CSV instead of placing them",
+    )
+    parser.add_argument(
+        "--uplink-interval", type=float, default=None,
+        help="seconds between the application uplinks of a node; the paper's nodes send none",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -155,12 +172,16 @@ def main() -> None:
         shared_duty_cycle=not args.per_device_duty_cycle,
         path_loss_exponent=args.exponent,
         fading=not args.no_fading,
+        shadowing=args.shadowing,
+        **({"sensitivity": args.sensitivity} if args.sensitivity is not None else {}),
+        uplink_interval=args.uplink_interval,
         seed=args.seed,
     )
     rng = random.Random(scenario.seed)
     random.seed(scenario.seed)  # The channel model draws from the global generator.
 
     scenario.setup_phy()
+    LoraPhyLayer(frame_loss=args.frame_loss, frame_loss_seed=args.seed)
     gateway_type, node_type, has_rounds = METHODS[args.method]
 
     if args.layout_file:
@@ -185,6 +206,9 @@ def main() -> None:
         duty_cycle=duty_cycles[0],
         **({"rounds": args.broadcast_rounds} if has_rounds else {}),
     )
+
+    for node in nodes:
+        node.campaign_finished = lambda: gateway.finish_time is not None
 
     print(
         f"{args.method}: {scenario.nodes} nodes within {scenario.radius:.0f}m, "

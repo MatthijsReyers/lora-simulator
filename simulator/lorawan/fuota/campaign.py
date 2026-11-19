@@ -135,6 +135,10 @@ class FuotaCampaignConfig:
         request is only delivered in the RX1 window of a device's own uplink. In the TR002
         order (:attr:`session_before_frag_setup`) the whole FRAG_SETUP phase runs inside
         this lead time as well, so it needs a second round trip per device on top.
+    :ivar frag_setup_share: In the TR002 order, the share of the time up to ``SessionTime``
+        that is kept for FRAG_SETUP. The campaign stops waiting for session answers when only
+        this share is left, so that a single device that never answers the session request
+        does not use up the lead time of every other device's fragmentation setup.
     :ivar session_before_frag_setup: True (the default) follows TR002 Table 3 and schedules
         the multicast session (step 5) before setting up the fragmentation session (step
         6); FRAG_SETUP then ends at ``SessionTime`` at the latest. False sets up the
@@ -189,6 +193,7 @@ class FuotaCampaignConfig:
     session_timeout: int | None = None
     session_lead_time: float = 60.0
     session_answer_margin: float = 2.0
+    frag_setup_share: float = 0.5
     broadcast_offset: float = 1.0
     session_before_frag_setup: bool = True
 
@@ -675,7 +680,8 @@ class FuotaCampaign:
             # be over before the window opens.
             self._transition(FuotaCampaignState.SESSION_SETUP)
             session_time = await self._phase_session_setup(
-                cfg.session_lead_time, self.planned_fragments()
+                cfg.session_lead_time, self.planned_fragments(),
+                reserved_share=cfg.frag_setup_share,
             )
             if session_time is None:
                 return self._fail("no device accepted the multicast session")
@@ -795,9 +801,13 @@ class FuotaCampaign:
     # ---- Phase 3: multicast session scheduling (TS005 §4.5/§4.6) ----
 
     async def _phase_session_setup(
-        self, lead_time: float, fragments: int
+        self, lead_time: float, fragments: int, reserved_share: float = 0.0
     ) -> float | None:
-        """Queue a session request and wait for the answers. Returns ``SessionTime``."""
+        """Queue a session request and wait for the answers. Returns ``SessionTime``.
+
+        :param reserved_share: Share of the time up to ``SessionTime`` to leave for whatever
+            has to happen after this phase and before the session opens.
+        """
         cfg = self.config
         now = sim.current_time()
         session_time = now + lead_time
@@ -845,9 +855,11 @@ class FuotaCampaign:
             }
 
         # Never wait past SessionTime itself: a device that has not answered by then will
-        # not open its window either.
+        # not open its window either. And stop earlier when another phase needs part of the
+        # lead time, or one silent device would leave that phase no time at all.
         budget = max(
-            session_time - sim.current_time() - cfg.session_answer_margin,
+            (session_time - sim.current_time()) * (1.0 - reserved_share)
+            - cfg.session_answer_margin,
             cfg.poll_interval,
         )
         await self._wait_until(lambda: accepted() == self.participants, budget)

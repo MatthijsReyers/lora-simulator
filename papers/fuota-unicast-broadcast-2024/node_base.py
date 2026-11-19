@@ -6,11 +6,14 @@ handshake after the reboot).
 """
 import asyncio, hashlib
 from abc import abstractmethod
+from typing import Callable
 
 from simulator.environment import simulation_env as sim
+from simulator.exceptions import SimulatorException
+from simulator.lora.enums.radio_state import RadioState
 
 from frames import (
-    BROADCAST_ADDRESS,
+    BROADCAST_ADDRESS, GATEWAY_ADDRESS, ApplicationData,
     ChecksumFragment, FlashNewVersion, HandshakeRequest, HandshakeResponse, StatusRequest,
     StatusResponse, WaitingForChecksumFragment, MiWiFrame, GatewayMessage, NodeMessage,
     decode_gateway_message,
@@ -32,7 +35,46 @@ class OtaNode(OtaDevice):
         self.flash_count = 0
         self.frames_handled = 0
         self._reset_update_state()
+        self.uplinks_sent = 0
+        # Set by whoever runs the scenario: the uplinks stop with the campaign, as the
+        # simulation only ends once nothing is left to happen.
+        self.campaign_finished: Callable[[], bool] = lambda: False
+        self._transmitting = False
         sim.create_task(self.run(), name=f"node-{address}")
+        if scenario.uplink_interval is not None:
+            sim.create_task(self.uplinks(), name=f"node-{address}-uplinks")
+
+    async def transmit(self, destination: int, payload: bytes) -> float:
+        # The answer to the gateway and the node's own uplink come from two tasks and share
+        # one transmitter.
+        while self._transmitting:
+            await sim.sleep(0.01)
+        self._transmitting = True
+        try:
+            return await super().transmit(destination, payload)
+        finally:
+            self._transmitting = False
+
+    async def uplinks(self) -> None:
+        """
+            The node's own traffic: a small frame to the gateway every `uplink_interval`, at
+            this node's moment within the interval.
+        """
+        interval = self.scenario.uplink_interval
+        assert interval is not None
+        moment = 1.0 + (self.address - 1) * interval / self.scenario.nodes
+        try:
+            while True:
+                await sim.sleep_until(moment)
+                if not sim.is_running() or self.campaign_finished():
+                    return
+                # Not while the node is off the air to flash and reboot.
+                if self.radio.get_state() != RadioState.OFF:
+                    await self.transmit(GATEWAY_ADDRESS, ApplicationData().to_bytes())
+                    self.uplinks_sent += 1
+                moment += interval
+        except SimulatorException:
+            return
 
     def _reset_update_state(self) -> None:
         # The chunks of the binary by fragment number, None for chunks not received (yet).

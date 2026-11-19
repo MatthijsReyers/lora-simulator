@@ -27,7 +27,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from simulator.environment import simulation_env as sim
 from simulator.lora.airtime import estimate_airtime
 from simulator.lora.distance import distance
-from simulator.lora.phy_layer import LoraPhyLayer
+from simulator.lora.phy_layer import LoraPhyLayer, sensitivity_from_sf7
 from simulator.lorawan.device import DeviceSession, LoRaWanDevice
 from simulator.lorawan.fuota.campaign import (
     FRAGMENT_FRAME_OVERHEAD,
@@ -145,6 +145,17 @@ def parse_args() -> argparse.Namespace:
         help="per-device fragment loss probability (seeded), applied to every device",
     )
     parser.add_argument(
+        "--frame-loss", type=float, default=0.0,
+        help="share of all frames a receiver does not hear, uplinks, beacons and setup "
+             "commands included (seeded); the loss of the protocol comparison",
+    )
+    parser.add_argument(
+        "--setup-attempts", type=int, default=None,
+        help="how often a unicast setup command can be tried on a device before the campaign "
+             "gives up on it; every attempt takes one uplink interval and lengthens the setup "
+             "phases and the session lead time. Default: the short timings of a clean link",
+    )
+    parser.add_argument(
         "--repair-rounds", type=int, default=2, help="maximum TS004 repair rounds"
     )
     parser.add_argument(
@@ -162,6 +173,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--exponent", type=float, default=PATH_LOSS_EXPONENT, help="path loss exponent",
+    )
+    parser.add_argument(
+        "--shadowing", type=float, default=0.0,
+        help="standard deviation in dB of the log-normal shadowing, drawn for every frame",
+    )
+    parser.add_argument(
+        "--sensitivity", type=float, default=None,
+        help="receiver sensitivity in dBm at SF7 for every radio, 2.5 dB better per spreading factor up; from the noise floor by default",
     )
     parser.add_argument(
         "--nodes-csv", default=None,
@@ -250,6 +269,15 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
     # repeats the session request, so its lead time is half that.
     lead_time = max(60.0, 4.0 * args.uplink_interval + 5.0)
     repair_lead_time = max(40.0, 2.0 * args.uplink_interval + 5.0)
+    setup_intervals = 3.0
+    retries: dict[str, int] = {}
+    if args.setup_attempts is not None:
+        # A command goes out in the RX1 window of one uplink and is answered on the next, so
+        # N attempts need N + 1 uplink intervals. The lead time holds two such phases.
+        setup_intervals = args.setup_attempts + 1.0
+        lead_time = max(60.0, 2.0 * setup_intervals * args.uplink_interval + 5.0)
+        repair_lead_time = max(40.0, setup_intervals * args.uplink_interval + 5.0)
+        retries = {"command_retries": max(3, args.setup_attempts - 1)}
     plan = plan_broadcast(args)
     frag_size = int(plan["frag_size"])
     # The campaign sizes every "wait for an answer" from the uplink interval and from the
@@ -273,8 +301,9 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
             session_lead_time=max(3 * BEACON_INTERVAL, lead_time),
             broadcast_offset=0.0,
             fragment_interval=0.0,
-            setup_timeout=max(180.0, 3.0 * args.uplink_interval),
-            cleanup_timeout=max(120.0, 3.0 * args.uplink_interval),
+            setup_timeout=max(180.0, setup_intervals * args.uplink_interval),
+            cleanup_timeout=max(120.0, setup_intervals * args.uplink_interval),
+            **retries,
             broadcast_settle=2.0,
             max_repair_rounds=args.repair_rounds,
             repair_lead_time=max(2 * BEACON_INTERVAL, repair_lead_time),
@@ -292,8 +321,9 @@ def build_config(args: argparse.Namespace) -> FuotaCampaignConfig:
         fragment_interval=None,
         session_lead_time=lead_time,
         device_uplink_interval=args.uplink_interval,
-        setup_timeout=max(120.0, 3.0 * args.uplink_interval),
-        cleanup_timeout=max(90.0, 3.0 * args.uplink_interval),
+        setup_timeout=max(120.0, setup_intervals * args.uplink_interval),
+        cleanup_timeout=max(90.0, setup_intervals * args.uplink_interval),
+        **retries,
         broadcast_settle=2.0,
         max_repair_rounds=args.repair_rounds,
         repair_lead_time=repair_lead_time,
@@ -330,18 +360,26 @@ def estimate_class_b_window(
     while window < plan["broadcast"]:
         window *= 2
     start = session_time - 1.5 * BEACON_INTERVAL
-    return start, session_time + window + 2.0 * args.uplink_interval
+    # The group setup may take its whole timeout when a device does not answer, and
+    # SessionTime moves back with it.
+    slack = max(2.0, (args.setup_attempts or 0) + 1.0)
+    return start, session_time + window + slack * args.uplink_interval
 
 
 def build_scenario(args: argparse.Namespace):
     """Network server, gateway, campaign and N device stacks, started but not yet run."""
     rng = random.Random(args.seed)
+    random.seed(args.seed)  # the channel model (shadowing) draws from the global generator
 
     phy = LoraPhyLayer(
-        path_loss=log_distance_path_loss(exponent=args.exponent, sigma=0.0),
+        path_loss=log_distance_path_loss(exponent=args.exponent, sigma=args.shadowing),
         noise_floor=NOISE_FLOOR,
+        frame_loss=args.frame_loss,
+        frame_loss_seed=args.seed,
     )
     phy.logger.setLevel(logging.WARNING)
+    if args.sensitivity is not None:
+        phy.set_sensitivity(sensitivity_from_sf7(args.sensitivity))
 
     firmware = make_firmware(args.image_size, rng)
     config = build_config(args)
@@ -436,7 +474,8 @@ def estimate_sim_length(args: argparse.Namespace, config: FuotaCampaignConfig) -
         window *= 2
     # Setup: three unicast round trips (group, fragmentation session, multicast session),
     # roughly one uplink interval each, plus the session lead time.
-    setup = config.session_lead_time + 6.0 * args.uplink_interval + 60.0
+    slack = max(6.0, (args.setup_attempts or 0) + 3.0)
+    setup = config.session_lead_time + slack * args.uplink_interval + 60.0
     # The status phase only starts counting its timeout once the session window has closed
     # and the devices have had a couple of uplink opportunities (see
     # ``FuotaCampaign.answers_possible_at``), and it may poll a silent device again.
@@ -447,7 +486,7 @@ def estimate_sim_length(args: argparse.Namespace, config: FuotaCampaignConfig) -
     )
     # A repair round only sends a handful of fragments, so its own window is small.
     repair = args.repair_rounds * (
-        config.session_lead_time + 4.0 * unit + 6.0 * args.uplink_interval + 120.0
+        config.session_lead_time + 4.0 * unit + slack * args.uplink_interval + 120.0
     )
     return math.ceil(setup + window + status + repair + 60.0)
 
@@ -476,6 +515,7 @@ def print_banner(args: argparse.Namespace, campaign: FuotaCampaign, sim_length: 
         print(f"  Fragment interval:  {campaign.fragment_interval():.3f} s")
     print(f"  Gateway duty cycle: {f'{args.duty_cycle:.0%}' if args.duty_cycle > 0 else 'unlimited'}")
     print(f"  Fragment loss:      {args.loss:.0%} per device")
+    print(f"  Frame loss:         {args.frame_loss:.0%} of all frames, per receiver")
     print(f"  Repair rounds:      up to {args.repair_rounds}")
     print(f"  Uplink interval:    {args.uplink_interval:.1f} s per device")
     print(f"  Simulation length:  {sim_length:.0f} s  (seed {args.seed})")
@@ -601,8 +641,10 @@ def main() -> int:
     print_summary(args, campaign, gateway, stacks, positions, firmware, wall_time)
 
     if args.nodes_csv:
-        # For the protocol comparison: the cost up to the moment a device holds the verified
-        # image, or up to the end of the simulation for one that never does.
+        # For the protocol comparison: the cost from the uplink that brought a device its
+        # first FUOTA command up to the moment it holds the verified image, or up to the end
+        # of the simulation for one that never does. Its periodic uplinks before that are its
+        # normal traffic.
         rows = []
         for index, stack in enumerate(stacks):
             completed = stack.completion_time
@@ -612,8 +654,10 @@ def main() -> int:
                 "x": positions[index][0],
                 "y": positions[index][1],
                 "distance": distance(positions[index], (0.0, 0.0)),
+                "started_at_s": stack.fuota_started_at(),
+                "completed_at_s": completed if updated else None,
                 **update_cost(
-                    stack.device.radio, start=0.0,
+                    stack.device.radio, start=stack.fuota_started_at() or 0.0,
                     end=completed if updated and completed is not None else float(sim_length),
                     updated=updated,
                 ),

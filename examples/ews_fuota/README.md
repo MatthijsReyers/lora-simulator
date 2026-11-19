@@ -26,7 +26,7 @@ pipenv run python examples/ews_fuota/main.py --sensors 10 --hours 24 --image-byt
 
 Other options: `--burst-packets` (fragments per burst, default as many as fit in 1 s),
 `--fuota-offset`, `--ping-interval`, `--ping-slot`, `--sf`, `--downlink-loss`, `--uplink-loss`,
-`--seed`, `--out`.
+`--frame-loss`, `--seed`, `--out`.
 Results go to `examples/ews_fuota/data/<run name>/`. To draw who transmits when and on which
 channel (`timeline.png` in the run directory):
 
@@ -108,6 +108,9 @@ transmit 54 mW at 10 dBm, MCU 18 mW while awake, 5 µW asleep, 752 µJ per radio
   no ACK.
 - `--downlink-loss` drops frames at the sensor and `--uplink-loss` at the gateway, as if they
   were never heard: a flat share of the frames, whatever their length or signal strength.
+- `--frame-loss` is the same kind of loss applied by the radio channel instead, to every frame
+  at every receiver. It is what the protocol comparison (`papers/fuota-comparison`) uses, so
+  that all protocols lose frames in the same way.
 - Flash writes, image verification and the reboot cost nothing: the firmware does none of them
   yet.
 - The simulator does not apply low data rate optimisation, so SF11 and SF12 airtimes are short.

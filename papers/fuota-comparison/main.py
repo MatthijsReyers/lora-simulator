@@ -57,6 +57,15 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
     duty_percent = str(args.duty_cycle)
     duty_fraction = str(args.duty_cycle / 100)
     exponent = str(args.exponent)
+    # The same loss for every protocol: applied by the radio channel, to every frame.
+    loss = [
+        "--frame-loss", str(args.loss), "--shadowing", str(args.shadowing),
+        "--sensitivity", str(args.sensitivity),
+    ]
+    # EWS updates one sensor per hour and tries again an hour later when a transfer fails,
+    # so it needs room for the retries once frames get lost.
+    lossy = args.loss or args.shadowing
+    ews_hours = args.nodes + 2 if not lossy else 3 * args.nodes + 2
 
     def ews(name: str, label: str, burst: int | None) -> Variant:
         directory = out / name
@@ -65,9 +74,11 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
             name, label, "examples/ews_fuota/main.py",
             [
                 "--layout-file", str(layout), "--exponent", exponent,
-                "--image-bytes", str(firmware), "--hours", str(args.nodes + 2),
+                "--image-bytes", str(firmware), "--hours", str(ews_hours),
                 "--seed", str(args.seed), "--out", str(directory),
-            ] + burst_arguments,
+                "--sensor-tx-power", str(args.ews_tx_power),
+                "--ping-interval", str(args.uplink_interval),
+            ] + loss + burst_arguments,
             "sensors.csv", "completed_at_s",
         )
 
@@ -80,8 +91,9 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
                 "--image-size", str(firmware), "--duty-cycle", duty_fraction,
                 "--uplink-interval", str(args.uplink_interval), "--seed", str(args.seed),
                 "--nodes-csv", str(directory / "nodes.csv"), "--log-level", "WARNING",
-            ] + extra,
-            "nodes.csv", "cmp_time_s",
+                "--setup-attempts", str(args.lorawan_setup_attempts),
+            ] + loss + extra,
+            "nodes.csv", "completed_at_s",
         )
 
     def malumbres(name: str, label: str, method: str) -> Variant:
@@ -91,8 +103,9 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
                 "--method", method, "--layout-file", str(layout), "--exponent", exponent,
                 "--no-fading", "--per-device-duty-cycle", "--duty-cycle", duty_percent,
                 "--firmware-kb", str(args.firmware_kb), "--seed", str(args.seed),
+                "--uplink-interval", str(args.uplink_interval),
                 "--output-dir", str(out / name),
-            ],
+            ] + loss,
             "*_nodes.csv", "cmp_time_s",
         )
 
@@ -103,7 +116,7 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
     per_sf = math.ceil(1.1 * firmware / fragment_size)
     def sequential(name: str, label: str, extra: list[str]) -> Variant:
         return Variant(name, label, "papers/fuota-sequential-sf-2025/main.py", [
-            *sequential_arguments, "--output-dir", str(out / name), *extra,
+            *sequential_arguments, "--output-dir", str(out / name), *loss, *extra,
         ], "*_nodes.csv", "cmp_time_s")
 
     sequential_arguments = [
@@ -114,6 +127,20 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
             "--interference", "none", "--duty-cycle", duty_percent, "--seed", str(args.seed),
     ]
 
+    def sequential_lorawan(name: str, label: str, last_sf: int, extra: list[str]) -> Variant:
+        # The same scheme as a campaign on the LoRaWAN stack. Its fragments have to fit a
+        # frame of the last spreading factor of the ladder, and its setup is paced by the
+        # devices' uplinks like that of LoRaWAN FUOTA.
+        return Variant(name, label, "papers/fuota-sequential-sf-2025-lorawan/main.py", [
+            "-L", "7", "-M", str(last_sf), "--layout-file", str(layout),
+            "--firmware-kb", str(args.firmware_kb), "--exponent", exponent,
+            "--reference-loss", str(FREE_SPACE_LOSS_1M), "--no-fading",
+            "--duty-cycle", duty_percent, "--uplink-interval", str(args.uplink_interval),
+            "--setup-attempts", str(args.lorawan_setup_attempts),
+            "--max-hours", str(args.sequential_max_hours), "--seed", str(args.seed),
+            "--output-dir", str(out / name), *loss, *extra,
+        ], "*_nodes.csv", "completed_at")
+
     return [
         ews("ews_burst2", "EWS, 2 fragments per burst", None),
         ews("ews_burst12", "EWS, 12 fragments per burst", 12),
@@ -121,9 +148,16 @@ def variants(args: argparse.Namespace, layout: Path, out: Path) -> list[Variant]
             "--class-b", "--class-b-periodicity", str(args.class_b_periodicity),
         ]),
         lorawan("lorawan_class_c", "LoRaWAN FUOTA, Class C", []),
-        sequential("sequential_sf", "Sequential SF multicast (Borkotoky)", []),
-        sequential("sequential_sf_always_on", "Sequential SF, receiver always on",
-                   ["--listen-always"]),
+        # The scheme on bare radios, as the paper models it: no protocol around the frames, a
+        # frame larger than LoRaWAN allows and no traffic of the devices' own. Not a fair
+        # comparison with the others, which is what the variants on LoRaWAN are for.
+        # sequential("sequential_sf", "Sequential SF multicast (Borkotoky)", []),
+        # sequential("sequential_sf_always_on", "Sequential SF, receiver always on",
+        #            ["--listen-always"]),
+        sequential_lorawan("sequential_sf_lorawan", "Sequential SF on LoRaWAN, SF7-12", 12, []),
+        sequential_lorawan("sequential_sf_lorawan_sf7_8", "Sequential SF on LoRaWAN, SF7-8", 8, []),
+        sequential_lorawan("sequential_sf_lorawan_class_c", "Sequential SF on LoRaWAN, SF7-12, Class C",
+                           12, ["--listen", "continuous"]),
         malumbres("broadcast_unicast", "Broadcast + unicast (Malumbres)", "broadcast_unicast"),
         malumbres("broadcast_only", "Broadcast only (Malumbres)", "broadcast_only"),
     ]
@@ -245,15 +279,41 @@ def main() -> None:
     parser.add_argument("--duty-cycle", type=float, default=1.0,
                         help="gateway duty cycle in percent, for the protocols that have one")
     parser.add_argument("--uplink-interval", type=float, default=3600.0,
-                        help="seconds between a LoRaWAN device's uplinks, which pace its setup")
+                        help="seconds between the periodic uplinks of a LoRaWAN device, which "
+                             "pace its setup, of a node of Malumbres and of the pings of an EWS sensor")
     parser.add_argument("--class-b-periodicity", type=int, default=6,
                         help="LoRaWAN Class B ping periodicity; 6 keeps the gateway under 1%%")
+    parser.add_argument("--lorawan-setup-attempts", type=int, default=3,
+                        help="how often a LoRaWAN setup command can be tried on a device; every "
+                             "attempt adds two uplink intervals to the campaign")
+    parser.add_argument("--sequential-max-hours", type=float, default=24.0,
+                        help="hours after which the gateway of the sequential SF scheme on "
+                             "LoRaWAN gives up; also bounds how long those runs take")
+    parser.add_argument("--ews-tx-power", type=int, default=14,
+                        help="transmit power in dBm of the EWS sensors, which is 10 in the real "
+                             "system; every other device sends at 14")
+    parser.add_argument("--sensitivity", type=float, default=-105.0,
+                        help="receiver sensitivity in dBm at SF7 of every radio, 2.5 dB better "
+                             "per spreading factor up")
+    parser.add_argument("--shadowing", type=float, default=0.0,
+                        help="standard deviation in dB of the shadowing, drawn for every frame")
+    parser.add_argument("--loss", type=float, default=0.0,
+                        help="share of the frames (0 to 1) every receiver loses, in both directions")
     parser.add_argument("--seed", type=int, default=1, help="node placement and every protocol's own seed")
     parser.add_argument("--only", nargs="+", default=None, help="run only these protocol names")
     parser.add_argument("--jobs", type=int, default=os.cpu_count())
     args = parser.parse_args()
 
     name = f"n{args.nodes}_r{args.radius:g}_fw{args.firmware_kb:g}kb_s{args.seed}"
+    if args.exponent != 3.2:
+        name += f"_exp{args.exponent:g}"
+    if args.shadowing:
+        name += f"_shadow{args.shadowing:g}"
+    name += f"_sens{args.sensitivity:g}"
+    if args.ews_tx_power != 14:
+        name += f"_ewstx{args.ews_tx_power}"
+    if args.loss:
+        name += f"_loss{args.loss:g}"
     out = HERE / "data" / name
     out.mkdir(parents=True, exist_ok=True)
     layout = out / "layout.csv"
@@ -264,6 +324,13 @@ def main() -> None:
           f"{args.firmware_kb:g} kB firmware")
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         nodes = pd.concat(pool.map(lambda variant: run(variant, out), chosen), ignore_index=True)
+    if args.only and (out / "comparison_nodes.csv").exists():
+        # A rerun of some protocols keeps the earlier results of the others.
+        earlier = pd.read_csv(out / "comparison_nodes.csv")
+        kept = earlier[~earlier["protocol"].isin(nodes["protocol"])]
+        order = [variant.name for variant in variants(args, layout, out)]
+        nodes = pd.concat([kept, nodes], ignore_index=True)
+        nodes = nodes.sort_values("protocol", key=lambda names: names.map(order.index), kind="stable")
     nodes.to_csv(out / "comparison_nodes.csv", index=False, float_format="%.6g")
 
     summary = summarise(nodes)
@@ -273,7 +340,9 @@ def main() -> None:
 
     subtitle = (
         f"{args.nodes} nodes within {args.radius:g} m, {args.firmware_kb:g} kB image, SF7, "
-        f"no fading; dot: mean device, line: best to worst device"
+        f"exponent {args.exponent:g}, {args.shadowing:g} dB shadowing, "
+        f"{f'{args.loss:.0%} frame loss' if args.loss else 'no loss'}; "
+        f"dot: mean device, line: best to worst device"
     )
     plot(summary, out / "comparison.png", subtitle)
     print(f"results in {out}")

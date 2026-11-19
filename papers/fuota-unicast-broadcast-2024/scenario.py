@@ -41,10 +41,14 @@ class Scenario:
     sensitivity: float = -125.0         # dBm
     path_loss_exponent: float = 3.2     # calibrated, see README
     fading: bool = True                 # Nakagami fading on top of the path loss, as in the paper
+    shadowing: float = 0.0              # dB, standard deviation of the shadowing per frame
     seed: int = 0
     processing_delay: float = 0.05      # seconds a node takes to answer a frame
     checksum_delay: float = 1.0         # seconds the gateway gives a node to verify the checksum
     reboot_delay: float = 10.0          # seconds a node is off the air while flashing and rebooting
+    # Seconds between the application uplinks of a node, None for the paper's nodes, which
+    # send nothing of their own. Every node has its own moment within the interval.
+    uplink_interval: float | None = None
     old_version: int = 1
     new_version: int = 2
 
@@ -100,7 +104,7 @@ class Scenario:
             at `sensitivity` for the used spreading factor.
         """
         sf = SpreadingFactor(self.spreading_factor)
-        path_loss = log_distance_path_loss(exponent=self.path_loss_exponent, sigma=0.0)
+        path_loss = log_distance_path_loss(exponent=self.path_loss_exponent, sigma=self.shadowing)
         phy = LoraPhyLayer(
             path_loss=nakagami_path_loss(base=path_loss) if self.fading else path_loss,
             noise_floor=self.sensitivity - sf.minimum_snr(),

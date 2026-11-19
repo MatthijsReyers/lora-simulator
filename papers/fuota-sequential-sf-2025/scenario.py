@@ -101,6 +101,7 @@ class Scenario:
     path_loss_exponent: float = 2.5     # α
     reference_loss_db: float = CALIBRATED_REFERENCE_LOSS_DB
     rayleigh_fading: bool = True        # block fading, i.i.d. per frame and link
+    shadowing_db: float = 0.0           # log-normal shadowing per frame, not in the paper
     sensitivity: dict[int, float] = field(default_factory=lambda: dict(GEORGIOU_RAZA_SENSITIVITY))
     sir_thresholds: dict[int, dict[int, float]] = field(
         default_factory=lambda: {i: dict(row) for (i, row) in MAHMOOD_SIR_THRESHOLDS.items()}
@@ -271,11 +272,13 @@ class Scenario:
     def path_loss(self) -> Callable[[float, float], float]:
         """ Power law loss `reference_loss_db + 10 α log10(d)` with Rayleigh fading on top. """
         exponent, reference = self.path_loss_exponent, self.reference_loss_db
+        sigma = self.shadowing_db
 
         def power_law(distance: float, frequency: float) -> float:
             if distance <= 0:
                 return 0.0
-            return reference + 10 * exponent * math.log10(distance)
+            shadowing = random.gauss(0.0, sigma) if sigma else 0.0
+            return max(0.0, reference + 10 * exponent * math.log10(distance) + shadowing)
 
         if not self.rayleigh_fading:
             return power_law
