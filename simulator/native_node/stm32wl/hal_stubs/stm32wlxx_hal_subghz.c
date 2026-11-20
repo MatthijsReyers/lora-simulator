@@ -32,7 +32,6 @@ SUBGHZ_HandleTypeDef *sim_stm32_hal_subghz_callbacks = NULL;
  * after a reception (the simulated radio stays in receive mode until the next transmission).
  */
 #include <string.h>
-#include <pthread.h>
 #include "stm32wlxx.h"
 
 #define SIM_SUBGHZ_IRQ_TX_DONE  0x0001
@@ -58,14 +57,11 @@ struct {
 } sim_subghz;
 
 /* These live in radio_node.c / native_node.c / the Python side. */
+int sim_transmit_blocking(uint8_t *data, int len);
 int sim_receive_blocking(uint8_t *data, int len, int timeout_ms);
 void sim_exit(void);
 int sim_stm32_nvic_irq_enabled(int irqn);
 extern int SIM_ERR_TIMEOUT;
-extern volatile int sim_tx_done_ready;
-extern volatile int sim_tx_err;
-extern pthread_cond_t sim_tx_done_finished_cond;
-extern pthread_mutex_t sim_tx_done_mutex;
 
 /* The firmware's radio interrupt handler, optional. */
 void SUBGHZ_Radio_IRQHandler(void) __attribute__((weak));
@@ -86,17 +82,8 @@ int sim_stm32_hal_subghz_run_pending(void)
             sim_subghz.preamble_len, sim_subghz.fixed_len, sim_subghz.crc_on, 0,
             sim_subghz.iq_inverted, 0
         );
-        if (sim_transmit_start(&sim_subghz.buffer[sim_subghz.tx_base], sim_subghz.payload_len) != 0) {
+        if (sim_transmit_blocking(&sim_subghz.buffer[sim_subghz.tx_base], sim_subghz.payload_len) != 0) {
             sim_exit(); /* The simulation is over */
-        }
-        pthread_mutex_lock(&sim_tx_done_mutex);
-        while (!sim_tx_done_ready) {
-            pthread_cond_wait(&sim_tx_done_finished_cond, &sim_tx_done_mutex);
-        }
-        sim_tx_done_ready = 0;
-        pthread_mutex_unlock(&sim_tx_done_mutex);
-        if (sim_tx_err != 0) {
-            sim_exit();
         }
         sim_subghz.irq_status |= SIM_SUBGHZ_IRQ_TX_DONE;
     }

@@ -31,14 +31,15 @@ int SIM_ERR_UNKNOWN_ERR = -4;
 
 
 /**
- * Wait for the active transmission to finish (if one is active, returns immediately otherwise).
+ * Wait for the transmission that was started with sim_transmit_start() to finish. Only call this
+ * after sim_transmit_start() returned 0, without a transmission there is nothing to wait for and
+ * this blocks forever.
  */
 int sim_wait_transmit_finished() {
 
-    // Cannot wait for transmit to finish if we're not transmitting!
-    if (sim_already_transmitting()) {
-        return SIM_ERR_ALREADY_TRANSMITTING;
-    }
+    // Note that we can not look at the radio state here to check if a transmission is active:
+    // the Python side starts the transmission asynchronously, so by now it may not have started
+    // yet or may already be in progress. The done flag below is the only reliable signal.
 
     // Wait for the Python/simulator side of things to setup the simulation in the async runtime
     // and then wait for the sleep to finish.
