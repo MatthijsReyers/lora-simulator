@@ -33,7 +33,8 @@ class Node:
         await sim.sleep(self.radio._radio_id * 0.001)
         while sim.is_running():
             await self.radio.transmit_data_blocking(b"BeepBoop")
-            await sim.sleep(self.interval)
+            if sim.is_running():
+                await sim.sleep(self.interval)
 
 
 if __name__ == "__main__":
