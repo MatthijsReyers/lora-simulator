@@ -1,5 +1,6 @@
 from typing import Tuple, override
 from os import path
+from simulator.environment import simulation_env as sim
 from simulator.lora.radio_power_profile import RadioPowerProfile, NucleoWL55PowerProfile
 from simulator.native_node.radio_node import RadioNode
 from simulator.native_node.stm32wl.hal_enums import HAL_StatusTypeDef
@@ -50,3 +51,9 @@ class STM32Node(RadioNode):
     @override
     def setup_callbacks(self):
         super().setup_callbacks()
+
+        # Firmware never returns from main(), the HAL stubs use this to stop it when the
+        # simulation is over.
+        @self.export('int(void)')
+        def sim_is_finished() -> int: # pyright: ignore[reportUnusedFunction]
+            return int(sim.is_finished())

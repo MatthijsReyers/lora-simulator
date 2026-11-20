@@ -110,3 +110,17 @@ void HAL_PWREx_PVD_PVM_IRQHandler(void) {}
 
 void HAL_PWREx_PVM3Callback(void) {}
 
+
+
+int sim_stm32_hal_subghz_run_pending(void);
+void HAL_Delay(uint32_t Delay);
+
+/**
+ * Sleep until the next interrupt. If the radio is busy that is the radio interrupt (its handler
+ * runs before this returns), otherwise it is the 1ms SysTick.
+ */
+void HAL_PWR_EnterSLEEPMode(uint32_t Regulator, uint8_t SLEEPEntry) {
+    if (!sim_stm32_hal_subghz_run_pending()) {
+        HAL_Delay(1);
+    }
+}

@@ -13,6 +13,9 @@ __attribute__((weak))
 void HAL_Delay(uint32_t delay_ms)
 {
     sim_sleep(delay_ms / 1000.0);
+    if (sim_is_finished()) {
+        sim_exit();
+    }
 }
 
 uint32_t HAL_GetTick(void) {
@@ -23,3 +26,6 @@ void HAL_IncTick(void) {
     sim_sleep(0.000001);
 }
 
+
+/* What the clock enable macros and __NOP() expand to. */
+void sim_nop(void) {}
