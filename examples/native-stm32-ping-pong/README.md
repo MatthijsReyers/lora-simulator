@@ -21,10 +21,10 @@ pipenv run python examples/native-stm32-ping-pong/main.py
 4. Make sure the SUBGHZ driver is part of the build. Projects generated without the radio enabled
    do not have it, add `stm32wlxx_hal_subghz.c`, `stm32wlxx_hal_subghz.h` and `stm32wlxx_ll_spi.h`
    from the STM32CubeWL package to the HAL driver folder and the `.c` file to the source list.
-5. Flash two boards. The log comes out of the ST-LINK virtual COM port at 115200 baud, the blue
-   LED toggles on every transmitted packet and the green LED on every received one.
+5. Flash two boards. The log comes out of the ST-LINK virtual COM port at 115200 baud. The
+   firmware leaves the LEDs off so they do not show up in power measurements.
 
-The pins (LEDs, antenna switch, UART), the TCXO setup and the 868 MHz image calibration at the
+The pins (antenna switch, UART), the TCXO setup and the 868 MHz image calibration at the
 top of `main.c` are for the NUCLEO-WL55JC1, adjust them for other boards.
 
 Tested on two NUCLEO-WL55JC1 boards with STM32WL HAL 1.3.1 and arm-none-eabi-gcc 14.3.

@@ -34,9 +34,6 @@
 #define IRQ_ALL             (IRQ_TX_DONE | IRQ_RX_DONE | IRQ_HEADER_ERROR | IRQ_CRC_ERROR | IRQ_TIMEOUT)
 
 /* ---- Pins of the NUCLEO-WL55JC1 ----------------------------------------------------------- */
-#define LED_PORT            GPIOB
-#define LED_BLUE            GPIO_PIN_15 /* toggles on every transmitted packet */
-#define LED_GREEN           GPIO_PIN_9  /* toggles on every received packet */
 #define RF_SWITCH_PORT      GPIOC       /* antenna switch */
 #define RF_SWITCH_CTRL1     GPIO_PIN_4
 #define RF_SWITCH_CTRL2     GPIO_PIN_5
@@ -84,16 +81,14 @@ static void board_init(void)
     GPIO_InitTypeDef gpio = {0};
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_USART2_CLK_ENABLE();
 
-    /* LEDs and antenna switch are plain outputs. */
+    /* The antenna switch pins are plain outputs. The LEDs are left off, they would add to the
+       power consumption of the board. */
     gpio.Mode = GPIO_MODE_OUTPUT_PP;
     gpio.Pull = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
-    gpio.Pin = LED_BLUE | LED_GREEN;
-    HAL_GPIO_Init(LED_PORT, &gpio);
     gpio.Pin = RF_SWITCH_CTRL1 | RF_SWITCH_CTRL2 | RF_SWITCH_CTRL3;
     HAL_GPIO_Init(RF_SWITCH_PORT, &gpio);
 
@@ -209,7 +204,6 @@ static void radio_send(const uint8_t *data, uint8_t length)
     radio_antenna_switch(1);
     radio_command(RADIO_SET_TX, (uint8_t[]){0, 0, 0}, 3); /* no timeout */
     radio_wait_irq();
-    HAL_GPIO_TogglePin(LED_PORT, LED_BLUE);
 }
 
 /* Listen for a packet for at most timeout_ms. Returns its length, or -1 if nothing (valid) came in. */
@@ -232,7 +226,6 @@ static int radio_receive(uint8_t *data, uint8_t max_length, uint32_t timeout_ms)
         rx_status[0] = max_length;
     }
     HAL_SUBGHZ_ReadBuffer(&hsubghz, rx_status[1], data, rx_status[0]);
-    HAL_GPIO_TogglePin(LED_PORT, LED_GREEN);
     return rx_status[0];
 }
 
