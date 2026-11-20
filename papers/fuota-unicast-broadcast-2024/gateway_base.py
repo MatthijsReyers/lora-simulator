@@ -87,7 +87,7 @@ class StopAndWaitGateway(OtaDevice):
         firmware: bytes,
         scenario: Scenario,
         duty_cycle: DutyCycle,
-        max_attempts: int = 10_000,
+        max_attempts: int = 5,
         max_restarts: int = 3,
     ):
         """
