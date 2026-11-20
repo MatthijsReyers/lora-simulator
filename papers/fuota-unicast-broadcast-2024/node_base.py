@@ -102,8 +102,12 @@ class OtaNode(OtaDevice):
     async def run(self) -> None:
         while True:
             try:
+                # The radio cannot receive while the node's own uplink is on the air; whatever
+                # is sent in the meantime is missed.
+                while self._transmitting:
+                    await sim.sleep(0.01)
                 packet = await self.radio.receive_data_wait()
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, SimulatorException):
                 return  # Simulation is over.
 
             frame = self.decode_frame(packet.payload)
