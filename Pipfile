@@ -17,6 +17,7 @@ scipy = "*"
 pytest = "*"
 pytest-asyncio = "*"
 mypy = "*"
+ipykernel = "*"
 
 [requires]
 python_version = "3.12"
