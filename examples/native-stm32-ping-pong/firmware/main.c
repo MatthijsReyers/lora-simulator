@@ -20,6 +20,7 @@
 #define BANDWIDTH           0x04        /* 0x04 = 125 kHz, 0x05 = 250 kHz, 0x06 = 500 kHz */
 #define CODING_RATE         0x01        /* 0x01 = 4/5 ... 0x04 = 4/8 */
 #define PREAMBLE_LENGTH     8           /* symbols */
+#define PAYLOAD_LENGTH      4           /* bytes per packet, 4 to 255: "PING" or "PONG", then zeros */
 
 #define REPLY_DELAY         1000        /* ms to wait before answering a packet */
 #define RX_TIMEOUT          3000        /* ms without a packet before sending a PING ourselves */
@@ -240,7 +241,8 @@ static int radio_receive(uint8_t *data, uint8_t max_length, uint32_t timeout_ms)
 
 int main(void)
 {
-    uint8_t rx_data[16];
+    uint8_t rx_data[255];
+    uint8_t tx_data[PAYLOAD_LENGTH] = {0};
     int rx_length;
 
     /* Every chip has a unique ID. We use it as a name in the log and to give each board a
@@ -257,19 +259,22 @@ int main(void)
     while (1) {
         rx_length = radio_receive(rx_data, sizeof(rx_data), rx_timeout);
 
-        if (rx_length == 4 && memcmp(rx_data, "PING", 4) == 0) {
+        if (rx_length == PAYLOAD_LENGTH && memcmp(rx_data, "PING", 4) == 0) {
             printf("[%04X] %8lu ms: received PING, sending PONG\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
             HAL_Delay(REPLY_DELAY);
-            radio_send((const uint8_t *)"PONG", 4);
+            memcpy(tx_data, "PONG", 4);
+            radio_send(tx_data, PAYLOAD_LENGTH);
         }
-        else if (rx_length == 4 && memcmp(rx_data, "PONG", 4) == 0) {
+        else if (rx_length == PAYLOAD_LENGTH && memcmp(rx_data, "PONG", 4) == 0) {
             printf("[%04X] %8lu ms: received PONG, sending PING\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
             HAL_Delay(REPLY_DELAY);
-            radio_send((const uint8_t *)"PING", 4);
+            memcpy(tx_data, "PING", 4);
+            radio_send(tx_data, PAYLOAD_LENGTH);
         }
         else {
             printf("[%04X] %8lu ms: heard nothing, sending PING\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
-            radio_send((const uint8_t *)"PING", 4);
+            memcpy(tx_data, "PING", 4);
+            radio_send(tx_data, PAYLOAD_LENGTH);
         }
     }
 }
