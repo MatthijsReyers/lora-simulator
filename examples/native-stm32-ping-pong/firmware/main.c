@@ -74,6 +74,18 @@ int __io_putchar(int ch)
 }
 
 
+/* Wait with the CPU asleep. HAL_Delay() would keep the CPU running in a loop, here it only
+   wakes up for the 1 ms SysTick to check the time. */
+static void sleep_ms(uint32_t ms)
+{
+    uint32_t start = HAL_GetTick();
+
+    while (HAL_GetTick() - start < ms) {
+        HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    }
+}
+
+
 /* ---- Board setup -------------------------------------------------------------------------- */
 
 static void board_init(void)
@@ -261,13 +273,13 @@ int main(void)
 
         if (rx_length == PAYLOAD_LENGTH && memcmp(rx_data, "PING", 4) == 0) {
             printf("[%04X] %8lu ms: received PING, sending PONG\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
-            HAL_Delay(REPLY_DELAY);
+            sleep_ms(REPLY_DELAY);
             memcpy(tx_data, "PONG", 4);
             radio_send(tx_data, PAYLOAD_LENGTH);
         }
         else if (rx_length == PAYLOAD_LENGTH && memcmp(rx_data, "PONG", 4) == 0) {
             printf("[%04X] %8lu ms: received PONG, sending PING\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
-            HAL_Delay(REPLY_DELAY);
+            sleep_ms(REPLY_DELAY);
             memcpy(tx_data, "PING", 4);
             radio_send(tx_data, PAYLOAD_LENGTH);
         }
