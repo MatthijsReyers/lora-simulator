@@ -1,0 +1,19 @@
+{
+  "run": "run-1",
+  "recorded": "2026-11-21 16:24",
+  "boards_stlink_serial": [
+    "002200355553500B20393256",
+    "0049002A3234510A33353533"
+  ],
+  "firmware_ids": {
+    "002200355553500B20393256": "675B",
+    "0049002A3234510A33353533": "6567"
+  },
+  "host_time_capture_start": 1795274661.5156188,
+  "host_time_boards_reset": 1795274663.1715133,
+  "joulescope_measures": "whole board at its 5 V supply",
+  "notes": [
+    "boards as wired for the stm32_ping_pong runs of 2026-11-21, 869.525 MHz"
+  ],
+  "problems": []
+}

@@ -1,109 +1,123 @@
-from typing import Literal
-import numpy as np
-
 from simulator.lora.radio_config import LoraConfig
 from simulator.lora.radio_power_profile import RadioPowerProfile
-
+import random
 
 class Stm32WL55PowerProfile(RadioPowerProfile):
     """
-        Power profile for the STM32WL55 sub-GHz radio based on the typical values from the ST
-        datasheet (DS13293 Rev 2, section 5.3.3 "Sub-GHz radio characteristics"). All currents
-        are datasheet typicals at VDD = 3.3 V, 25 degrees C, 868 MHz, and only cover the radio
-        subsystem itself: regulator/board overhead and the MCU are not included. For a profile
-        based on empirical whole-board measurements of the Nucleo-WL55JC1 development board see
-        NucleoWL55PowerProfile.
+        Power profile for the radio of the STM32WL55, measured at the 3.3 V supply of the chip.
+        These values are based on empirical measurements on a Nucleo-WL55JC1 development board at
+        its JP1 jumper (the VDD_MCU rail) performed with a Joulescope JS220 at 500 kHz. See the
+        capture in measurements/nucleo_wl55jc1_power_profile/ and its extract_power_profile.py to
+        reproduce the extraction.
 
-        The radio has two power amplifiers: a low-power PA (up to +15 dBm) and a high-power PA
-        (up to +22 dBm). This profile selects the low-power PA for output powers up to and
-        including +15 dBm and the high-power PA above that, matching the ST reference firmware.
-        TX currents between the datasheet's specified output powers are linearly interpolated
-        (Table 28, "optimized" PA match, 868-915 MHz, VDDRF = 3.3 V); below +10 dBm the
-        datasheet provides no figures so the +10 dBm value is used, which overestimates the
-        consumption of very low TX powers.
+        JP1 sits behind the board's 3.3 V regulator, so this is what the chip's radio draws, not
+        what a board draws from its supply: the losses of the regulator are not in here. Use
+        NucleoWL55PowerProfile for the consumption of a Nucleo board at its 5 V supply. This
+        profile models ONLY the radio part of the MCU, the roughly 44 mW of MCU/board components
+        are not modeled in here, add a separate PowerConsumer for those!
     """
-    _VDD = 3.3  # All datasheet typicals are specified at VDD = 3.3 V.
-
-    # Table 27: Sub-GHz radio power consumption [A].
-    _SLEEP_CURRENT = 140e-9  # Sleep with warm start, configuration retained.
-    _STANDBY_RC_CURRENT = 0.7e-3  # Standby mode, RC 13 MHz on, HSE32 off.
-    _STANDBY_HSE32_CURRENT = {'smps': 1.05e-3, 'ldo': 0.99e-3}
-    _RX_CURRENT = {  # by (regulator, rx_boosted), LoRa 125 kHz.
-        ('smps', False): 4.82e-3,
-        ('smps', True): 5.46e-3,
-        ('ldo', False): 8.90e-3,
-        ('ldo', True): 10.22e-3,
+    # The radio's own sleep draw is ~140 nA (datasheet), far below what the board-level JP1
+    # measurement can resolve, so it is modeled as zero here.
+    _SLEEP_POWER_USAGE = 0.0
+    _STANDBY_POWER_USAGE = 0.001456  # radio standby-RC delta over sleep
+    _RX_POWER_USAGE = {  # by bandwidth [kHz], delta over sleep
+        125: 0.013222,
+        250: 0.014331,
+        500: 0.015047,
+    }
+    _TX_POWER_USAGE = {  # by TX power [dBm], delta over sleep
+        0: 0.036515,
+        1: 0.038461,
+        2: 0.041567,
+        3: 0.044657,
+        4: 0.047497,
+        5: 0.050060,
+        6: 0.053410,
+        7: 0.057513,
+        8: 0.061461,
+        9: 0.065323,
+        10: 0.070764,
+        11: 0.076158,
+        12: 0.082352,
+        13: 0.088419,
+        14: 0.096262,
+        15: 0.105914,
+        # >= 16 dBm switches from the low-power PA to the high-power PA, hence the jump.
+        16: 0.310486,
+        17: 0.325764,
+        18: 0.345114,
+        19: 0.366562,
+        20: 0.391340,
+        21: 0.419946,
+        22: 0.433970,
+    }
+    _TX_STARTUP_TIME = {  # by TX power [dBm], seconds
+        0: 0.0012296694393721522,
+        1: 0.0012156692433694105,
+        2: 0.001217669271369806,
+        3: 0.001205669103367446,
+        4: 0.001213669215369015,
+        5: 0.0012116691873686333,
+        6: 0.001199669019366273,
+        7: 0.001205669103367446,
+        8: 0.001205669103367446,
+        9: 0.001199669019366273,
+        10: 0.0012096691593682374,
+        11: 0.001205669103367446,
+        12: 0.0012016690473666688,
+        13: 0.0012016690473666688,
+        14: 0.001199669019366273,
+        15: 0.0011916689073647043,
+        16: 6.765317114440506e-05,
+        17: 6.765317114440506e-05,
+        18: 6.765317114440506e-05,
+        19: 6.565314314400938e-05,
+        20: 6.765317114440506e-05,
+        21: 6.565314314400938e-05,
+        22: 6.765317114440506e-05,
     }
 
-    # Table 28: TX consumption [A] by output power [dBm], 868-915 MHz, VDDRF = 3.3 V.
-    _LP_PA_TX_CURRENT = {  # Low-power PA (optimized for 14 dBm; +15 dBm from optimal settings).
-        10: 17.5e-3,
-        14: 23.5e-3,
-        15: 25.5e-3,
-    }
-    _HP_PA_TX_CURRENT = {  # High-power PA (optimized for 22 dBm).
-        14: 92.0e-3,
-        17: 98.0e-3,
-        20: 107.5e-3,
-        22: 120.0e-3,
-    }
-
-    # Tables 29, 31 and 32: wakeup/startup times [s].
-    _SYNTH_WAKEUP_TIME = 40e-6  # TS_FS: synthesizer wakeup from standby, HSE32 mode.
-    _TX_WAKEUP_TIME = 36e-6  # TS_TX: TX wakeup with synthesizer enabled, excluding PA ramping.
-    _REGULATOR_STARTUP_TIME = {'smps': 70e-6, 'ldo': 60e-6}  # TSSMPS / TSLDO.
-    _OSC_WAKEUP_TIME = 170e-6  # TS_OSC: crystal oscillator wakeup from standby RC.
-
-    def __init__(self,
-            regulator: Literal['smps', 'ldo'] = 'smps',
-            rx_boosted: bool = False,
-            pa_ramp_time: float = 40e-6,
-        ):
+    def __init__(self, randomize: bool = False):
         """
-            Initialize a datasheet-based STM32WL55 radio power profile.
+            Initialize a STM32WL55 PowerProfile.
 
-            :param regulator: Which internal regulator powers the radio: the buck converter
-                ('smps', default) or the linear regulator ('ldo'). The LDO roughly doubles the
-                RX current at 3.3 V.
-            :param rx_boosted: If true, use the RX boosted gain currents (better sensitivity at
-                the cost of ~0.6-1.3 mA extra RX current).
-            :param pa_ramp_time: The configured PA ramping time in seconds. Programmable from
-                10 us to 3.4 ms on the STM32WL55; defaults to 40 us as used by the ST LoRaWAN
-                middleware.
+            :param randomize: If true, random variations will be added to the power consumption
+                values to simulate real-world variations between devices. Default is false to keep
+                the simulation deterministic.
         """
         super().__init__()
-        assert regulator in ('smps', 'ldo'), "Regulator must be 'smps' or 'ldo'"
-        assert 10e-6 <= pa_ramp_time <= 3400e-6, "PA ramp time must be between 10 us and 3.4 ms"
-        self._regulator = regulator
-        self._rx_boosted = rx_boosted
-        self._pa_ramp_time = pa_ramp_time
-
-    def disabled_power(self) -> float:
-        # The radio cannot be turned off completely, at best it is put in sleep mode.
-        return self.sleep_power()
-
-    def sleep_power(self) -> float:
-        return self._SLEEP_CURRENT * self._VDD
-
-    def standby_power(self) -> float:
-        # Standby with the RC 13 MHz oscillator, the default mode the radio wakes up into.
-        return self._STANDBY_RC_CURRENT * self._VDD
-
-    def standby_startup_time(self) -> float:
-        return self._REGULATOR_STARTUP_TIME[self._regulator]
+        self._randomize = randomize
 
     def tx_startup_time(self, power: float|int, config: LoraConfig) -> float:
-        return self._SYNTH_WAKEUP_TIME + self._TX_WAKEUP_TIME + self._pa_ramp_time
+        if type(power) is float:
+            power = int(power)
+        assert power in self._TX_STARTUP_TIME, "Unsupported TX power level for STM32WL55 profile"
+        startup = self._TX_STARTUP_TIME[power]
+        if self._randomize:
+            # Measured spread differs per PA: ~9.1 µs for the low-power PA, ~1 µs for the
+            # high-power PA.
+            startup += random.gauss(0.0, 9.1e-6 if power <= 15 else 1.0e-6)
+        return startup
 
     def tx_power(self, power: float|int, config: LoraConfig) -> float:
-        assert power <= 22, "The STM32WL55 cannot transmit above +22 dBm"
-        # The low-power PA covers up to +15 dBm, the high-power PA is used above that.
-        table = self._LP_PA_TX_CURRENT if power <= 15 else self._HP_PA_TX_CURRENT
-        levels = sorted(table.keys())
-        currents = [table[level] for level in levels]
-        return float(np.interp(power, levels, currents)) * self._VDD
+        if type(power) is float:
+            power = int(power)
+        assert power in self._TX_POWER_USAGE, "Unsupported TX power level for STM32WL55 profile"
+        return self._TX_POWER_USAGE[power]
 
     def rx_power(self, config: LoraConfig) -> float:
-        # The datasheet only specifies RX consumption for LoRa at 125 kHz bandwidth; the same
-        # value is used for all configurations.
-        return self._RX_CURRENT[(self._regulator, self._rx_boosted)] * self._VDD
+        return self._RX_POWER_USAGE[config.bandwidth.to_khz()]
+
+    def standby_startup_time(self) -> float:
+        # 10-90% rise time of the measured sleep -> standby transition.
+        return 0.0005
+
+    def disabled_power(self) -> float:
+        # The radio is put to sleep when "disabled", it cannot be turned off completely.
+        return self._SLEEP_POWER_USAGE
+
+    def sleep_power(self) -> float:
+        return self._SLEEP_POWER_USAGE
+
+    def standby_power(self) -> float:
+        return self._STANDBY_POWER_USAGE
