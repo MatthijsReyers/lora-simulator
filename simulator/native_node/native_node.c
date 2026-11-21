@@ -1,4 +1,5 @@
 #include <pthread.h>
+#include <setjmp.h>
 
 // Flag that indicates if the sleep condition variable below has emitted yet, we need this because
 // of the unavoidable race condition where the Python thread may emit on the condition varible 
@@ -48,11 +49,24 @@ extern void sim_sleep_end(void) {
 
 int main(void);
 
+// Where sim_exit() jumps back to: run_sensor(), just after main() would have returned.
+jmp_buf sim_exit_jmp;
+
+/**
+ * Stop running the sensor code, as if main() returned. Firmware normally never returns from
+ * main(), so the HAL stubs call this once the simulation is over.
+ */
+void sim_exit(void) {
+    longjmp(sim_exit_jmp, 1);
+}
+
 /**
  * DO NOT CALL DIRECTLY!
  * Callback for simulator for when the simulation should start running the sensor code.
  */
 extern void run_sensor() {
-    main();
+    if (setjmp(sim_exit_jmp) == 0) {
+        main();
+    }
 }
 

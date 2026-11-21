@@ -15,6 +15,7 @@ We recommend checking out the basic smaller examples first (listed at the top of
 | LoRaWAN FUOTA vs. paper | `examples/lorawan_fuota/compare_with_paper.py` | The Malumbres 2024 scenario of `papers/fuota-unicast-broadcast-2024` re-run over the standard LoRaWAN FUOTA stack, printing the same headline metrics for a side-by-side comparison. |
 | Multi-channel Ping Pong | `examples/multi-channel-ping-pong/main.py` | Three nodes ping a gateway on three different frequencies simultaneously, demonstrating carrier frequencies and multi-chain gateway radios. |
 | Native Ping Pong | `examples/native_ping_pong/main.py` | Shows how to use the native C API of the simulator to run nodes with C firmware. |
+| STM32 Ping Pong | `examples/native-stm32-ping-pong/main.py` | Two simulated STM32WL55 boards running a single-file ping pong firmware written against the STM32 HAL, the same file builds for a real NUCLEO-WL55JC1. |
 
 ## LoRaWAN FUOTA
 
