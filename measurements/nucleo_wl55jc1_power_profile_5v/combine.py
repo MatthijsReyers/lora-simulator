@@ -9,9 +9,9 @@ import json
 import os
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-RUNS = ['run-1', 'run-2']
-# Draws about 32 mW extra whenever its CPU runs or its radio is awake, see README.md.
-EXCLUDED = ['002200355553500B20393256']
+RUNS = ['run-1', 'run-2', 'run-3']
+# These draw 32 and 141 mW extra whenever their CPU runs or their radio is awake, see README.md.
+EXCLUDED = ['002200355553500B20393256', '002F00383133510836303739']
 
 
 def main():

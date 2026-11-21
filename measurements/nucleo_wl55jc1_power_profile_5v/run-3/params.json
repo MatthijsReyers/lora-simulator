@@ -1,0 +1,19 @@
+{
+  "run": "run-3",
+  "recorded": "2026-11-21 17:01",
+  "boards_stlink_serial": [
+    "002D00333234510A33353533",
+    "002F00383133510836303739"
+  ],
+  "firmware_ids": {
+    "002D00333234510A33353533": "656D",
+    "002F00383133510836303739": "6228"
+  },
+  "host_time_capture_start": 1795276860.987853,
+  "host_time_boards_reset": 1795276862.7437356,
+  "joulescope_measures": "whole board at its 5 V supply",
+  "notes": [
+    "two more boards on the same Joulescopes and wiring as run-1 and run-2, 869.525 MHz"
+  ],
+  "problems": []
+}

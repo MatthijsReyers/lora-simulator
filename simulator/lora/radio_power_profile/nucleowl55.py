@@ -18,79 +18,81 @@ class NucleoWL55PowerProfile(RadioPowerProfile):
         BOARD_SLEEP_POWER is drawn all the time and MCU_RUN_POWER comes on top of it while the CPU
         is running, add a separate PowerConsumer for those!
 
-        The values are the mean of three boards. They agree within 3 % when receiving and within
-        5 % on the high-power PA, but one of them differs by up to 25 % on the low-power PA.
+        The values are the mean of four boards. They agree within 3 % when receiving and within
+        5 % on the high-power PA, but one of them differs by up to 25 % on the low-power PA. Two
+        more boards were measured and left out: they draw 32 and 141 mW extra whenever the CPU
+        runs or the radio is awake.
         See measurements/nucleo_wl55jc1_power_profile_5v/ for the firmware, the captures and the
         scripts that extract these values.
     """
-    BOARD_SLEEP_POWER = 0.027850  # whole board, radio asleep and CPU in Stop 1
-    MCU_RUN_POWER = 0.004752  # on top of that while the CPU runs (4 MHz MSI, busy waiting)
+    BOARD_SLEEP_POWER = 0.027879  # whole board, radio asleep and CPU in Stop 1
+    MCU_RUN_POWER = 0.004740  # on top of that while the CPU runs (4 MHz MSI, busy waiting)
 
     # The radio's own sleep draw is ~140 nA (datasheet), part of BOARD_SLEEP_POWER.
     _SLEEP_POWER_USAGE = 0.0
-    _STANDBY_POWER_USAGE = 0.003392  # standby on the RC oscillator
+    _STANDBY_POWER_USAGE = 0.003372  # standby on the RC oscillator
     _RX_POWER_USAGE = {  # by bandwidth [kHz]
-        125: 0.030316,
-        250: 0.031827,
-        500: 0.032397,
+        125: 0.030304,
+        250: 0.031810,
+        500: 0.032417,
     }
-    _RX_BOOSTED_POWER_USAGE = 0.002330  # extra with boosted receive gain (measured at 125 kHz)
+    _RX_BOOSTED_POWER_USAGE = 0.002296  # extra with boosted receive gain (measured at 125 kHz)
     _TX_POWER_USAGE = {
         # Set up as the ST SubGHz_Phy middleware does for this board, by TX power [dBm].
         'middleware': {
-            0: 0.064338,
-            1: 0.067956,
-            2: 0.073592,
-            3: 0.079158,
-            4: 0.084704,
-            5: 0.089937,
-            6: 0.097101,
-            7: 0.105850,
-            8: 0.114561,
-            9: 0.122967,
-            10: 0.134609,
-            11: 0.145374,
-            12: 0.156747,
-            13: 0.166389,
-            14: 0.176450,
-            15: 0.185815,
+            0: 0.065084,
+            1: 0.068834,
+            2: 0.074709,
+            3: 0.080546,
+            4: 0.086315,
+            5: 0.091674,
+            6: 0.099078,
+            7: 0.108148,
+            8: 0.117101,
+            9: 0.125646,
+            10: 0.137512,
+            11: 0.148314,
+            12: 0.159521,
+            13: 0.168957,
+            14: 0.178893,
+            15: 0.186395,
             # >= 16 dBm switches from the low-power PA to the high-power PA, hence the jump.
-            16: 0.560102,
-            17: 0.577376,
-            18: 0.595411,
-            19: 0.612791,
-            20: 0.634259,
-            21: 0.663707,
-            22: 0.677584,
+            16: 0.562241,
+            17: 0.579398,
+            18: 0.597124,
+            19: 0.614192,
+            20: 0.634606,
+            21: 0.661398,
+            22: 0.676537,
         },
         # Low-power PA with the settings that are optimal for 14 dBm (SetPaConfig 0x04, 0x00).
         'lp_14dbm': {
-            0: 0.064210,
-            1: 0.069456,
-            2: 0.074654,
-            3: 0.079875,
-            4: 0.084835,
-            5: 0.091594,
-            6: 0.099792,
-            7: 0.107664,
-            8: 0.115043,
-            9: 0.124613,
-            10: 0.133068,
-            11: 0.141137,
-            12: 0.147331,
-            13: 0.153203,
-            14: 0.158597,
+            0: 0.063217,
+            1: 0.068360,
+            2: 0.073497,
+            3: 0.078740,
+            4: 0.083595,
+            5: 0.090287,
+            6: 0.098395,
+            7: 0.106194,
+            8: 0.113519,
+            9: 0.123075,
+            10: 0.131530,
+            11: 0.139799,
+            12: 0.146269,
+            13: 0.152458,
+            14: 0.158030,
         },
     }
     _TX_STARTUP_TIME = {  # by TX power [dBm], seconds
         'middleware': {  # 40 us ramp
-            0: 83e-6, 1: 79e-6, 2: 74e-6, 3: 71e-6, 4: 69e-6, 5: 67e-6, 6: 65e-6, 7: 64e-6,
-            8: 63e-6, 9: 62e-6, 10: 61e-6, 11: 61e-6, 12: 60e-6, 13: 60e-6, 14: 61e-6, 15: 62e-6,
-            16: 66e-6, 17: 66e-6, 18: 67e-6, 19: 68e-6, 20: 69e-6, 21: 69e-6, 22: 70e-6,
+            0: 83e-6, 1: 78e-6, 2: 74e-6, 3: 70e-6, 4: 68e-6, 5: 66e-6, 6: 65e-6, 7: 64e-6,
+            8: 63e-6, 9: 62e-6, 10: 61e-6, 11: 60e-6, 12: 60e-6, 13: 60e-6, 14: 61e-6, 15: 62e-6,
+            16: 65e-6, 17: 66e-6, 18: 67e-6, 19: 68e-6, 20: 68e-6, 21: 69e-6, 22: 70e-6,
         },
         'lp_14dbm': {  # 200 us ramp
-            0: 387e-6, 1: 345e-6, 2: 316e-6, 3: 302e-6, 4: 296e-6, 5: 285e-6, 6: 276e-6, 7: 271e-6,
-            8: 268e-6, 9: 264e-6, 10: 263e-6, 11: 265e-6, 12: 268e-6, 13: 271e-6, 14: 276e-6,
+            0: 395e-6, 1: 353e-6, 2: 320e-6, 3: 304e-6, 4: 298e-6, 5: 287e-6, 6: 277e-6, 7: 272e-6,
+            8: 268e-6, 9: 264e-6, 10: 263e-6, 11: 264e-6, 12: 267e-6, 13: 270e-6, 14: 275e-6,
         },
     }
 

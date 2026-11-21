@@ -41,7 +41,7 @@ CYCLES = 3
 # TX packet: SF7, 125 kHz, CR 4/5, preamble 8, 64 bytes, CRC on, explicit header
 SF, BW_HZ, CR, PREAMBLE, PAYLOAD = 7, 125000, 1, 8, 64
 
-RX_THRESHOLD = 0.015  # W above the standby level: receiving or transmitting
+THRESHOLDS = [0.015, 0.035]  # W above the standby level: receiving or transmitting
 
 
 def lora_airtime() -> float:
@@ -241,14 +241,22 @@ def main():
         # The level the board is at most of the time is standby (the gaps between the pulses).
         counts, edges = np.histogram(p1k, bins=np.arange(0, 0.2, 0.0005))
         standby = float(edges[np.argmax(counts)])
-        events = find_events(p1k > standby + RX_THRESHOLD, 1000, merge=0.005, shortest=0.03)
-
-        # The board index blips of the last boot in the capture, then one marker per cycle.
-        boot_time, blips = groups_of_blips(events, 0.2)[-1]
-        markers = [t for t, _ in groups_of_blips([e for e in events if e[0] > boot_time + 0.4 * blips], 0.1, count=3)]
-        assert len(markers) == CYCLES, f'{joulescope}: expected {CYCLES} markers, found {len(markers)}'
-        ends = markers[1:] + [len(p) / fs]
-        cycles = [analyse_cycle(p, fs, p1k, events, t0, t_end) for t0, t_end in zip(markers, ends)]
+        # Receiving is 27 mW over standby on most boards, but a board that draws more in every
+        # state also has its TCXO standby further up: try a higher threshold when the phases
+        # do not come out.
+        for threshold in THRESHOLDS:
+            try:
+                events = find_events(p1k > standby + threshold, 1000, merge=0.005, shortest=0.03)
+                # The board index blips of the last boot in the capture, then one marker per cycle.
+                boot_time, blips = groups_of_blips(events, 0.2)[-1]
+                markers = [t for t, _ in groups_of_blips([e for e in events if e[0] > boot_time + 0.4 * blips], 0.1, count=3)]
+                assert len(markers) == CYCLES, f'{joulescope}: expected {CYCLES} markers, found {len(markers)}'
+                ends = markers[1:] + [len(p) / fs]
+                cycles = [analyse_cycle(p, fs, p1k, events, t0, t_end) for t0, t_end in zip(markers, ends)]
+                break
+            except (AssertionError, IndexError):
+                if threshold == THRESHOLDS[-1]:
+                    raise
 
         serial = serials[blips - 1]
         board = {
