@@ -13,7 +13,7 @@ same trace averaged down to 1 kHz.
 
 ## Boards
 
-Six boards were measured in three runs (2026-11-21), the profile is the mean of four of them.
+Six boards were measured in four runs (2026-11-21), the profile is the mean of four of them.
 
 | Board (ST-LINK serial) | Run | Sleep | CPU running | Standby | RX 125 kHz | TX 14 dBm | TX 22 dBm |
 |---|---|---|---|---|---|---|---|
@@ -31,6 +31,26 @@ Boards `0022...` and `002F...` are left out. They match the others when everythi
 draw 32 and 141 mW extra whenever the CPU runs or the radio is not asleep, the same amount in
 every state. The cause is not known.
 
-The four other boards agree within 5 % except on the low-power amplifier, where `0008...` draws
-up to 12 % less than the others with the middleware setup (and up to 25 % more at low power
-with the ping pong setup).
+## How well it repeats (run-4)
+
+Boards `0049...` and `002D...` were measured a second time, `0049...` on the other Joulescope.
+
+| | `0049...` run-1 / run-4 | `002D...` run-3 / run-4 |
+|---|---|---|
+| Sleep (whole board) | 27.66 / 27.85 | 27.97 / 28.01 |
+| Standby | +3.35 / +3.35 | +3.31 / +3.35 |
+| RX 125 kHz | +30.71 / +30.68 | +30.27 / +30.29 |
+| TX 0 dBm | +63.4 / +69.8 | +67.3 / +73.7 |
+| TX 7 dBm | +109.2 / +124.2 | +115.0 / +127.7 |
+| TX 14 dBm | +184.1 / +196.1 | +186.2 / +187.3 |
+| TX 16 dBm | +565.1 / +594.3 | +568.7 / +588.1 |
+| TX 22 dBm | +678.1 / +683.8 | +673.4 / +674.9 |
+
+Sleep, standby and receiving repeat within 0.1 mW (0.2 mW for the sleep level on the other
+Joulescope), so the Joulescopes are not what sets the two left out boards apart. Transmitting
+does not repeat: up to 14 % more in the second run on both boards, with the same firmware. The
+boards were plugged in again between the runs, a likely cause is what the antenna sees, this was
+not tested. The differences between boards on the low-power amplifier (`0008...` draws 12 % less
+at 14 dBm) are of the same size, so they say little about the boards.
+
+In the profile a board that was measured twice counts once, with the mean of its runs.

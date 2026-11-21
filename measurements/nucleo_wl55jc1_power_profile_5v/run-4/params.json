@@ -1,0 +1,19 @@
+{
+  "run": "run-4",
+  "recorded": "2026-11-21 17:09",
+  "boards_stlink_serial": [
+    "002D00333234510A33353533",
+    "0049002A3234510A33353533"
+  ],
+  "firmware_ids": {
+    "002D00333234510A33353533": "656D",
+    "0049002A3234510A33353533": "6567"
+  },
+  "host_time_capture_start": 1795277365.3155768,
+  "host_time_boards_reset": 1795277367.0215971,
+  "joulescope_measures": "whole board at its 5 V supply",
+  "notes": [
+    "repeat of boards 0049 and 002D, both measured on Joulescope 005681 before, to check the Joulescope positions"
+  ],
+  "problems": []
+}
