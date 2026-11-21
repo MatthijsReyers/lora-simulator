@@ -165,6 +165,13 @@ static void radio_init(void)
 
     radio_command(RADIO_SET_STANDBY, (uint8_t[]){0x00}, 1);
 
+    /* Power the radio from its switching regulator (SMPS) instead of the default LDO, the board
+       has the inductor for it. Let it deliver up to 60 mA, enough for transmitting. */
+    uint8_t smps = 0;
+    radio_command(RADIO_SET_REGULATORMODE, (uint8_t[]){0x01}, 1);
+    HAL_SUBGHZ_ReadRegister(&hsubghz, 0x0923, &smps);
+    HAL_SUBGHZ_WriteRegister(&hsubghz, 0x0923, (smps & ~0x06) | 0x04);
+
     /* The board's 32 MHz TCXO is powered by the radio: 1.7 V, give it 10 ms to start up. Then
        recalibrate everything now that the radio has its proper clock. */
     radio_command(RADIO_SET_TCXOMODE, (uint8_t[]){0x01, 0x00, 0x02, 0x80}, 4);

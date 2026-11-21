@@ -24,7 +24,7 @@ pipenv run python examples/native-stm32-ping-pong/main.py
 5. Flash two boards. The log comes out of the ST-LINK virtual COM port at 115200 baud. The
    firmware leaves the LEDs off so they do not show up in power measurements.
 
-The pins (antenna switch, UART), the TCXO setup and the 868 MHz image calibration at the
+The pins (antenna switch, UART), the TCXO setup, the SMPS and the 868 MHz image calibration at the
 top of `main.c` are for the NUCLEO-WL55JC1, adjust them for other boards.
 
 Tested on two NUCLEO-WL55JC1 boards with STM32WL HAL 1.3.1 and arm-none-eabi-gcc 14.3.
