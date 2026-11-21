@@ -44,14 +44,18 @@
 
 static SUBGHZ_HandleTypeDef hsubghz;
 static UART_HandleTypeDef huart2;
+static RTC_HandleTypeDef hrtc;
 
 /* Interrupt flags the radio raised, set by the interrupt handler and consumed by the main loop. */
 static volatile uint16_t radio_irq = 0;
 
+/* Set by the interrupt handler of the wake-up timer when a timed sleep is over. */
+static volatile uint16_t timer_irq = 0;
+
 
 /* ---- Interrupt handlers ------------------------------------------------------------------- */
 
-/* 1 ms tick, used by HAL_Delay() and HAL_GetTick(). */
+/* 1 ms tick, used by the HAL for its timeouts. It does not run while the CPU is stopped. */
 void SysTick_Handler(void)
 {
     HAL_IncTick();
@@ -66,6 +70,13 @@ void SUBGHZ_Radio_IRQHandler(void)
     radio_irq |= (uint16_t)((status[0] << 8) | status[1]);
 }
 
+/* The wake-up timer has expired. */
+void RTC_WKUP_IRQHandler(void)
+{
+    HAL_RTCEx_WakeUpTimerIRQHandler(&hrtc);
+    timer_irq = 1;
+}
+
 /* printf() ends up here, one character at a time. */
 int __io_putchar(int ch)
 {
@@ -74,15 +85,32 @@ int __io_putchar(int ch)
 }
 
 
-/* Wait with the CPU asleep. HAL_Delay() would keep the CPU running in a loop, here it only
-   wakes up for the 1 ms SysTick to check the time. */
+/* ---- Sleeping --------------------------------------------------------------------------- */
+
+/* Stop the CPU (Stop 1 mode, the deepest that keeps the serial port's settings) until an
+   interrupt handler has set *flag. */
+static void stop_until(volatile uint16_t *flag)
+{
+    /* With interrupts disabled an interrupt still wakes the CPU up, but its handler only runs
+       once they are enabled again. That way the interrupt cannot slip in between checking the
+       flag and stopping the CPU, which would leave it stopped forever. */
+    __disable_irq();
+    while (*flag == 0) {
+        HAL_PWREx_EnterSTOP1Mode(PWR_STOPENTRY_WFI);
+        __enable_irq();
+        __disable_irq();
+    }
+    __enable_irq();
+}
+
+/* Stop the CPU for the given time, the wake-up timer of the real-time clock wakes it up. */
 static void sleep_ms(uint32_t ms)
 {
-    uint32_t start = HAL_GetTick();
-
-    while (HAL_GetTick() - start < ms) {
-        HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-    }
+    timer_irq = 0;
+    /* The timer counts at 32768 Hz / 16 = 2048 Hz. */
+    HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, ms * 2048 / 1000 - 1, RTC_WAKEUPCLOCK_RTCCLK_DIV16, 0);
+    stop_until(&timer_irq);
+    HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
 }
 
 
@@ -91,6 +119,7 @@ static void sleep_ms(uint32_t ms)
 static void board_init(void)
 {
     GPIO_InitTypeDef gpio = {0};
+    RCC_OscInitTypeDef osc = {0};
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -119,6 +148,21 @@ static void board_init(void)
     huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart2.Init.OverSampling = UART_OVERSAMPLING_16;
     HAL_UART_Init(&huart2);
+
+    /* Real-time clock on the board's 32.768 kHz crystal, we only use its wake-up timer. */
+    HAL_PWR_EnableBkUpAccess();
+    osc.OscillatorType = RCC_OSCILLATORTYPE_LSE;
+    osc.LSEState = RCC_LSE_ON;
+    HAL_RCC_OscConfig(&osc);
+    __HAL_RCC_RTC_CONFIG(RCC_RTCCLKSOURCE_LSE);
+    __HAL_RCC_RTC_ENABLE();
+    __HAL_RCC_RTCAPB_CLK_ENABLE();
+    hrtc.Instance = RTC;
+    hrtc.Init.AsynchPrediv = 127;
+    hrtc.Init.SynchPrediv = 255;
+    HAL_RTC_Init(&hrtc);
+    HAL_NVIC_SetPriority(RTC_WKUP_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);
 }
 
 
@@ -152,15 +196,12 @@ static void radio_set_payload_length(uint8_t length)
     }, 6);
 }
 
-/* Sleep until the radio raises an interrupt, returns the interrupt flags. */
+/* Stop the CPU until the radio raises an interrupt, returns the interrupt flags. */
 static uint16_t radio_wait_irq(void)
 {
     uint16_t irq;
 
-    while (radio_irq == 0) {
-        /* The CPU sleeps until any interrupt fires, at the latest the next 1 ms SysTick. */
-        HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-    }
+    stop_until(&radio_irq);
     irq = radio_irq;
     radio_irq = 0;
     return irq;
@@ -272,19 +313,19 @@ int main(void)
         rx_length = radio_receive(rx_data, sizeof(rx_data), rx_timeout);
 
         if (rx_length == PAYLOAD_LENGTH && memcmp(rx_data, "PING", 4) == 0) {
-            printf("[%04X] %8lu ms: received PING, sending PONG\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
+            printf("[%04X] received PING, sending PONG\r\n", (unsigned)id);
             sleep_ms(REPLY_DELAY);
             memcpy(tx_data, "PONG", 4);
             radio_send(tx_data, PAYLOAD_LENGTH);
         }
         else if (rx_length == PAYLOAD_LENGTH && memcmp(rx_data, "PONG", 4) == 0) {
-            printf("[%04X] %8lu ms: received PONG, sending PING\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
+            printf("[%04X] received PONG, sending PING\r\n", (unsigned)id);
             sleep_ms(REPLY_DELAY);
             memcpy(tx_data, "PING", 4);
             radio_send(tx_data, PAYLOAD_LENGTH);
         }
         else {
-            printf("[%04X] %8lu ms: heard nothing, sending PING\r\n", (unsigned)id, (unsigned long)HAL_GetTick());
+            printf("[%04X] heard nothing, sending PING\r\n", (unsigned)id);
             memcpy(tx_data, "PING", 4);
             radio_send(tx_data, PAYLOAD_LENGTH);
         }

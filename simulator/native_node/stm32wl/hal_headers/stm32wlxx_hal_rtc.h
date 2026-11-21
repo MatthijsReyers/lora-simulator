@@ -644,6 +644,18 @@ typedef  void (*pRTC_CallbackTypeDef)(RTC_HandleTypeDef *hrtc);  /*!< pointer to
 
 
 HAL_StatusTypeDef HAL_RTC_Init(RTC_HandleTypeDef *hrtc);
+
+/* Wake-up timer (stm32wlxx_hal_rtc_ex.h on the real HAL) */
+#define RTC_WAKEUPCLOCK_RTCCLK_DIV16        0x00000000u
+#define RTC_WAKEUPCLOCK_RTCCLK_DIV8         0x00000001u
+#define RTC_WAKEUPCLOCK_RTCCLK_DIV4         0x00000002u
+#define RTC_WAKEUPCLOCK_RTCCLK_DIV2         0x00000003u
+#define RTC_WAKEUPCLOCK_CK_SPRE_16BITS      0x00000004u
+HAL_StatusTypeDef HAL_RTCEx_SetWakeUpTimer_IT(RTC_HandleTypeDef *hrtc, uint32_t WakeUpCounter, uint32_t WakeUpClock,
+                                              uint32_t WakeUpAutoClr);
+HAL_StatusTypeDef HAL_RTCEx_DeactivateWakeUpTimer(RTC_HandleTypeDef *hrtc);
+void              HAL_RTCEx_WakeUpTimerIRQHandler(RTC_HandleTypeDef *hrtc);
+void              HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc);
 HAL_StatusTypeDef HAL_RTC_DeInit(RTC_HandleTypeDef *hrtc);
 
 void HAL_RTC_MspInit(RTC_HandleTypeDef *hrtc);

@@ -101,9 +101,6 @@ HAL_StatusTypeDef HAL_PWREx_DisableLowPowerRunMode(void) {
     return HAL_OK;
 }
 
-void HAL_PWREx_EnterSTOP0Mode(uint8_t STOPEntry) {}
-void HAL_PWREx_EnterSTOP1Mode(uint8_t STOPEntry) {}
-void HAL_PWREx_EnterSTOP2Mode(uint8_t STOPEntry) {}
 void HAL_PWREx_EnterSHUTDOWNMode(void) {}
 
 void HAL_PWREx_PVD_PVM_IRQHandler(void) {}
@@ -113,14 +110,49 @@ void HAL_PWREx_PVM3Callback(void) {}
 
 
 int sim_stm32_hal_subghz_run_pending(void);
-void HAL_Delay(uint32_t Delay);
+void sim_stm32_rtc_wakeup_fire(void);
+extern int sim_stm32_rtc_wakeup_armed;
+extern double sim_stm32_rtc_wakeup_period;
+void sim_exit(void);
 
 /**
- * Sleep until the next interrupt. If the radio is busy that is the radio interrupt (its handler
- * runs before this returns), otherwise it is the 1ms SysTick.
+ * The CPU goes to sleep: let simulation time pass until the next interrupt and run its handler.
+ *
+ *  - A radio operation armed with RADIO_SET_TX / RADIO_SET_RX runs now, followed by the radio
+ *    interrupt.
+ *  - Otherwise, if the RTC wake-up timer is running, time passes until it expires, followed by
+ *    its interrupt.
+ *  - Otherwise only the 1 ms SysTick can wake the CPU up, and that does not run in the stop modes.
+ *
+ * Not modelled: a wake-up timer that expires while a radio operation is running (the radio
+ * operation runs to its end first).
  */
-void HAL_PWR_EnterSLEEPMode(uint32_t Regulator, uint8_t SLEEPEntry) {
-    if (!sim_stm32_hal_subghz_run_pending()) {
-        HAL_Delay(1);
+static void sim_stm32_wait_for_interrupt(int systick_running) {
+    if (sim_stm32_hal_subghz_run_pending()) {
+        return;
+    }
+    if (sim_stm32_rtc_wakeup_armed) {
+        sim_sleep(sim_stm32_rtc_wakeup_period);
+        if (sim_is_finished()) {
+            sim_exit();
+        }
+        sim_stm32_rtc_wakeup_fire();
+        return;
+    }
+    if (!systick_running) {
+        sim_error("The CPU was stopped with nothing that can wake it up (no radio operation, no wake-up timer)");
+    }
+    sim_sleep(0.001);
+    if (sim_is_finished()) {
+        sim_exit();
     }
 }
+
+void HAL_PWR_EnterSLEEPMode(uint32_t Regulator, uint8_t SLEEPEntry) { sim_stm32_wait_for_interrupt(1); }
+void HAL_PWREx_EnterSTOP0Mode(uint8_t STOPEntry) { sim_stm32_wait_for_interrupt(0); }
+void HAL_PWREx_EnterSTOP1Mode(uint8_t STOPEntry) { sim_stm32_wait_for_interrupt(0); }
+void HAL_PWREx_EnterSTOP2Mode(uint8_t STOPEntry) { sim_stm32_wait_for_interrupt(0); }
+
+/* The backup domain (RTC, LSE) needs no unlocking in the simulator. */
+void HAL_PWR_EnableBkUpAccess(void) {}
+void HAL_PWR_DisableBkUpAccess(void) {}

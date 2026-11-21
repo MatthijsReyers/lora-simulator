@@ -1018,7 +1018,7 @@ typedef struct
   * @note   These macros must be used after the RTC clock source was selected.
   * @retval None
   */
-#define __HAL_RCC_RTC_ENABLE()         LL_RCC_EnableRTC()
+#define __HAL_RCC_RTC_ENABLE()         sim_nop()   /* SIM: no clock registers */
 #define __HAL_RCC_RTC_DISABLE()        LL_RCC_DisableRTC()
 /**
   * @}
@@ -1309,7 +1309,7 @@ typedef struct
   *         RTC clock source).
   * @retval None
   */
-#define __HAL_RCC_RTC_CONFIG(__RTC_CLKSOURCE__)  LL_RCC_SetRTCClockSource(__RTC_CLKSOURCE__)
+#define __HAL_RCC_RTC_CONFIG(__RTC_CLKSOURCE__)  sim_nop()   /* SIM: no clock registers */
 
 /** @brief  Macro to get the RTC clock source.
   * @retval The returned value can be one of the following:
