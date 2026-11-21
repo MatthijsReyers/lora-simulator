@@ -39,9 +39,9 @@ void     HAL_IncTick(void);
 
 /* ---- Device UID (96-bit unique device identifier) ----------------------- */
 
-static inline uint32_t HAL_GetUIDw0(void) { return sim_radio_id(); }
-static inline uint32_t HAL_GetUIDw1(void) { return 0xDEADBEEF; }
-static inline uint32_t HAL_GetUIDw2(void) { return 0x12345678; }
+static inline uint32_t HAL_GetUIDw0(void) { return sim_stm32_uid(0); }
+static inline uint32_t HAL_GetUIDw1(void) { return sim_stm32_uid(1); }
+static inline uint32_t HAL_GetUIDw2(void) { return sim_stm32_uid(2); }
 
 
 #ifdef __cplusplus
